@@ -2148,6 +2148,19 @@ class TestUnifiProtectNVRSensorEdgeCases:
 
         assert sensor.available is False
 
+    async def test_unavailable_when_protect_coordinator_fails(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """Test available returns False when Protect coordinator fails."""
+        storage_desc = next(d for d in NVR_SENSOR_TYPES if d.key == "storage_used")
+        sensor = UnifiProtectNVRSensor(
+            coordinator=mock_coordinator,
+            description=storage_desc,
+            device_id="nvr1",
+        )
+        mock_coordinator.protect_available = False
+        assert sensor.available is False
+
     async def test_available_storage_sensor_with_nested_storage_info(
         self, hass: HomeAssistant, mock_coordinator
     ):

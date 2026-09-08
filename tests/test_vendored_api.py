@@ -1814,3 +1814,87 @@ async def test_vpn_clients_endpoint_update_not_found_raises() -> None:
 
     with pytest.raises(ValueError, match="VPN Client missing not found"):
         await client.vpn_clients.update_vpn_client("default", "missing", enabled=False)
+
+
+async def test_cameras_get_all_reports_incomplete_when_item_skipped() -> None:
+    """Camera get_all should flag a result it silently dropped an item from.
+
+    Skipping the unparseable item keeps every other camera visible, but the
+    coordinator would otherwise read the short list as authoritative, treat
+    the dropped camera as unadopted and evict it from the device registry.
+    """
+    client = _protect_client()
+    client._get = AsyncMock(
+        return_value={
+            "data": [
+                {"id": "cam-1", "mac": "AABBCCDDEE01"},
+                {"id": "cam-2"},  # missing the required mac
+            ]
+        }
+    )
+
+    result = await client.cameras.get_all()
+
+    assert [camera.id for camera in result] == ["cam-1"]
+    assert client.cameras.last_result_complete is False
+
+
+async def test_cameras_get_all_reports_complete_once_items_parse_again() -> None:
+    """Camera get_all should clear the incomplete flag on a clean response."""
+    client = _protect_client()
+    client._get = AsyncMock(return_value={"data": [{"id": "cam-2"}]})
+    await client.cameras.get_all()
+    assert client.cameras.last_result_complete is False
+
+    client._get = AsyncMock(
+        return_value={
+            "data": [
+                {"id": "cam-1", "mac": "AABBCCDDEE01"},
+                {"id": "cam-2", "mac": "AABBCCDDEE02"},
+            ]
+        }
+    )
+
+    result = await client.cameras.get_all()
+
+    assert len(result) == 2
+    assert client.cameras.last_result_complete is True
+
+
+async def test_protect_device_endpoint_get_all_reports_incomplete_when_item_skipped() -> (
+    None
+):
+    """The shared Protect endpoint base should flag incomplete results too."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        return_value={
+            "data": [
+                {"id": "hub-1", "modelKey": "linkStation"},
+                "not-a-hub",
+            ]
+        }
+    )
+
+    result = await client.alarm_hubs.get_all()
+
+    assert [hub.id for hub in result] == ["hub-1"]
+    assert client.alarm_hubs.last_result_complete is False
+
+
+async def test_cameras_get_all_reports_complete_for_response_with_nothing_to_parse() -> (
+    None
+):
+    """Camera get_all should not let an empty response inherit a stale verdict.
+
+    The flag distinguishes "no cameras there" from "every camera failed to
+    parse", so it has to describe the call that just ran, not an earlier one.
+    """
+    client = _protect_client()
+    client._get = AsyncMock(return_value={"data": [{"id": "cam-2"}]})
+    await client.cameras.get_all()
+    assert client.cameras.last_result_complete is False
+
+    client._get = AsyncMock(return_value=None)
+
+    assert await client.cameras.get_all() == []
+    assert client.cameras.last_result_complete is True

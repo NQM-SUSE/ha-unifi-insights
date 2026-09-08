@@ -269,6 +269,10 @@ def mock_coordinator() -> MagicMock:
     """Return a mocked UniFi Insights coordinator."""
     coordinator = MagicMock()
     coordinator.last_update_success = True
+    coordinator.available = True
+    coordinator.device_available = True
+    coordinator.config_available = True
+    coordinator.protect_available = True
     coordinator.network_client = _create_mock_network_client()
     coordinator.protect_client = _create_mock_protect_client()
     coordinator.data = {

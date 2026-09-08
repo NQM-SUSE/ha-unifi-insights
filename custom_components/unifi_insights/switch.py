@@ -1464,7 +1464,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
     @property
     def available(self) -> bool:
         """Return True if switch is available."""
-        if not self.coordinator.available:
+        if not self.coordinator.device_available:
             return False
         device_data = self._get_device_data()
         if not device_data or not is_device_online(device_data):
@@ -1670,7 +1670,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
     @property
     def available(self) -> bool:
         """Return True if switch is available."""
-        if not self.coordinator.available:
+        if not self.coordinator.device_available:
             return False
         device_data = self._get_device_data()
         if not device_data or not is_device_online(device_data):

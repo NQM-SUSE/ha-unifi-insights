@@ -34,6 +34,8 @@ from custom_components.unifi_insights.coordinators.config import UnifiConfigCoor
 from custom_components.unifi_insights.coordinators.device import UnifiDeviceCoordinator
 from custom_components.unifi_insights.coordinators.facade import UnifiFacadeCoordinator
 from custom_components.unifi_insights.coordinators.protect import (
+    MAX_CONSECUTIVE_EMPTY_FETCHES,
+    MAX_CONSECUTIVE_MISSING_POLLS,
     STALE_EVENT_TIMEOUT,
     UnifiProtectCoordinator,
 )
@@ -1859,10 +1861,18 @@ class TestUnifiProtectCoordinator:
     async def test_async_update_data_connection_error(
         self, coordinator: UnifiProtectCoordinator
     ):
-        """Test data fetch with connection error."""
+        """Test a sustained connection error eventually fails the poll.
+
+        The first MAX_CONSECUTIVE_EMPTY_FETCHES polls are absorbed so a single
+        blipped endpoint does not take every Protect entity unavailable; past
+        that window the error propagates and the coordinator reports failure.
+        """
         coordinator.protect_client.cameras.get_all = AsyncMock(
             side_effect=UniFiConnectionError("Connection refused")
         )
+
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._async_update_data()
 
         with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
@@ -2080,7 +2090,9 @@ class TestUnifiProtectCoordinator:
                 return_value=mock_device
             )
 
-            coordinator._cleanup_stale_devices()
+            # Removal waits out the MAX_CONSECUTIVE_MISSING_POLLS grace window.
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 1):
+                coordinator._cleanup_stale_devices()
 
             # camera2 should be marked for removal
             mock_registry.return_value.async_update_device.assert_called()
@@ -2740,11 +2752,14 @@ class TestUnifiProtectCoordinator:
         ) as mock_registry:
             mock_registry.return_value.async_get_device = MagicMock(return_value=None)
 
-            # Should not raise - just skip removal
-            coordinator._cleanup_stale_devices()
+            # Poll past the grace window so eviction is actually attempted,
+            # then fall through both identifier patterns without a match.
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 1):
+                coordinator._cleanup_stale_devices()
 
             # No device updates should happen (nothing found)
             mock_registry.return_value.async_update_device.assert_not_called()
+            assert mock_registry.return_value.async_get_device.called
 
     @pytest.mark.asyncio
     async def test_fetch_sensors_error(self, coordinator: UnifiProtectCoordinator):
@@ -2758,6 +2773,679 @@ class TestUnifiProtectCoordinator:
 
         # Should not raise, sensors should remain empty
         assert coordinator.data["sensors"] == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_sensors_preserves_cache_on_empty(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test sensor fetch preserves cached sensors across transient empty polls."""
+        cached = {"sensor1": {"id": "sensor1", "state": "CONNECTED"}}
+        coordinator.data["sensors"] = cached
+        coordinator.protect_client.sensors.get_all = AsyncMock(return_value=[])
+
+        # Polls 1, 2, 3 should preserve cache
+        for _ in range(3):
+            await coordinator._fetch_sensors()
+            assert "sensor1" in coordinator.data["sensors"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_sensors_clears_cache_after_max_consecutive_empty(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test sensor cache is cleared after MAX_CONSECUTIVE_EMPTY_FETCHES polls."""
+        cached = {"sensor1": {"id": "sensor1", "state": "CONNECTED"}}
+        coordinator.data["sensors"] = cached
+        coordinator.protect_client.sensors.get_all = AsyncMock(return_value=[])
+
+        # 4 consecutive empty polls exceeds threshold of 3
+        for _ in range(4):
+            await coordinator._fetch_sensors()
+
+        assert coordinator.data["sensors"] == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_sensors_preserves_cache_on_404(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test sensor fetch preserves cached sensors across transient 404s."""
+        cached = {"sensor1": {"id": "sensor1", "state": "CONNECTED"}}
+        coordinator.data["sensors"] = cached
+        coordinator.protect_client.sensors.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("Not Found", 404)
+        )
+
+        for _ in range(3):
+            await coordinator._fetch_sensors()
+            assert "sensor1" in coordinator.data["sensors"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_sensors_clears_cache_after_max_consecutive_404(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test sensor cache is cleared after consecutive 404s exceed threshold."""
+        cached = {"sensor1": {"id": "sensor1", "state": "CONNECTED"}}
+        coordinator.data["sensors"] = cached
+        coordinator.protect_client.sensors.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("Not Found", 404)
+        )
+
+        for _ in range(4):
+            await coordinator._fetch_sensors()
+
+        assert coordinator.data["sensors"] == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_sensors_404_when_no_sensors_configured(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test sensor fetch 404 leaves dict empty without error."""
+        coordinator.data["sensors"] = {}
+        coordinator.protect_client.sensors.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("Not Found", 404)
+        )
+
+        await coordinator._fetch_sensors()
+        assert coordinator.data["sensors"] == {}
+
+    def test_update_device_collection_handles_non_dict_existing(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test _update_device_collection handles existing data being non-dict."""
+        coordinator.data["cameras"] = None  # type: ignore[assignment]
+        coordinator._update_device_collection("cameras", {})
+        assert coordinator.data["cameras"] == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("collection", "client_attr", "client_method", "fetch_method"),
+        [
+            ("cameras", "cameras", "get_all", "_fetch_cameras"),
+            ("lights", "lights", "get_all", "_fetch_lights"),
+            ("nvrs", "nvr", "get", "_fetch_nvr"),
+            ("chimes", "chimes", "get_all", "_fetch_chimes"),
+            ("viewers", "viewers", "get_all", "_fetch_viewers"),
+        ],
+    )
+    async def test_fetch_endpoints_preserve_cache_on_404(
+        self,
+        coordinator: UnifiProtectCoordinator,
+        collection: str,
+        client_attr: str,
+        client_method: str,
+        fetch_method: str,
+    ):
+        """Test fetch methods handle UniFiNotFoundError (404) by preserving cache."""
+        device_id = f"{collection}_1"
+        cached = {device_id: {"id": device_id}}
+        coordinator.data[collection] = cached
+        setattr(
+            getattr(coordinator.protect_client, client_attr),
+            client_method,
+            AsyncMock(side_effect=UniFiNotFoundError("Not Found", 404)),
+        )
+        await getattr(coordinator, fetch_method)()
+        assert device_id in coordinator.data[collection]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("collection", ["sensors", "nvrs", "chimes", "viewers"])
+    async def test_fetch_preserves_cache_across_persistent_errors(
+        self,
+        hass: HomeAssistant,
+        coordinator: UnifiProtectCoordinator,
+        collection: str,
+    ):
+        """Test a persistent fetch error never evicts devices or registry entries.
+
+        An error means "we could not ask", not "the server says they are gone",
+        so it must not feed the empty-response eviction counter. When it did,
+        roughly two minutes of HTTP 500s cleared the collection and
+        _cleanup_stale_devices then removed every device in it from the device
+        registry, losing area assignments and any automation keyed on device_id.
+        """
+        # collection -> (protect_client attribute, its fetch method, coordinator fetch)
+        endpoints = {
+            "sensors": ("sensors", "get_all", "_fetch_sensors"),
+            "nvrs": ("nvr", "get", "_fetch_nvr"),
+            "chimes": ("chimes", "get_all", "_fetch_chimes"),
+            "viewers": ("viewers", "get_all", "_fetch_viewers"),
+        }
+        client_attr, client_method, fetch_method = endpoints[collection]
+
+        device_id = f"{collection}_device1"
+        coordinator.data[collection] = {device_id: {"id": device_id}}
+        coordinator._previous_protect_device_ids = {
+            key: set()
+            for key in ("cameras", "lights", "sensors", "nvrs", "viewers", "chimes")
+        }
+        coordinator._previous_protect_device_ids[collection] = {device_id}
+        setattr(
+            getattr(coordinator.protect_client, client_attr),
+            client_method,
+            AsyncMock(side_effect=Exception("500 Internal Server Error")),
+        )
+
+        # Well past MAX_CONSECUTIVE_EMPTY_FETCHES: errors have no threshold.
+        for _ in range(6):
+            await getattr(coordinator, fetch_method)()
+            assert device_id in coordinator.data[collection]
+
+        assert coordinator._consecutive_empty_fetches.get(collection, 0) == 0
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=MagicMock()
+            )
+            coordinator._cleanup_stale_devices()
+            mock_registry.return_value.async_update_device.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_nvr_missing_id_clears_cache_after_max_consecutive(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test NVR response without id is treated as empty."""
+        cached = {"nvr1": {"id": "nvr1", "name": "NVR"}}
+        coordinator.data["nvrs"] = cached
+        mock_model = MagicMock()
+        coordinator._model_to_dict = MagicMock(return_value={"name": "No ID"})
+        coordinator.protect_client.nvr.get = AsyncMock(return_value=mock_model)
+
+        for _ in range(3):
+            await coordinator._fetch_nvr()
+            assert "nvr1" in coordinator.data["nvrs"]
+
+        await coordinator._fetch_nvr()
+        assert coordinator.data["nvrs"] == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_preserves_cache_on_transient_empty(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test camera fetch preserves cache across transient empty polls."""
+        cached = {"camera1": {"id": "camera1", "state": "CONNECTED"}}
+        coordinator.data["cameras"] = cached
+        coordinator.protect_client.cameras.get_all = AsyncMock(return_value=[])
+
+        await coordinator._fetch_cameras()
+        assert "camera1" in coordinator.data["cameras"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_clears_cache_after_max_consecutive_empty(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test camera cache is cleared after consecutive empty polls."""
+        cached = {"camera1": {"id": "camera1", "state": "CONNECTED"}}
+        coordinator.data["cameras"] = cached
+        coordinator.protect_client.cameras.get_all = AsyncMock(return_value=[])
+
+        for _ in range(4):
+            await coordinator._fetch_cameras()
+
+        assert coordinator.data["cameras"] == {}
+
+    @pytest.mark.asyncio
+    async def test_fetch_lights_preserves_cache_on_transient_empty(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test light fetch preserves cached lights across transient empty responses."""
+        cached = {"light1": {"id": "light1", "state": "CONNECTED"}}
+        coordinator.data["lights"] = cached
+        coordinator.protect_client.lights.get_all = AsyncMock(return_value=[])
+
+        await coordinator._fetch_lights()
+        assert "light1" in coordinator.data["lights"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "err",
+        [
+            # The session-drop the controller serves as an HTML login page.
+            pytest.param(
+                UniFiResponseError("Response is not JSON", status_code=200),
+                id="response_error",
+            ),
+            pytest.param(UniFiConnectionError("Connection reset"), id="connection"),
+            pytest.param(UniFiTimeoutError("Timed out"), id="timeout"),
+        ],
+    )
+    async def test_fetch_cameras_preserves_cache_on_transient_error(
+        self, coordinator: UnifiProtectCoordinator, err: Exception
+    ):
+        """A transient camera fetch error must not fail the whole Protect poll.
+
+        `_fetch_cameras` runs first, so letting the error escape aborts every
+        later fetcher and raises `UpdateFailed`, marking all Protect entities
+        unavailable for that cycle.
+        """
+        cached = {"camera1": {"id": "camera1", "state": "CONNECTED"}}
+        coordinator.data["cameras"] = cached
+        coordinator.protect_client.cameras.get_all = AsyncMock(side_effect=err)
+
+        await coordinator._fetch_cameras()
+
+        assert "camera1" in coordinator.data["cameras"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_lights_preserves_cache_on_transient_error(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """A transient light fetch error must not fail the whole Protect poll."""
+        cached = {"light1": {"id": "light1", "state": "CONNECTED"}}
+        coordinator.data["lights"] = cached
+        coordinator.protect_client.lights.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Response is not JSON", status_code=200)
+        )
+
+        await coordinator._fetch_lights()
+
+        assert "light1" in coordinator.data["lights"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_transient_error_does_not_advance_eviction(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """A fetch error is not evidence a camera was removed, unlike an empty poll.
+
+        An empty response clears the cache after MAX_CONSECUTIVE_EMPTY_FETCHES so
+        genuinely removed devices are cleaned up. An error says nothing about the
+        device set, so it must not advance that counter: errored polls followed by
+        a single empty one must still preserve the cache.
+        """
+        cached = {"camera1": {"id": "camera1", "state": "CONNECTED"}}
+        coordinator.data["cameras"] = cached
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Bad gateway", status_code=502)
+        )
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._fetch_cameras()
+
+        # First clean poll after the outage genuinely returns no cameras.
+        coordinator.protect_client.cameras.get_all = AsyncMock(return_value=[])
+        await coordinator._fetch_cameras()
+
+        assert "camera1" in coordinator.data["cameras"]
+
+    @pytest.mark.asyncio
+    async def test_sustained_camera_fetch_errors_fail_the_poll(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Preservation is bounded: a lasting outage must mark Protect unavailable.
+
+        Serving a warm cache forever would leave every Protect entity reporting
+        stale state through a controller outage, which is worse than the flapping
+        the bounded window prevents.
+        """
+        coordinator.data["cameras"] = {"camera1": {"id": "camera1"}}
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Response is not JSON", status_code=200)
+        )
+
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._fetch_cameras()
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._fetch_cameras()
+
+    @pytest.mark.asyncio
+    async def test_camera_fetch_error_counter_resets_on_handled_404(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """A 404 is a healthy answer, so it breaks the transient-error streak.
+
+        The endpoint replied, which is evidence the session is alive. Without
+        the reset, three absorbed errors plus a 404 plus one more error would
+        fail the poll on errors that were never consecutive.
+        """
+        coordinator.data["cameras"] = {"camera1": {"id": "camera1"}}
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Blip", status_code=502)
+        )
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._fetch_cameras()
+
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("No cameras configured", 404)
+        )
+        await coordinator._fetch_cameras()
+
+        # Streak was broken, so this error is the first of a new window.
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Blip", status_code=502)
+        )
+        await coordinator._fetch_cameras()
+
+    @pytest.mark.asyncio
+    async def test_light_fetch_error_counter_resets_on_handled_404(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """See the camera case: a handled 404 resets the light error streak."""
+        coordinator.data["lights"] = {"light1": {"id": "light1"}}
+        coordinator.protect_client.lights.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Blip", status_code=502)
+        )
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._fetch_lights()
+
+        coordinator.protect_client.lights.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("No lights configured", 404)
+        )
+        await coordinator._fetch_lights()
+
+        coordinator.protect_client.lights.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Blip", status_code=502)
+        )
+        await coordinator._fetch_lights()
+
+    @pytest.mark.asyncio
+    async def test_camera_fetch_error_counter_resets_on_success(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """A recovered poll re-arms the full preservation window."""
+        coordinator.data["cameras"] = {"camera1": {"id": "camera1"}}
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Blip", status_code=502)
+        )
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._fetch_cameras()
+
+        camera = MagicMock()
+        camera.model_dump = MagicMock(return_value={"id": "camera1", "name": "Cam"})
+        coordinator.protect_client.cameras.get_all = AsyncMock(return_value=[camera])
+        await coordinator._fetch_cameras()
+
+        # Window is re-armed, so the next error is absorbed rather than raised.
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Blip", status_code=502)
+        )
+        await coordinator._fetch_cameras()
+
+        assert "camera1" in coordinator.data["cameras"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["_fetch_cameras", "_fetch_lights"])
+    async def test_fetch_propagates_auth_error(
+        self, coordinator: UnifiProtectCoordinator, method: str
+    ):
+        """An expired key must still reach the reauth flow, not be swallowed."""
+        collection = "cameras" if method == "_fetch_cameras" else "lights"
+        getattr(coordinator.protect_client, collection).get_all = AsyncMock(
+            side_effect=UniFiAuthenticationError("API key expired")
+        )
+
+        with pytest.raises(UniFiAuthenticationError):
+            await getattr(coordinator, method)()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stale_devices_preserves_devices_on_transient_empty(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ):
+        """Test stale device cleanup preserves devices during transient empty poll."""
+        coordinator._previous_protect_device_ids = {
+            "cameras": set(),
+            "lights": set(),
+            "sensors": {"sensor1"},
+            "nvrs": set(),
+            "viewers": set(),
+            "chimes": set(),
+        }
+        coordinator.data["sensors"] = {"sensor1": {"id": "sensor1"}}
+        coordinator.protect_client.sensors.get_all = AsyncMock(return_value=[])
+
+        # 1 transient empty fetch
+        await coordinator._fetch_sensors()
+        assert "sensor1" in coordinator.data["sensors"]
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_device = MagicMock()
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=mock_device
+            )
+            coordinator._cleanup_stale_devices()
+            mock_registry.return_value.async_update_device.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stale_devices_removes_device_after_max_consecutive_empty(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ):
+        """Test stale device cleanup removes devices after max empty polls."""
+        coordinator._previous_protect_device_ids = {
+            "cameras": set(),
+            "lights": set(),
+            "sensors": {"sensor1"},
+            "nvrs": set(),
+            "viewers": set(),
+            "chimes": set(),
+        }
+        coordinator.data["sensors"] = {"sensor1": {"id": "sensor1"}}
+        coordinator.protect_client.sensors.get_all = AsyncMock(return_value=[])
+
+        # 4 consecutive empty polls
+        for _ in range(4):
+            await coordinator._fetch_sensors()
+
+        assert coordinator.data["sensors"] == {}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_device = MagicMock()
+            mock_device.id = "sensor1_entry_id"
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=mock_device
+            )
+            # Removal waits out the MAX_CONSECUTIVE_MISSING_POLLS grace window.
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 1):
+                coordinator._cleanup_stale_devices()
+            mock_registry.return_value.async_update_device.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_preserves_camera_skipped_by_validation(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ):
+        """Test a camera dropped on a ValidationError keeps its cached entry.
+
+        `get_all()` skips an item whose payload will not parse - typically a
+        field reshaped by a Protect release - and returns the rest. That short
+        list is non-empty, so the bounded empty-response guard never engages
+        and the grace window only delays the loss: the skip is deterministic
+        and repeats on every poll. The collection must merge instead of
+        replace while the endpoint reports the result incomplete.
+        """
+        coordinator.data["cameras"] = {
+            "camera1": {"id": "camera1", "name": "Front"},
+            "camera2": {"id": "camera2", "name": "Back"},
+        }
+        coordinator._previous_protect_device_ids["cameras"] = {"camera1", "camera2"}
+
+        mock_camera = MagicMock()
+        mock_camera.model_dump = MagicMock(
+            return_value={"id": "camera1", "name": "Front"}
+        )
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            return_value=[mock_camera]
+        )
+        coordinator.protect_client.cameras.last_result_complete = False
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=MagicMock()
+            )
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 2):
+                await coordinator._fetch_cameras()
+                coordinator._cleanup_stale_devices()
+
+            assert "camera2" in coordinator.data["cameras"]
+            mock_registry.return_value.async_update_device.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_still_refreshes_data_when_result_incomplete(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test preserving a skipped camera does not stall the others' data.
+
+        Merging must layer the fresh response over the cache, not fall back to
+        it, or one unparseable camera would freeze every sibling's state.
+        """
+        coordinator.data["cameras"] = {
+            "camera1": {"id": "camera1", "state": "DISCONNECTED"},
+            "camera2": {"id": "camera2", "state": "CONNECTED"},
+        }
+
+        mock_camera = MagicMock()
+        mock_camera.model_dump = MagicMock(
+            return_value={"id": "camera1", "state": "CONNECTED"}
+        )
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            return_value=[mock_camera]
+        )
+        coordinator.protect_client.cameras.last_result_complete = False
+
+        await coordinator._fetch_cameras()
+
+        assert coordinator.data["cameras"]["camera1"]["state"] == "CONNECTED"
+        assert coordinator.data["cameras"]["camera2"]["state"] == "CONNECTED"
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_replaces_collection_when_result_complete(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test a complete response still drops cameras removed from Protect.
+
+        The merge is scoped to incomplete results; a clean listing remains
+        authoritative so genuinely unadopted cameras are cleaned up.
+        """
+        coordinator.data["cameras"] = {
+            "camera1": {"id": "camera1"},
+            "camera2": {"id": "camera2"},
+        }
+
+        mock_camera = MagicMock()
+        mock_camera.model_dump = MagicMock(return_value={"id": "camera1"})
+        coordinator.protect_client.cameras.get_all = AsyncMock(
+            return_value=[mock_camera]
+        )
+        coordinator.protect_client.cameras.last_result_complete = True
+
+        await coordinator._fetch_cameras()
+
+        assert set(coordinator.data["cameras"]) == {"camera1"}
+
+    @pytest.mark.asyncio
+    async def test_fetch_cameras_preserves_cache_when_every_camera_fails_parsing(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test a schema break that drops every camera does not purge the cache.
+
+        A Protect release reshaping a shared field fails validation for all
+        cameras at once, so `get_all()` returns an empty list that looks
+        exactly like "no cameras adopted". Left there, the bounded
+        empty-response guard clears the collection a few polls later and hands
+        every camera to `_cleanup_stale_devices`. An endpoint that reports the
+        result incomplete must not advance that counter.
+        """
+        coordinator.data["cameras"] = {"camera1": {"id": "camera1"}}
+        coordinator.protect_client.cameras.get_all = AsyncMock(return_value=[])
+        coordinator.protect_client.cameras.last_result_complete = False
+
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES + 3):
+            await coordinator._fetch_cameras()
+
+        assert "camera1" in coordinator.data["cameras"]
+        assert coordinator._consecutive_empty_fetches["cameras"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stale_devices_defers_removal_on_brief_absence(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ):
+        """Test a device missing from one poll is not purged from the registry.
+
+        A partial controller response - or an item that `get_all()` skipped on
+        a ValidationError - drops a still-adopted device out of the collection.
+        Acting on that single poll is irreversible: the registry entry, its
+        area assignment and every automation keyed on device_id are lost.
+        """
+        coordinator._previous_protect_device_ids["cameras"] = {"cam1", "cam2"}
+        coordinator.data["cameras"] = {"cam1": {"id": "cam1"}}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=MagicMock()
+            )
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS):
+                coordinator._cleanup_stale_devices()
+
+            mock_registry.return_value.async_update_device.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stale_devices_removes_device_after_sustained_absence(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ):
+        """Test a device absent past the grace window is still evicted.
+
+        Guards the other half of the deferral: a device genuinely unadopted
+        from Protect must not be tracked forever just because removal is no
+        longer immediate (Gold stale-device requirement).
+        """
+        coordinator._previous_protect_device_ids["cameras"] = {"cam1", "cam2"}
+        coordinator.data["cameras"] = {"cam1": {"id": "cam1"}}
+        mock_device = MagicMock()
+        mock_device.id = "registry_id_cam2"
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=mock_device
+            )
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 1):
+                coordinator._cleanup_stale_devices()
+
+            mock_registry.return_value.async_update_device.assert_called_once_with(
+                device_id="registry_id_cam2",
+                remove_config_entry_id=coordinator.config_entry.entry_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stale_devices_resets_absence_counter_on_return(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ):
+        """Test a device that reappears restarts its grace window.
+
+        Without a reset, intermittent partial responses would accumulate
+        across unrelated polls and eventually evict a healthy device.
+        """
+        coordinator._previous_protect_device_ids["cameras"] = {"cam1", "cam2"}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            mock_registry.return_value.async_get_device = MagicMock(
+                return_value=MagicMock()
+            )
+            # Absent for one poll short of the threshold.
+            coordinator.data["cameras"] = {"cam1": {"id": "cam1"}}
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS):
+                coordinator._cleanup_stale_devices()
+
+            # cam2 comes back, then goes missing again for the same span.
+            coordinator.data["cameras"] = {
+                "cam1": {"id": "cam1"},
+                "cam2": {"id": "cam2"},
+            }
+            coordinator._cleanup_stale_devices()
+
+            coordinator.data["cameras"] = {"cam1": {"id": "cam1"}}
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS):
+                coordinator._cleanup_stale_devices()
+
+            mock_registry.return_value.async_update_device.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fetch_nvr_error(self, coordinator: UnifiProtectCoordinator):
@@ -2931,10 +3619,18 @@ class TestUnifiProtectCoordinator:
     async def test_async_update_data_response_error(
         self, coordinator: UnifiProtectCoordinator
     ):
-        """Test data fetch with response error."""
+        """Test a sustained response error eventually fails the poll.
+
+        The first MAX_CONSECUTIVE_EMPTY_FETCHES polls are absorbed so a single
+        blipped endpoint does not take every Protect entity unavailable; past
+        that window the error propagates and the coordinator reports failure.
+        """
         coordinator.protect_client.cameras.get_all = AsyncMock(
             side_effect=UniFiResponseError("Invalid response", status_code=400)
         )
+
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._async_update_data()
 
         with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
@@ -2943,10 +3639,18 @@ class TestUnifiProtectCoordinator:
     async def test_async_update_data_timeout_error(
         self, coordinator: UnifiProtectCoordinator
     ):
-        """Test data fetch with timeout error."""
+        """Test a sustained timeout error eventually fails the poll.
+
+        The first MAX_CONSECUTIVE_EMPTY_FETCHES polls are absorbed so a single
+        blipped endpoint does not take every Protect entity unavailable; past
+        that window the error propagates and the coordinator reports failure.
+        """
         coordinator.protect_client.cameras.get_all = AsyncMock(
             side_effect=UniFiTimeoutError("Request timed out")
         )
+
+        for _ in range(MAX_CONSECUTIVE_EMPTY_FETCHES):
+            await coordinator._async_update_data()
 
         with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
@@ -3241,7 +3945,9 @@ class TestUnifiFacadeCoordinator:
 
         assert facade_coordinator.available is True
 
-    def test_available_config_fails(self, facade_coordinator: UnifiFacadeCoordinator):
+    def test_available_config_fails_decoupled(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
         """Test available property when config coordinator fails."""
         mock_config = MagicMock()
         mock_config.last_update_success = False
@@ -3255,8 +3961,13 @@ class TestUnifiFacadeCoordinator:
         facade_coordinator._protect_coordinator = mock_protect
 
         assert facade_coordinator.available is False
+        assert facade_coordinator.config_available is False
+        assert facade_coordinator.device_available is True
+        assert facade_coordinator.protect_available is True
 
-    def test_available_device_fails(self, facade_coordinator: UnifiFacadeCoordinator):
+    def test_available_device_fails_decoupled(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
         """Test available property when device coordinator fails."""
         mock_config = MagicMock()
         mock_config.last_update_success = True
@@ -3270,8 +3981,13 @@ class TestUnifiFacadeCoordinator:
         facade_coordinator._protect_coordinator = mock_protect
 
         assert facade_coordinator.available is False
+        assert facade_coordinator.device_available is False
+        assert facade_coordinator.config_available is True
+        assert facade_coordinator.protect_available is True
 
-    def test_available_protect_fails(self, facade_coordinator: UnifiFacadeCoordinator):
+    def test_available_protect_fails_decoupled(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
         """Test available property when protect coordinator fails."""
         mock_config = MagicMock()
         mock_config.last_update_success = True
@@ -3285,6 +4001,29 @@ class TestUnifiFacadeCoordinator:
         facade_coordinator._protect_coordinator = mock_protect
 
         assert facade_coordinator.available is False
+        assert facade_coordinator.protect_available is False
+        assert facade_coordinator.device_available is True
+        assert facade_coordinator.config_available is True
+
+    def test_available_all_coordinators_fail(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test available property when all coordinators fail."""
+        mock_config = MagicMock()
+        mock_config.last_update_success = False
+        mock_device = MagicMock()
+        mock_device.last_update_success = False
+        mock_protect = MagicMock()
+        mock_protect.last_update_success = False
+
+        facade_coordinator._config_coordinator = mock_config
+        facade_coordinator._device_coordinator = mock_device
+        facade_coordinator._protect_coordinator = mock_protect
+
+        assert facade_coordinator.available is False
+        assert facade_coordinator.device_available is False
+        assert facade_coordinator.config_available is False
+        assert facade_coordinator.protect_available is False
 
     def test_available_no_protect(
         self, facade_coordinator_no_protect: UnifiFacadeCoordinator
@@ -3300,6 +4039,7 @@ class TestUnifiFacadeCoordinator:
         # protect_coordinator is None by default for this fixture
 
         assert facade_coordinator_no_protect.available is True
+        assert facade_coordinator_no_protect.protect_available is True
 
     @pytest.mark.asyncio
     async def test_async_update_data(self, facade_coordinator: UnifiFacadeCoordinator):

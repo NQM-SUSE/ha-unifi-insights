@@ -6,9 +6,9 @@ import logging
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
-import pytest
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -2992,6 +2992,7 @@ class TestUnifiOutletSwitch:
         """Create mock coordinator with PDU device data."""
         coordinator = MagicMock()
         coordinator.available = True
+        coordinator.device_available = True
         coordinator.data = {
             "devices": {
                 "site1": {
@@ -3101,6 +3102,23 @@ class TestUnifiOutletSwitch:
         assert attrs["cycle_enabled"] is True
         assert attrs["outlet_power"] == 150.0
 
+    def test_outlet_switch_unavailable_when_device_coordinator_unavailable(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """Test outlet switch unavailable when device coordinator is unavailable."""
+        mock_coordinator.device_available = False
+        outlet_data = mock_coordinator.data["devices"]["site1"]["pdu1"]["outlet_table"][
+            0
+        ]
+        switch = UnifiOutletSwitch(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            device_id="pdu1",
+            outlet_index=1,
+            outlet_data=outlet_data,
+        )
+        assert switch.available is False
+
     @pytest.mark.asyncio
     async def test_outlet_switch_turn_on(self, mock_coordinator) -> None:
         """Test turning on the outlet switch."""
@@ -3199,6 +3217,7 @@ class TestUnifiOutletCycleSwitch:
         """Create mock coordinator with PDU device data."""
         coordinator = MagicMock()
         coordinator.available = True
+        coordinator.device_available = True
         coordinator.data = {
             "devices": {
                 "site1": {
@@ -3258,6 +3277,23 @@ class TestUnifiOutletCycleSwitch:
         assert switch.entity_registry_enabled_default is False
         assert switch.is_on is True
         assert switch.available is True
+
+    def test_cycle_switch_unavailable_when_device_coordinator_unavailable(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """Test cycle switch unavailable when device coordinator is unavailable."""
+        mock_coordinator.device_available = False
+        outlet_data = mock_coordinator.data["devices"]["site1"]["pdu1"]["outlet_table"][
+            0
+        ]
+        switch = UnifiOutletCycleSwitch(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            device_id="pdu1",
+            outlet_index=1,
+            outlet_data=outlet_data,
+        )
+        assert switch.available is False
 
     @pytest.mark.asyncio
     async def test_cycle_switch_turn_on(self, mock_coordinator) -> None:

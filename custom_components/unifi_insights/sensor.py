@@ -2188,6 +2188,9 @@ class UnifiProtectNVRSensor(UnifiProtectEntity, SensorEntity):
         NVR doesn't have a 'state' field like cameras, so we check if we have
         valid NVR data and if storage info is available for storage sensors.
         """
+        if not self.coordinator.protect_available:
+            return False
+
         nvr_data = self.coordinator.data["protect"]["nvrs"].get(self._device_id)
         if not nvr_data or not isinstance(nvr_data, dict):
             return False

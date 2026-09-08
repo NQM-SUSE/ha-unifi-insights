@@ -153,6 +153,8 @@ class UnifiProtectDoorbellEventEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
+        if not self.coordinator.protect_available:
+            return False
         camera_data = self.coordinator.data["protect"]["cameras"].get(self._device_id)
         if not camera_data:
             return False
@@ -161,6 +163,10 @@ class UnifiProtectDoorbellEventEntity(
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        if not self.coordinator.protect_available:
+            if self.hass is not None:
+                self.async_write_ha_state()
+            return
         camera_data = self.coordinator.data["protect"]["cameras"].get(
             self._device_id, {}
         )
@@ -228,6 +234,8 @@ class UnifiProtectSmartDetectEventEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
+        if not self.coordinator.protect_available:
+            return False
         camera_data = self.coordinator.data["protect"]["cameras"].get(self._device_id)
         if not camera_data:
             return False
@@ -236,6 +244,10 @@ class UnifiProtectSmartDetectEventEntity(
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        if not self.coordinator.protect_available:
+            if self.hass is not None:
+                self.async_write_ha_state()
+            return
         camera_data = self.coordinator.data["protect"]["cameras"].get(
             self._device_id, {}
         )
@@ -312,6 +324,8 @@ class UnifiProtectSensorEventEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
+        if not self.coordinator.protect_available:
+            return False
         sensor_data = self.coordinator.data["protect"]["sensors"].get(self._device_id)
         if not sensor_data:
             return False
@@ -320,6 +334,10 @@ class UnifiProtectSensorEventEntity(
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        if not self.coordinator.protect_available:
+            if self.hass is not None:
+                self.async_write_ha_state()
+            return
         sensor_data = self.coordinator.data["protect"]["sensors"].get(
             self._device_id, {}
         )

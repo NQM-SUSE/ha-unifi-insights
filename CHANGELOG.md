@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Protect entities (cameras, lights, door sensors, doorbell/smart-detect events, NVR sensors) no longer go unavailable when the _Network_ API has a transient error. Entity availability is now gated on the sub-coordinator that actually provides the data instead of an aggregate fold across all of them, so a Network session drop (`Response is not JSON: <!doctype html>`) leaves Protect entities alone. PDU outlet switches gate on the device coordinator for the same reason.
+- Protect devices are no longer permanently removed from the Home Assistant device registry because of a transient polling failure. A single empty list, 404, fetch error or short response used to be enough to purge a device, losing its area assignment, entity customizations and any automation keyed on `device_id`. Recovery is bounded on several fronts:
+  - Empty or 404 device collections preserve the cache for up to 3 consecutive polls before clearing, so genuinely unadopted devices are still cleaned up.
+  - Fetch errors (transport failures, HTTP 500s) preserve the cache without counting toward that limit - an error means "we could not ask", not "the devices are gone". This now applies to the camera and light endpoints too: previously only a 404 was handled there, so any other error aborted the whole Protect poll and took every Protect entity unavailable. Absorption is bounded at 3 consecutive failed polls per collection, after which the error is allowed through so a genuine controller outage still marks entities unavailable instead of serving a stale cache. Authentication errors are never absorbed, so reauth still triggers immediately.
+  - A device missing from its collection must now be absent for more than 3 consecutive polls (~90s) before it is removed from the device registry.
+  - When the Protect API returns a device whose payload fails to parse, that device is skipped as before but the response is flagged incomplete: the collection is merged over the cache rather than replacing it, so a field reshaped by a Protect release cannot evict the affected devices. If _every_ device in a family fails to parse, the cache is preserved instead of being treated as an empty controller.
+
 ### CI & Testing
 
 - Added GitHub Actions workflow (`.github/workflows/test.yml`) to run pytest with branch coverage and upload reports to Codecov (`codecov/codecov-action@v5`).

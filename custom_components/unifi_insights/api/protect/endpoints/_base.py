@@ -36,6 +36,11 @@ class ProtectDeviceEndpoint(Generic[_ModelT]):
 
         """
         self._client = client
+        # False when the most recent get_all() silently dropped an item on a
+        # ValidationError. Callers need to tell a complete listing from a short
+        # one: a device absent because its payload would not parse is still
+        # adopted, and must not be treated as removed.
+        self.last_result_complete: bool = True
 
     async def get_all(self, site_id: str | None = None) -> list[_ModelT]:
         """
@@ -49,6 +54,7 @@ class ProtectDeviceEndpoint(Generic[_ModelT]):
 
         """
         path = self._client.build_api_path(f"/{self._resource}", site_id)
+        self.last_result_complete = True
         response = await self._client._get(path)
 
         if response is None:
@@ -65,6 +71,7 @@ class ProtectDeviceEndpoint(Generic[_ModelT]):
             try:
                 items.append(self._model.model_validate(item))
             except ValidationError as err:
+                self.last_result_complete = False
                 _LOGGER.warning(
                     "Skipping %s that failed to parse (id=%s): %s",
                     self._resource,

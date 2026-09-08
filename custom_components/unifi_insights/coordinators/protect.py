@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime, timedelta
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.core import callback
@@ -14,6 +14,7 @@ from homeassistant.helpers import device_registry as dr
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
+    UniFiNotFoundError,
     UniFiResponseError,
     UniFiTimeoutError,
 )
@@ -59,6 +60,17 @@ _LOGGER = logging.getLogger(__name__)
 # -digit minutes rather than staying wrong for hours. It is deliberately not
 # tied to any one event type - see `_reconcile_stale_events`.
 STALE_EVENT_TIMEOUT: Final = timedelta(minutes=5)
+MAX_CONSECUTIVE_EMPTY_FETCHES: Final = 3
+
+# How many consecutive polls a device may be absent from its collection before
+# `_cleanup_stale_devices` removes it from the device registry. That removal is
+# irreversible - it drops the area assignment, entity customizations and any
+# automation keyed on device_id - while the absence itself is ambiguous: the
+# coordinator cannot tell "unadopted from Protect" from "omitted by a partial
+# controller response" or "skipped by `get_all()` on a ValidationError". The
+# grace window keeps the eviction, just no longer on the strength of a single
+# poll. 3 polls is ~90s at SCAN_INTERVAL_PROTECT (30s).
+MAX_CONSECUTIVE_MISSING_POLLS: Final = 3
 
 # Envelope-only keys that must never leak from the raw top-level WebSocket
 # frame into a merged device/event dict - see `_pick_field` and the
@@ -138,6 +150,32 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
             "nvrs": set(),
             "viewers": set(),
             "chimes": set(),
+        }
+        self._consecutive_empty_fetches: dict[str, int] = {
+            "cameras": 0,
+            "lights": 0,
+            "sensors": 0,
+            "nvrs": 0,
+            "viewers": 0,
+            "chimes": 0,
+        }
+        # collection -> consecutive polls whose fetch raised a transient error.
+        # Kept separate from `_consecutive_empty_fetches`: an empty response is
+        # evidence the devices are gone, an error is evidence of nothing.
+        self._consecutive_fetch_errors: dict[str, int] = {
+            "cameras": 0,
+            "lights": 0,
+        }
+        # device_type -> {device_id: consecutive polls the device has been
+        # missing from its collection}. Drives the registry-removal grace
+        # window in `_cleanup_stale_devices`.
+        self._consecutive_missing_polls: dict[str, dict[str, int]] = {
+            "cameras": {},
+            "lights": {},
+            "sensors": {},
+            "nvrs": {},
+            "viewers": {},
+            "chimes": {},
         }
         self.data: dict[str, Any] = {
             "cameras": {},
@@ -1024,29 +1062,190 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         # Should never reach here due to raises above
         return self.data  # pragma: no cover
 
+    def _absorb_transient_fetch_error(
+        self, collection_key: str, err: Exception
+    ) -> bool:
+        """
+        Return True if a transient fetch error should be absorbed this poll.
+
+        `_fetch_cameras` and `_fetch_lights` run before every other fetcher, so
+        letting an error escape aborts the whole poll and raises `UpdateFailed`,
+        taking every Protect entity unavailable over one blipped endpoint. The
+        first `MAX_CONSECUTIVE_EMPTY_FETCHES` failures are absorbed and the cache
+        is preserved instead.
+
+        Absorption is bounded on purpose: past the window the error propagates so
+        a real controller outage still marks the entities unavailable rather than
+        serving a stale cache indefinitely.
+        """
+        count = self._consecutive_fetch_errors.get(collection_key, 0) + 1
+        self._consecutive_fetch_errors[collection_key] = count
+        if count > MAX_CONSECUTIVE_EMPTY_FETCHES:
+            _LOGGER.warning(
+                "Protect coordinator: %s fetch failed for %d consecutive polls "
+                "(%s); failing the update",
+                collection_key,
+                count,
+                err,
+            )
+            return False
+        _LOGGER.warning(
+            "Protect coordinator: Error fetching %s (poll %d/%d): %s; "
+            "preserving cached devices",
+            collection_key,
+            count,
+            MAX_CONSECUTIVE_EMPTY_FETCHES,
+            err,
+        )
+        # Leave the cached collection untouched and hold the empty-response
+        # eviction counter at zero: a failed fetch is no evidence a device was
+        # removed. Deliberately not routed through `_update_device_collection`,
+        # whose `is_partial` path would log a parse failure that did not happen.
+        self._consecutive_empty_fetches[collection_key] = 0
+        return True
+
+    def _update_device_collection(
+        self,
+        collection_key: str,
+        new_items: dict[str, Any],
+        *,
+        is_404: bool = False,
+        is_partial: bool = False,
+    ) -> None:
+        """
+        Update a device collection with bounded cache preservation.
+
+        Preserves existing cached items across up to MAX_CONSECUTIVE_EMPTY_FETCHES
+        transient empty responses or 404 errors. If empty/404 persists beyond the
+        threshold, the collection is cleared so genuinely removed or unadopted devices
+        are cleaned up from the device registry.
+
+        `is_partial` marks a response the endpoint already knows is short - it
+        dropped an item on a ValidationError. Those results are merged over the
+        cache rather than replacing it, because the missing device is still
+        adopted and the bounded empty-response guard never sees a short list.
+        """
+        existing = self.data.get(collection_key)
+        if not isinstance(existing, dict):
+            existing = {}
+            self.data[collection_key] = existing
+
+        if new_items:
+            self._consecutive_empty_fetches[collection_key] = 0
+            if is_partial:
+                # Layer the fresh response over the cache: siblings still get
+                # their new state, and the dropped device keeps its last-known
+                # entry so `_cleanup_stale_devices` never reads it as removed.
+                _LOGGER.debug(
+                    "Protect coordinator: %s response was incomplete; merging "
+                    "%d fetched over %d cached devices",
+                    collection_key,
+                    len(new_items),
+                    len(existing),
+                )
+                self.data[collection_key] = {**existing, **new_items}
+                return
+            # known gap: completeness is only known for items the endpoint itself
+            # dropped. A response short because the controller omitted a device
+            # (e.g. 3 of 5 during a partial start) still looks authoritative here;
+            # the grace window in `_cleanup_stale_devices` is what covers that.
+            self.data[collection_key] = new_items
+            return
+
+        # An incomplete response that came back with nothing left is a parse
+        # failure across the whole collection, not an empty controller. Treat
+        # it like a fetch error: preserve the cache and do not advance the
+        # eviction counter, or a schema change affecting every device of a
+        # family would purge them all a few polls later.
+        if is_partial and existing:
+            _LOGGER.warning(
+                "Protect coordinator: every %s in the response failed to parse; "
+                "preserving %d cached devices",
+                collection_key,
+                len(existing),
+            )
+            self._consecutive_empty_fetches[collection_key] = 0
+            return
+
+        # Response is empty or 404
+        if not existing:
+            # Collection was already empty; nothing to preserve
+            self.data[collection_key] = {}
+            self._consecutive_empty_fetches[collection_key] = 0
+            if is_404:
+                _LOGGER.debug(
+                    (
+                        "Protect coordinator: %s endpoint returned 404;"
+                        " no devices configured"
+                    ),
+                    collection_key,
+                )
+            return
+
+        # Collection had items; handle transient vs persistent outage
+        count = self._consecutive_empty_fetches.get(collection_key, 0) + 1
+        self._consecutive_empty_fetches[collection_key] = count
+        status_desc = "404" if is_404 else "empty response"
+
+        if count <= MAX_CONSECUTIVE_EMPTY_FETCHES:
+            _LOGGER.debug(
+                "Protect coordinator: %s fetch returned %s (poll %d/%d); "
+                "preserving %d cached devices",
+                collection_key,
+                status_desc,
+                count,
+                MAX_CONSECUTIVE_EMPTY_FETCHES,
+                len(existing),
+            )
+        else:
+            _LOGGER.warning(
+                "Protect coordinator: %s fetch returned %s for %d consecutive polls; "
+                "clearing cached devices",
+                collection_key,
+                status_desc,
+                count,
+            )
+            self.data[collection_key] = {}
+            self._consecutive_empty_fetches[collection_key] = 0
+
     async def _fetch_cameras(self) -> None:
         """Fetch camera data."""
         if not self.protect_client:
             return
 
         _LOGGER.debug("Protect coordinator: Fetching cameras")
-        cameras_models = await self.protect_client.cameras.get_all()
-        # Rebuild the dict from the API response so cameras removed from
-        # Protect disappear from coordinator data (enables stale cleanup).
-        cameras: dict[str, Any] = {}
-        for camera_model in cameras_models:
-            camera = self._normalize_camera_data(self._model_to_dict(camera_model))
-            camera_id = camera.get("id")
-            if camera_id:
-                cameras[camera_id] = camera
+        try:
+            cameras_models = await self.protect_client.cameras.get_all()
+            # Rebuild the dict from the API response so cameras removed from
+            # Protect disappear from coordinator data (enables stale cleanup).
+            cameras: dict[str, Any] = {}
+            for camera_model in cameras_models:
+                camera = self._normalize_camera_data(self._model_to_dict(camera_model))
+                camera_id = camera.get("id")
+                if camera_id:
+                    cameras[camera_id] = camera
 
-                _LOGGER.debug(
-                    "Protect coordinator: Camera %s supports smart detection: %s",
-                    camera.get("name", camera_id),
-                    camera.get("smartDetectTypes", []),
-                )
-        self.data["cameras"] = cameras
-        self._drop_rebuilt_latch_trackers(cameras)
+                    _LOGGER.debug(
+                        "Protect coordinator: Camera %s supports smart detection: %s",
+                        camera.get("name", camera_id),
+                        camera.get("smartDetectTypes", []),
+                    )
+            self._consecutive_fetch_errors["cameras"] = 0
+            self._update_device_collection(
+                "cameras",
+                cameras,
+                is_partial=not self.protect_client.cameras.last_result_complete,
+            )
+        except UniFiNotFoundError:
+            # The endpoint answered, so the session is alive: end any error streak.
+            self._consecutive_fetch_errors["cameras"] = 0
+            self._update_device_collection("cameras", {}, is_404=True)
+        except (UniFiConnectionError, UniFiTimeoutError, UniFiResponseError) as err:
+            # Auth and unexpected errors deliberately stay uncaught: reauth must
+            # still trigger, and an unknown failure should not be papered over.
+            if not self._absorb_transient_fetch_error("cameras", err):
+                raise
+        self._drop_rebuilt_latch_trackers(self.data["cameras"])
 
     def _drop_rebuilt_latch_trackers(self, cameras: dict[str, Any]) -> None:
         """
@@ -1087,14 +1286,28 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
             return
 
         _LOGGER.debug("Protect coordinator: Fetching lights")
-        lights_models = await self.protect_client.lights.get_all()
-        lights: dict[str, Any] = {}
-        for light_model in lights_models:
-            light = self._model_to_dict(light_model)
-            light_id = light.get("id")
-            if light_id:
-                lights[light_id] = light
-        self.data["lights"] = lights
+        try:
+            lights_models = await self.protect_client.lights.get_all()
+            lights: dict[str, Any] = {}
+            for light_model in lights_models:
+                light = self._model_to_dict(light_model)
+                light_id = light.get("id")
+                if light_id:
+                    lights[light_id] = light
+            self._consecutive_fetch_errors["lights"] = 0
+            self._update_device_collection(
+                "lights",
+                lights,
+                is_partial=not self.protect_client.lights.last_result_complete,
+            )
+        except UniFiNotFoundError:
+            # The endpoint answered, so the session is alive: end any error streak.
+            self._consecutive_fetch_errors["lights"] = 0
+            self._update_device_collection("lights", {}, is_404=True)
+        except (UniFiConnectionError, UniFiTimeoutError, UniFiResponseError) as err:
+            # See `_fetch_cameras` for why this is bounded rather than swallowed.
+            if not self._absorb_transient_fetch_error("lights", err):
+                raise
 
     async def _fetch_sensors(self) -> None:
         """Fetch sensor data."""
@@ -1110,11 +1323,17 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                 sensor_id = sensor.get("id")
                 if sensor_id:
                     sensors[sensor_id] = sensor
-            self.data["sensors"] = sensors
+            self._update_device_collection(
+                "sensors",
+                sensors,
+                is_partial=not self.protect_client.sensors.last_result_complete,
+            )
             _LOGGER.debug(
                 "Protect coordinator: Successfully fetched %d sensors",
                 len(sensors_models),
             )
+        except UniFiNotFoundError:
+            self._update_device_collection("sensors", {}, is_404=True)
         except Exception as err:
             _LOGGER.warning("Protect coordinator: Error fetching sensors: %s", err)
 
@@ -1127,13 +1346,16 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         try:
             nvr_model = await self.protect_client.nvr.get()
             nvr = self._model_to_dict(nvr_model)
-            if nvr:
-                nvr_id = nvr.get("id")
-                if nvr_id:
-                    self.data["nvrs"] = {nvr_id: nvr}
-                    _LOGGER.debug(
-                        "Protect coordinator: Successfully fetched NVR: %s", nvr_id
-                    )
+            nvr_id = nvr.get("id") if isinstance(nvr, dict) else None
+            if nvr_id:
+                self._update_device_collection("nvrs", {nvr_id: nvr})
+                _LOGGER.debug(
+                    "Protect coordinator: Successfully fetched NVR: %s", nvr_id
+                )
+            else:
+                self._update_device_collection("nvrs", {})
+        except UniFiNotFoundError:
+            self._update_device_collection("nvrs", {}, is_404=True)
         except Exception as err:
             _LOGGER.debug("Protect coordinator: Error fetching NVR: %s", err)
 
@@ -1151,11 +1373,17 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                 chime_id = chime.get("id")
                 if chime_id:
                     chimes[chime_id] = chime
-            self.data["chimes"] = chimes
+            self._update_device_collection(
+                "chimes",
+                chimes,
+                is_partial=not self.protect_client.chimes.last_result_complete,
+            )
             _LOGGER.debug(
                 "Protect coordinator: Successfully fetched %d chimes",
                 len(chimes_models),
             )
+        except UniFiNotFoundError:
+            self._update_device_collection("chimes", {}, is_404=True)
         except Exception as err:
             _LOGGER.warning("Protect coordinator: Error fetching chimes: %s", err)
 
@@ -1174,11 +1402,16 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                     viewer_id = viewer.get("id")
                     if viewer_id:
                         viewers[viewer_id] = viewer
-                self.data["viewers"] = viewers
+                complete = self.protect_client.viewers.last_result_complete
+                self._update_device_collection(
+                    "viewers", viewers, is_partial=not complete
+                )
                 _LOGGER.debug(
                     "Protect coordinator: Successfully fetched %d viewers",
                     len(viewers_models),
                 )
+        except UniFiNotFoundError:
+            self._update_device_collection("viewers", {}, is_404=True)
         except Exception as err:
             _LOGGER.debug("Protect coordinator: Error fetching viewers: %s", err)
 
@@ -1206,7 +1439,17 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
             _LOGGER.debug("Protect coordinator: Error fetching liveviews: %s", err)
 
     def _cleanup_stale_devices(self) -> None:
-        """Remove stale Protect devices from the device registry (Gold requirement)."""
+        """
+        Remove stale Protect devices from the device registry (Gold requirement).
+
+        A device is only evicted once it has been absent for more than
+        MAX_CONSECUTIVE_MISSING_POLLS consecutive polls. A single poll is not
+        evidence of removal: a partial controller response, or an item that
+        `get_all()` skipped on a ValidationError, drops a still-adopted device
+        out of the collection, and `async_update_device(remove_config_entry_id=)`
+        cannot be undone. Devices still inside the grace window stay in the
+        tracked set so their absence keeps accumulating across polls.
+        """
         device_registry = dr.async_get(self.hass)
 
         for device_type in [
@@ -1219,9 +1462,32 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         ]:
             current_ids: set[str] = set(self.data.get(device_type, {}).keys())
             previous_ids = self._previous_protect_device_ids.get(device_type, set())
+            missing_polls = self._consecutive_missing_polls.setdefault(device_type, {})
 
-            stale_ids = previous_ids - current_ids
-            for device_id in stale_ids:
+            # A device that reported in restarts its grace window.
+            for device_id in current_ids:
+                missing_polls.pop(device_id, None)
+
+            # Devices still within the grace window are kept under observation
+            # rather than evicted, and stay tracked for the next poll.
+            pending_ids: set[str] = set()
+
+            for device_id in previous_ids - current_ids:
+                count = missing_polls.get(device_id, 0) + 1
+                if count <= MAX_CONSECUTIVE_MISSING_POLLS:
+                    missing_polls[device_id] = count
+                    pending_ids.add(device_id)
+                    _LOGGER.debug(
+                        "Protect coordinator: %s device %s missing from poll "
+                        "%d/%d; deferring registry removal",
+                        device_type,
+                        device_id,
+                        count,
+                        MAX_CONSECUTIVE_MISSING_POLLS,
+                    )
+                    continue
+
+                missing_polls.pop(device_id, None)
                 # Try both identifier patterns (with and without "protect_" prefix)
                 for identifier in [
                     f"protect_{device_type[:-1]}_{device_id}",  # protect_camera_xyz
@@ -1232,9 +1498,11 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                     )
                     if device:
                         _LOGGER.info(
-                            "Protect coordinator: Removing stale %s device: %s",
+                            "Protect coordinator: Removing stale %s device: %s "
+                            "(absent for %d consecutive polls)",
                             device_type,
                             device_id,
+                            count,
                         )
                         device_registry.async_update_device(
                             device_id=device.id,
@@ -1242,7 +1510,7 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                         )
                         break
 
-            self._previous_protect_device_ids[device_type] = current_ids
+            self._previous_protect_device_ids[device_type] = current_ids | pending_ids
 
     def get_camera(self, camera_id: str) -> dict[str, Any] | None:
         """Get camera data by ID."""

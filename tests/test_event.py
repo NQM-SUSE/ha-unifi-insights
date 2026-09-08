@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
-from homeassistant.components.event import EventDeviceClass
 import pytest
+from homeassistant.components.event import EventDeviceClass
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 from custom_components.unifi_insights.event import (
     EVENT_TYPE_DOORBELL_RING,
@@ -293,6 +297,40 @@ class TestUnifiProtectDoorbellEventEntity:
 
         assert entity.available is False
 
+    def test_unavailable_when_protect_coordinator_fails(self, mock_coordinator) -> None:
+        """Test entity unavailable when Protect coordinator fails."""
+        mock_coordinator.protect_available = False
+        entity = UnifiProtectDoorbellEventEntity(
+            coordinator=mock_coordinator,
+            device_id="camera1",
+        )
+        assert entity.available is False
+
+    def test_handle_update_skips_when_protect_coordinator_fails(
+        self, hass: HomeAssistant, mock_coordinator
+    ) -> None:
+        """Test update handler skips triggering event when Protect fails."""
+        mock_coordinator.protect_available = False
+        mock_coordinator.data["protect"]["cameras"]["camera1"]["lastRingStart"] = 12345
+        entity = UnifiProtectDoorbellEventEntity(
+            coordinator=mock_coordinator,
+            device_id="camera1",
+        )
+        # Test branch where hass is None
+        with patch.object(entity, "_trigger_event") as mock_trigger:
+            entity._handle_coordinator_update()
+            mock_trigger.assert_not_called()
+
+        # Test branch where hass is set
+        entity.hass = hass
+        with (
+            patch.object(entity, "_trigger_event") as mock_trigger,
+            patch.object(entity, "async_write_ha_state") as mock_write_state,
+        ):
+            entity._handle_coordinator_update()
+            mock_trigger.assert_not_called()
+            mock_write_state.assert_called_once()
+
     def test_device_info(self, mock_coordinator) -> None:
         """Test device info is set correctly."""
         entity = UnifiProtectDoorbellEventEntity(
@@ -391,6 +429,42 @@ class TestUnifiProtectSmartDetectEventEntity:
 
         assert entity.available is False
 
+    def test_unavailable_when_protect_coordinator_fails(self, mock_coordinator) -> None:
+        """Test entity unavailable when Protect coordinator fails."""
+        mock_coordinator.protect_available = False
+        entity = UnifiProtectSmartDetectEventEntity(
+            coordinator=mock_coordinator,
+            device_id="camera1",
+        )
+        assert entity.available is False
+
+    def test_handle_update_skips_when_protect_coordinator_fails(
+        self, hass: HomeAssistant, mock_coordinator
+    ) -> None:
+        """Test update handler skips triggering event when Protect fails."""
+        mock_coordinator.protect_available = False
+        mock_coordinator.data["protect"]["cameras"]["camera1"]["lastMotionStart"] = (
+            12345
+        )
+        entity = UnifiProtectSmartDetectEventEntity(
+            coordinator=mock_coordinator,
+            device_id="camera1",
+        )
+        # Test branch where hass is None
+        with patch.object(entity, "_trigger_event") as mock_trigger:
+            entity._handle_coordinator_update()
+            mock_trigger.assert_not_called()
+
+        # Test branch where hass is set
+        entity.hass = hass
+        with (
+            patch.object(entity, "_trigger_event") as mock_trigger,
+            patch.object(entity, "async_write_ha_state") as mock_write_state,
+        ):
+            entity._handle_coordinator_update()
+            mock_trigger.assert_not_called()
+            mock_write_state.assert_called_once()
+
     def test_device_info(self, mock_coordinator) -> None:
         """Test device info is set correctly."""
         entity = UnifiProtectSmartDetectEventEntity(
@@ -484,6 +558,42 @@ class TestUnifiProtectSensorEventEntity:
         )
 
         assert entity.available is False
+
+    def test_unavailable_when_protect_coordinator_fails(self, mock_coordinator) -> None:
+        """Test entity unavailable when Protect coordinator fails."""
+        mock_coordinator.protect_available = False
+        entity = UnifiProtectSensorEventEntity(
+            coordinator=mock_coordinator,
+            device_id="sensor1",
+        )
+        assert entity.available is False
+
+    def test_handle_update_skips_when_protect_coordinator_fails(
+        self, hass: HomeAssistant, mock_coordinator
+    ) -> None:
+        """Test update handler skips triggering event when Protect fails."""
+        mock_coordinator.protect_available = False
+        mock_coordinator.data["protect"]["sensors"]["sensor1"][
+            "openStatusChangedAt"
+        ] = 12345
+        entity = UnifiProtectSensorEventEntity(
+            coordinator=mock_coordinator,
+            device_id="sensor1",
+        )
+        # Test branch where hass is None
+        with patch.object(entity, "_trigger_event") as mock_trigger:
+            entity._handle_coordinator_update()
+            mock_trigger.assert_not_called()
+
+        # Test branch where hass is set
+        entity.hass = hass
+        with (
+            patch.object(entity, "_trigger_event") as mock_trigger,
+            patch.object(entity, "async_write_ha_state") as mock_write_state,
+        ):
+            entity._handle_coordinator_update()
+            mock_trigger.assert_not_called()
+            mock_write_state.assert_called_once()
 
     def test_device_info(self, mock_coordinator) -> None:
         """Test device info is set correctly."""

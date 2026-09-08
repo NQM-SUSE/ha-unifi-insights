@@ -197,15 +197,27 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def available(self) -> bool:
-        """Return combined availability from all coordinators."""
-        device_available = self._device_coordinator.last_update_success
-        config_available = self._config_coordinator.last_update_success
-        protect_available = (
-            self._protect_coordinator.last_update_success
-            if self._protect_coordinator
-            else True
+        """Return combined availability from all sub-coordinators."""
+        return (
+            self.device_available and self.config_available and self.protect_available
         )
-        return device_available and config_available and protect_available
+
+    @property
+    def device_available(self) -> bool:
+        """Return True if the device coordinator is available."""
+        return self._device_coordinator.last_update_success
+
+    @property
+    def config_available(self) -> bool:
+        """Return True if the config coordinator is available."""
+        return self._config_coordinator.last_update_success
+
+    @property
+    def protect_available(self) -> bool:
+        """Return True if the protect coordinator is available or not configured."""
+        if self._protect_coordinator is None:
+            return True
+        return self._protect_coordinator.last_update_success
 
     async def _async_update_data(self) -> dict[str, Any]:
         """
