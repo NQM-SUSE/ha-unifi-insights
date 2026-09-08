@@ -51,14 +51,15 @@ def _client_should_be_tracked(
     return track_wifi or track_wired
 
 
-def _connected_clients_to_track(
+def _partition_connected_clients(
     coordinator: UnifiFacadeCoordinator,
     *,
     track_wifi: bool,
     track_wired: bool,
-) -> dict[str, str]:
-    """Map MAC (lowercase) -> site_id for connected clients that should track."""
+) -> tuple[dict[str, str], set[str]]:
+    """Split connected clients into tracked (MAC -> site_id) and untracked MACs."""
     wanted: dict[str, str] = {}
+    untracked: set[str] = set()
     for site_id, clients in coordinator.data.get("clients", {}).items():
         if not isinstance(clients, dict):
             continue
@@ -70,6 +71,21 @@ def _connected_clients_to_track(
                 client_data, track_wifi=track_wifi, track_wired=track_wired
             ):
                 wanted[mac.lower()] = site_id
+            else:
+                untracked.add(mac.lower())
+    return wanted, untracked
+
+
+def _connected_clients_to_track(
+    coordinator: UnifiFacadeCoordinator,
+    *,
+    track_wifi: bool,
+    track_wired: bool,
+) -> dict[str, str]:
+    """Map MAC (lowercase) -> site_id for connected clients that should track."""
+    wanted, _ = _partition_connected_clients(
+        coordinator, track_wifi=track_wifi, track_wired=track_wired
+    )
     return wanted
 
 
@@ -89,30 +105,47 @@ async def async_setup_entry(
 
     _LOGGER.debug("Client tracking - WiFi: %s, Wired: %s", track_wifi, track_wired)
 
-    # Reconcile the entity registry with the current options/connected clients.
-    # This runs on every setup (including option-change reloads), so disabling a
-    # client type removes its trackers and only currently connected clients of
-    # the enabled types remain. Without this, toggling options would leave stale
-    # "unavailable" trackers behind.
-    wanted = _connected_clients_to_track(
-        coordinator, track_wifi=track_wifi, track_wired=track_wired
-    )
-    wanted_unique_ids = {f"{DOMAIN}_{mac}" for mac in wanted}
+    # Reconcile the entity registry with the current options. This runs on every
+    # setup, including option-change reloads.
+    #
+    # Only remove a tracker when the configuration says it is unwanted: either
+    # tracking is off entirely, or the client is currently connected with a type
+    # that is no longer tracked.
+    #
+    # A client merely missing from the connected-client snapshot is NOT evidence
+    # that its tracker should go -- it may be powered off or roaming, or the poll
+    # behind `coordinator.data` may have failed or not run yet. Removing the
+    # registry entry is permanent and destroys the user's name, area, and
+    # entity_id customisation, and reporting `not_home` for an absent device is
+    # the entire purpose of a device tracker.
     registry = er.async_get(hass)
-    for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
-        if (
-            reg_entry.domain == "device_tracker"
-            and reg_entry.platform == DOMAIN
-            and reg_entry.unique_id not in wanted_unique_ids
-        ):
-            _LOGGER.debug(
-                "Removing client tracker %s (no longer tracked)", reg_entry.entity_id
-            )
-            registry.async_remove(reg_entry.entity_id)
+    client_trackers = [
+        reg_entry
+        for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id)
+        if reg_entry.domain == "device_tracker" and reg_entry.platform == DOMAIN
+    ]
 
     if not track_wifi and not track_wired:
+        for reg_entry in client_trackers:
+            _LOGGER.debug(
+                "Removing client tracker %s (client tracking disabled)",
+                reg_entry.entity_id,
+            )
+            registry.async_remove(reg_entry.entity_id)
         _LOGGER.debug("Client tracking disabled - no client trackers created")
         return
+
+    _, untracked_macs = _partition_connected_clients(
+        coordinator, track_wifi=track_wifi, track_wired=track_wired
+    )
+    untracked_unique_ids = {f"{DOMAIN}_{mac}" for mac in untracked_macs}
+    for reg_entry in client_trackers:
+        if reg_entry.unique_id in untracked_unique_ids:
+            _LOGGER.debug(
+                "Removing client tracker %s (client type no longer tracked)",
+                reg_entry.entity_id,
+            )
+            registry.async_remove(reg_entry.entity_id)
 
     # Per-setup dedup set (recreated on every reload so re-enabling re-adds
     # entities); MAC is globally unique so it is used as the key.

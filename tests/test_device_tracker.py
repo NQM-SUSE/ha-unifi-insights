@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-from homeassistant.components.device_tracker import SourceType
 import pytest
+from homeassistant.components.device_tracker import SourceType
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.unifi_insights.const import DOMAIN
 from custom_components.unifi_insights.device_tracker import (
     PARALLEL_UPDATES,
     UnifiClientTracker,
     _get_client_type,
     async_setup_entry,
 )
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+    from homeassistant.helpers import entity_registry as er
 
 
 class TestParallelUpdates:
@@ -811,3 +818,141 @@ class TestUnifiClientTrackerEdgeCases:
         assert client_data is not None
         assert client_data["id"] == "valid_client"
         assert tracker.is_connected is True
+
+
+class TestRegistryReconciliation:
+    """Registry reconciliation on setup (upstream issue #116).
+
+    A tracker may only be deleted because the *configuration* no longer wants it,
+    never because the client is missing from the current snapshot. Deletion is
+    permanent and takes the user's name/area/entity_id customisation with it.
+    """
+
+    OFFLINE_MAC: str = "aa:bb:cc:dd:ee:01"
+    WIRED_MAC: str = "aa:bb:cc:dd:ee:02"
+    WIFI_MAC: str = "aa:bb:cc:dd:ee:03"
+
+    @pytest.fixture
+    def mock_coordinator(self) -> MagicMock:
+        """Create mock coordinator with an empty client snapshot."""
+        coordinator = MagicMock()
+        coordinator.data = {"clients": {"site1": {}}}
+        return coordinator
+
+    @staticmethod
+    def _entry(
+        hass: HomeAssistant, coordinator: MagicMock, options: dict[str, Any]
+    ) -> MockConfigEntry:
+        """Build a config entry wired to the coordinator."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={"connection_type": "remote", "console_id": "c", "api_key": "k"},
+            options=options,
+            entry_id="tracker_reconcile_entry",
+        )
+        entry.add_to_hass(hass)
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = coordinator
+        return entry
+
+    @staticmethod
+    def _register(
+        entity_registry: er.EntityRegistry, entry: MockConfigEntry, mac: str
+    ) -> str:
+        """Register an existing client tracker and return its entity_id."""
+        return entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{mac}",
+            config_entry=entry,
+            suggested_object_id=f"client_{mac.replace(':', '')}",
+        ).entity_id
+
+    @staticmethod
+    def _client(mac: str, client_type: str) -> dict[str, Any]:
+        """Build a connected-client payload."""
+        return {"id": mac, "mac": mac, "connected": True, "type": client_type}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "data",
+        [
+            # Site polled fine, this client is simply not connected right now.
+            pytest.param({"clients": {"site1": {}}}, id="client_offline"),
+            # No sites at all: a poll that failed or has not run yet. This is the
+            # case that wiped every client tracker in issue #116.
+            pytest.param({"clients": {}}, id="poll_returned_nothing"),
+            pytest.param({}, id="coordinator_has_no_data"),
+        ],
+    )
+    async def test_absent_client_keeps_its_registry_entry(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+        data: dict[str, Any],
+    ) -> None:
+        """A client missing from the snapshot must not lose its registry entry."""
+        mock_coordinator.data = data
+
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_id = self._register(entity_registry, entry, self.OFFLINE_MAC)
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        assert entity_registry.async_get(entity_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_connected_client_of_untracked_type_is_removed(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A connected client whose type is no longer tracked is still removed."""
+        mock_coordinator.data["clients"]["site1"] = {
+            "c1": self._client(self.WIRED_MAC, "WIRED")
+        }
+
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_id = self._register(entity_registry, entry, self.WIRED_MAC)
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        assert entity_registry.async_get(entity_id) is None
+
+    @pytest.mark.asyncio
+    async def test_connected_tracked_client_is_kept(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A connected client of a tracked type keeps its registry entry."""
+        mock_coordinator.data["clients"]["site1"] = {
+            "c1": self._client(self.WIFI_MAC, "WIRELESS")
+        }
+
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_id = self._register(entity_registry, entry, self.WIFI_MAC)
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        assert entity_registry.async_get(entity_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_tracking_disabled_removes_all_trackers(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """Turning tracking off is a config decision, so it may remove everything."""
+        entry = self._entry(hass, mock_coordinator, {})
+        offline = self._register(entity_registry, entry, self.OFFLINE_MAC)
+        wifi = self._register(entity_registry, entry, self.WIFI_MAC)
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        assert entity_registry.async_get(offline) is None
+        assert entity_registry.async_get(wifi) is None
