@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.9.2] - 2026-09-09
+
 ### Fixed
 
 - Protect entities (cameras, lights, door sensors, doorbell/smart-detect events, NVR sensors) no longer go unavailable when the _Network_ API has a transient error. Entity availability is now gated on the sub-coordinator that actually provides the data instead of an aggregate fold across all of them, so a Network session drop (`Response is not JSON: <!doctype html>`) leaves Protect entities alone. PDU outlet switches gate on the device coordinator for the same reason.
