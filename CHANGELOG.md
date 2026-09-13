@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Client device trackers now report `not_home` after a restart instead of sitting at `unavailable` until the client happens to reconnect. [#120](https://github.com/ruaan-deysel/ha-unifi-insights/pull/120) stopped the registry entry from being deleted, but no entity was created for a client that was absent from the first coordinator poll, so Home Assistant restored the entry as `unavailable` and a Person assigned to that tracker stayed `unknown`. Every surviving registry entry is now given a live entity at setup, and it keeps the name the registry retained rather than reverting to `Client <mac>`. This completes the fix for [#116](https://github.com/ruaan-deysel/ha-unifi-insights/issues/116).
+- Client trackers are looked up by MAC across every site instead of only the site they were created on, so a client that roams between sites is still resolved. The site is now only a starting hint and is updated when the client is found elsewhere.
+- Client trackers now declare their own `unique_id`. `ScannerEntity` supplies it from the live `mac_address`, which is `None` whenever the client is absent, so a tracker restored for an offline client would have had no registry identity at all. Existing trackers registered under the bare MAC are re-keyed in place on the next setup, preserving their name, area and entity ID.
+
 ## [2026.9.2] - 2026-09-09
 
 ### Fixed

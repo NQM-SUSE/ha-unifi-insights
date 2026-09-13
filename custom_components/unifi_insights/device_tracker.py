@@ -89,6 +89,51 @@ def _connected_clients_to_track(
     return wanted
 
 
+def _client_tracker_entries(
+    registry: er.EntityRegistry, entry_id: str
+) -> list[er.RegistryEntry]:
+    """Return this platform's device_tracker entries for a config entry."""
+    return [
+        reg_entry
+        for reg_entry in er.async_entries_for_config_entry(registry, entry_id)
+        if reg_entry.domain == "device_tracker" and reg_entry.platform == DOMAIN
+    ]
+
+
+def _migrate_tracker_unique_ids(
+    registry: er.EntityRegistry, client_trackers: list[er.RegistryEntry]
+) -> None:
+    """
+    Re-key trackers registered under the bare MAC to the MAC-derived id.
+
+    Before this platform declared its own `unique_id`, `ScannerEntity` supplied
+    it from the live `mac_address`, so existing entries are keyed by the raw MAC
+    as the API spelled it. Rename them in place rather than letting them be
+    orphaned, which would lose the user's name, area and entity_id.
+    """
+    prefix = f"{DOMAIN}_"
+    known = {reg_entry.unique_id for reg_entry in client_trackers}
+    for reg_entry in client_trackers:
+        if reg_entry.unique_id.startswith(prefix):
+            continue
+        new_unique_id = f"{prefix}{reg_entry.unique_id.lower()}"
+        if new_unique_id in known:
+            _LOGGER.warning(
+                "Cannot migrate client tracker %s to unique_id %s: already in use",
+                reg_entry.entity_id,
+                new_unique_id,
+            )
+            continue
+        _LOGGER.debug(
+            "Migrating client tracker %s unique_id %s -> %s",
+            reg_entry.entity_id,
+            reg_entry.unique_id,
+            new_unique_id,
+        )
+        registry.async_update_entity(reg_entry.entity_id, new_unique_id=new_unique_id)
+        known.add(new_unique_id)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
@@ -119,11 +164,7 @@ async def async_setup_entry(
     # entity_id customisation, and reporting `not_home` for an absent device is
     # the entire purpose of a device tracker.
     registry = er.async_get(hass)
-    client_trackers = [
-        reg_entry
-        for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id)
-        if reg_entry.domain == "device_tracker" and reg_entry.platform == DOMAIN
-    ]
+    client_trackers = _client_tracker_entries(registry, entry.entry_id)
 
     if not track_wifi and not track_wired:
         for reg_entry in client_trackers:
@@ -135,10 +176,18 @@ async def async_setup_entry(
         _LOGGER.debug("Client tracking disabled - no client trackers created")
         return
 
-    _, untracked_macs = _partition_connected_clients(
+    # Re-key legacy entries before anything compares unique_ids, so the
+    # reconciliation below and the retained trackers all speak the same
+    # identifier. Deliberately after the early return above: entries that are
+    # about to be removed are not worth renaming first.
+    _migrate_tracker_unique_ids(registry, client_trackers)
+    client_trackers = _client_tracker_entries(registry, entry.entry_id)
+
+    connected_macs, untracked_macs = _partition_connected_clients(
         coordinator, track_wifi=track_wifi, track_wired=track_wired
     )
     untracked_unique_ids = {f"{DOMAIN}_{mac}" for mac in untracked_macs}
+    surviving: list[er.RegistryEntry] = []
     for reg_entry in client_trackers:
         if reg_entry.unique_id in untracked_unique_ids:
             _LOGGER.debug(
@@ -146,10 +195,38 @@ async def async_setup_entry(
                 reg_entry.entity_id,
             )
             registry.async_remove(reg_entry.entity_id)
+            continue
+        surviving.append(reg_entry)
 
     # Per-setup dedup set (recreated on every reload so re-enabling re-adds
     # entities); MAC is globally unique so it is used as the key.
     tracked: set[str] = set()
+
+    # Every surviving registry entry gets a live entity, even when its client is
+    # absent from the current snapshot. A registry entry with no entity behind it
+    # is restored as "unavailable" and stays that way until the client happens to
+    # reconnect; adding the entity now makes it report `not_home` instead, which
+    # is what a device tracker is for. Seeding `tracked` here is what stops
+    # `async_add_clients` adding a second entity with the same unique_id when a
+    # retained client comes back.
+    prefix = f"{DOMAIN}_"
+    retained: list[UnifiClientTracker] = []
+    for reg_entry in surviving:
+        if not reg_entry.unique_id.startswith(prefix):
+            continue
+        mac = reg_entry.unique_id[len(prefix) :].lower()
+        retained.append(
+            UnifiClientTracker(
+                coordinator=coordinator,
+                mac=mac,
+                site_id=connected_macs.get(mac),
+                restored_name=reg_entry.original_name,
+            )
+        )
+        tracked.add(mac)
+    if retained:
+        _LOGGER.debug("Restoring %d client tracker(s) from the registry", len(retained))
+        async_add_entities(retained)
 
     @callback
     def async_add_clients() -> None:
@@ -158,7 +235,7 @@ async def async_setup_entry(
             coordinator, track_wifi=track_wifi, track_wired=track_wired
         )
         entities = [
-            UnifiClientTracker(coordinator=coordinator, site_id=site_id, mac=mac)
+            UnifiClientTracker(coordinator=coordinator, mac=mac, site_id=site_id)
             for mac, site_id in current.items()
             if mac not in tracked
         ]
@@ -181,10 +258,17 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
     def __init__(
         self,
         coordinator: UnifiFacadeCoordinator,
-        site_id: str,
         mac: str,
+        site_id: str | None = None,
+        restored_name: str | None = None,
     ) -> None:
-        """Initialize the tracker."""
+        """
+        Initialize the tracker.
+
+        `site_id` is only a starting hint and may be None for a tracker restored
+        from the registry, which knows the MAC but not where it last connected.
+        `restored_name` is the name the registry kept for such a tracker.
+        """
         super().__init__(coordinator)
         self._site_id = site_id
         self._mac = mac.lower()
@@ -195,18 +279,27 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         # Set unique ID based on MAC address for stability
         self._attr_unique_id = f"{DOMAIN}_{self._mac}"
 
-        # Set name from client data
+        # Set name from client data. With no live data, prefer the name the
+        # registry retained over the "Client <mac>" placeholder, so restoring an
+        # offline client does not rewrite what the user already sees.
         self._attr_name = get_field(
-            client_data, "name", "hostname", default=f"Client {self._mac}"
+            client_data,
+            "name",
+            "hostname",
+            default=restored_name or f"Client {self._mac}",
         )
 
         # Device info - associate with connected network device (switch/AP)
-        # This groups client trackers under their uplink device for cleaner UI
+        # This groups client trackers under their uplink device for cleaner UI.
+        # It is built once, from whatever data exists at construction time: a
+        # client that is offline at setup has no uplink to group under, so it
+        # lands on the standalone-client device below and only settles under its
+        # uplink on the next reload after the client reconnects.
         uplink_device_id = get_field(client_data, "uplinkDeviceId", "uplink_device_id")
         if uplink_device_id:
             # Use the network device's identifiers to group under it
             self._device_info = DeviceInfo(
-                identifiers={(DOMAIN, f"{site_id}_{uplink_device_id}")},
+                identifiers={(DOMAIN, f"{self._site_id}_{uplink_device_id}")},
             )
         else:
             # Fallback: create a standalone client device if no uplink found
@@ -220,14 +313,25 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
                 model=model,
             )
 
+    @property
+    def unique_id(self) -> str | None:
+        """
+        Return the unique ID of the entity.
+
+        `ScannerEntity.unique_id` returns `mac_address`, which is read from the
+        live client payload and is therefore None whenever the client is absent.
+        A tracker restored from the registry has no payload at all, so identity
+        has to come from the MAC it was built with instead.
+        """
+        return self._attr_unique_id
+
     @property  # type: ignore[misc]
     def device_info(self) -> DeviceInfo:
         """Return device info."""
         return self._device_info
 
-    def _get_client_data(self) -> dict[str, Any] | None:
-        """Get connected-client data for this MAC, if currently connected."""
-        clients = self.coordinator.data.get("clients", {}).get(self._site_id, {})
+    def _find_in_site(self, clients: Any) -> dict[str, Any] | None:
+        """Return this MAC's entry within one site's client snapshot."""
         if not isinstance(clients, dict):
             return None
         for client_data in clients.values():
@@ -235,6 +339,31 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
                 continue
             mac = get_field(client_data, "macAddress", "mac_address", "mac", default="")
             if mac and mac.lower() == self._mac:
+                return client_data
+        return None
+
+    def _get_client_data(self) -> dict[str, Any] | None:
+        """
+        Get connected-client data for this MAC, if currently connected.
+
+        The MAC, not the site, identifies the client. `self._site_id` is only a
+        hint: check it first (the common case), then fall back to scanning every
+        site so a roamed client -- or one restored from the registry with no hint
+        at all -- is still found. Remember where it turned up for next time.
+        """
+        all_clients = self.coordinator.data.get("clients", {})
+        if not isinstance(all_clients, dict):
+            return None
+        if self._site_id is not None:
+            client_data = self._find_in_site(all_clients.get(self._site_id, {}))
+            if client_data is not None:
+                return client_data
+        for site_id, clients in all_clients.items():
+            if site_id == self._site_id:
+                continue
+            client_data = self._find_in_site(clients)
+            if client_data is not None:
+                self._site_id = site_id
                 return client_data
         return None
 

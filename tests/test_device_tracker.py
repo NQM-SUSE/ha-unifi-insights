@@ -941,6 +941,154 @@ class TestRegistryReconciliation:
         assert entity_registry.async_get(entity_id) is not None
 
     @pytest.mark.asyncio
+    async def test_legacy_raw_mac_entry_is_rekeyed(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """Trackers registered under the bare MAC are renamed, not orphaned."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_id = entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            self.OFFLINE_MAC.upper(),
+            config_entry=entry,
+        ).entity_id
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        migrated = entity_registry.async_get(entity_id)
+        assert migrated is not None
+        assert migrated.unique_id == f"{DOMAIN}_{self.OFFLINE_MAC}"
+
+    @pytest.mark.asyncio
+    async def test_rekey_is_skipped_when_target_is_taken(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A legacy entry is left alone if the migrated id already exists."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        self._register(entity_registry, entry, self.OFFLINE_MAC)
+        legacy_id = entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            self.OFFLINE_MAC.upper(),
+            config_entry=entry,
+        ).entity_id
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        legacy = entity_registry.async_get(legacy_id)
+        assert legacy is not None
+        assert legacy.unique_id == self.OFFLINE_MAC.upper()
+
+    @pytest.mark.asyncio
+    async def test_retained_entry_gets_a_live_tracker(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A surviving registry entry is restored as a real, available entity."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        self._register(entity_registry, entry, self.OFFLINE_MAC)
+
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, entry, async_add_entities)
+
+        async_add_entities.assert_called_once()
+        entities = async_add_entities.call_args[0][0]
+        assert len(entities) == 1
+        tracker = entities[0]
+        assert isinstance(tracker, UnifiClientTracker)
+        assert tracker.unique_id == f"{DOMAIN}_{self.OFFLINE_MAC}"
+        # not_home (absent but reporting), not unavailable (no entity at all).
+        assert tracker.is_connected is False
+        assert tracker.available is True
+
+    def test_retained_tracker_finds_client_on_any_site(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """With no site hint, the MAC is resolved by scanning every site."""
+        tracker = UnifiClientTracker(
+            coordinator=mock_coordinator,
+            mac=self.WIFI_MAC,
+            site_id=None,
+        )
+
+        assert tracker.is_connected is False
+
+        # The client turns up on a site the tracker was never pointed at.
+        mock_coordinator.data["clients"]["site2"] = {
+            "c1": self._client(self.WIFI_MAC, "WIRELESS")
+        }
+
+        assert tracker.is_connected is True
+        assert tracker._site_id == "site2"
+
+    @pytest.mark.asyncio
+    async def test_reconnecting_retained_client_is_not_added_twice(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A retained MAC reconnecting must not create a duplicate unique_id."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        self._register(entity_registry, entry, self.WIFI_MAC)
+
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, entry, async_add_entities)
+
+        added = [
+            entity
+            for call in async_add_entities.call_args_list
+            for entity in call[0][0]
+        ]
+        assert len(added) == 1
+
+        # The retained client comes back; the coordinator listener re-runs.
+        mock_coordinator.data["clients"]["site1"] = {
+            "c1": self._client(self.WIFI_MAC, "WIRELESS")
+        }
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+        listener()
+
+        added = [
+            entity
+            for call in async_add_entities.call_args_list
+            for entity in call[0][0]
+        ]
+        assert [entity.unique_id for entity in added] == [f"{DOMAIN}_{self.WIFI_MAC}"]
+
+    @pytest.mark.asyncio
+    async def test_retained_tracker_keeps_its_name(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """Restoring an absent client keeps its name, not "Client <mac>"."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{self.OFFLINE_MAC}",
+            config_entry=entry,
+            original_name="Kitchen Tablet",
+        )
+
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, entry, async_add_entities)
+
+        tracker = async_add_entities.call_args[0][0][0]
+        assert tracker.name == "Kitchen Tablet"
+        assert tracker.name != f"Client {self.OFFLINE_MAC}"
+
+    @pytest.mark.asyncio
     async def test_tracking_disabled_removes_all_trackers(
         self,
         hass: HomeAssistant,
