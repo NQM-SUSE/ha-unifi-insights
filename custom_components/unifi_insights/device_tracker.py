@@ -100,6 +100,19 @@ def _client_tracker_entries(
     ]
 
 
+def _mac_from_unique_id(unique_id: str) -> str:
+    """
+    Return the lowercase MAC a client tracker's unique_id identifies.
+
+    Entries written by this platform are prefixed; entries predating the
+    prefix are the bare MAC as the API spelled it.
+    """
+    prefix = f"{DOMAIN}_"
+    if unique_id.startswith(prefix):
+        return unique_id[len(prefix) :].lower()
+    return unique_id.lower()
+
+
 def _migrate_tracker_unique_ids(
     registry: er.EntityRegistry, client_trackers: list[er.RegistryEntry]
 ) -> None:
@@ -112,16 +125,20 @@ def _migrate_tracker_unique_ids(
     orphaned, which would lose the user's name, area and entity_id.
     """
     prefix = f"{DOMAIN}_"
-    known = {reg_entry.unique_id for reg_entry in client_trackers}
     for reg_entry in client_trackers:
         if reg_entry.unique_id.startswith(prefix):
             continue
         new_unique_id = f"{prefix}{reg_entry.unique_id.lower()}"
-        if new_unique_id in known:
+        existing_entity_id = registry.async_get_entity_id(
+            "device_tracker", DOMAIN, new_unique_id
+        )
+        if existing_entity_id is not None:
             _LOGGER.warning(
-                "Cannot migrate client tracker %s to unique_id %s: already in use",
+                "Cannot migrate client tracker %s to unique_id %s: "
+                "already in use by %s",
                 reg_entry.entity_id,
                 new_unique_id,
+                existing_entity_id,
             )
             continue
         _LOGGER.debug(
@@ -131,7 +148,6 @@ def _migrate_tracker_unique_ids(
             new_unique_id,
         )
         registry.async_update_entity(reg_entry.entity_id, new_unique_id=new_unique_id)
-        known.add(new_unique_id)
 
 
 async def async_setup_entry(
@@ -186,10 +202,9 @@ async def async_setup_entry(
     connected_macs, untracked_macs = _partition_connected_clients(
         coordinator, track_wifi=track_wifi, track_wired=track_wired
     )
-    untracked_unique_ids = {f"{DOMAIN}_{mac}" for mac in untracked_macs}
     surviving: list[er.RegistryEntry] = []
     for reg_entry in client_trackers:
-        if reg_entry.unique_id in untracked_unique_ids:
+        if _mac_from_unique_id(reg_entry.unique_id) in untracked_macs:
             _LOGGER.debug(
                 "Removing client tracker %s (client type no longer tracked)",
                 reg_entry.entity_id,
@@ -209,18 +224,16 @@ async def async_setup_entry(
     # is what a device tracker is for. Seeding `tracked` here is what stops
     # `async_add_clients` adding a second entity with the same unique_id when a
     # retained client comes back.
-    prefix = f"{DOMAIN}_"
     retained: list[UnifiClientTracker] = []
     for reg_entry in surviving:
-        if not reg_entry.unique_id.startswith(prefix):
-            continue
-        mac = reg_entry.unique_id[len(prefix) :].lower()
+        mac = _mac_from_unique_id(reg_entry.unique_id)
         retained.append(
             UnifiClientTracker(
                 coordinator=coordinator,
                 mac=mac,
                 site_id=connected_macs.get(mac),
                 restored_name=reg_entry.original_name,
+                unique_id=reg_entry.unique_id,
             )
         )
         tracked.add(mac)
@@ -261,6 +274,7 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         mac: str,
         site_id: str | None = None,
         restored_name: str | None = None,
+        unique_id: str | None = None,
     ) -> None:
         """
         Initialize the tracker.
@@ -268,16 +282,26 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         `site_id` is only a starting hint and may be None for a tracker restored
         from the registry, which knows the MAC but not where it last connected.
         `restored_name` is the name the registry kept for such a tracker.
+        `unique_id` overrides the default DOMAIN_mac id format, used when
+        restoring legacy entries that could not be migrated due to collision.
         """
         super().__init__(coordinator)
         self._site_id = site_id
         self._mac = mac.lower()
 
+        # The MAC identifies the client and is known for every tracker, whether
+        # or not the client is currently connected. Reading it back out of the
+        # live payload -- as this platform used to -- returns None for exactly
+        # the absent clients a restored tracker exists to represent, which drops
+        # the `mac` state attribute while the device is away and skips the
+        # MAC registration `ScannerEntity.add_to_platform_start` performs.
+        self._attr_mac_address = self._mac
+
         # Get initial client data
         client_data = self._get_client_data() or {}
 
         # Set unique ID based on MAC address for stability
-        self._attr_unique_id = f"{DOMAIN}_{self._mac}"
+        self._attr_unique_id = unique_id or f"{DOMAIN}_{self._mac}"
 
         # Set name from client data. With no live data, prefer the name the
         # registry retained over the "Client <mac>" placeholder, so restoring an
@@ -318,10 +342,11 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         """
         Return the unique ID of the entity.
 
-        `ScannerEntity.unique_id` returns `mac_address`, which is read from the
-        live client payload and is therefore None whenever the client is absent.
-        A tracker restored from the registry has no payload at all, so identity
-        has to come from the MAC it was built with instead.
+        `ScannerEntity.unique_id` returns the bare `mac_address`, which is not
+        namespaced to this integration. Declaring the id here keeps it
+        domain-prefixed and lets a tracker restored from the registry carry the
+        id it was registered under, which a legacy entry that could not be
+        re-keyed still needs.
         """
         return self._attr_unique_id
 
@@ -387,14 +412,6 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         if not client_data:
             return None
         return get_field(client_data, "ipAddress", "ip_address", "ip")  # type: ignore[no-any-return]
-
-    @property
-    def mac_address(self) -> str | None:
-        """Return the MAC address of the client."""
-        client_data = self._get_client_data()
-        if not client_data:
-            return None
-        return get_field(client_data, "macAddress", "mac_address", "mac")  # type: ignore[no-any-return]
 
     @property
     def hostname(self) -> str | None:

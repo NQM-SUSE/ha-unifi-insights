@@ -7,9 +7,10 @@ from unittest.mock import MagicMock
 
 import pytest
 from homeassistant.components.device_tracker import SourceType
+from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.const import CONF_TRACK_WIFI_CLIENTS, DOMAIN
 from custom_components.unifi_insights.device_tracker import (
     PARALLEL_UPDATES,
     UnifiClientTracker,
@@ -539,14 +540,14 @@ class TestUnifiClientTracker:
         assert tracker.ip_address == "192.168.1.100"
 
     def test_mac_address(self, mock_coordinator) -> None:
-        """Test MAC address property."""
+        """Test MAC address property is the normalised MAC the tracker holds."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
             site_id="site1",
             mac="AA:BB:CC:DD:EE:FF",
         )
 
-        assert tracker.mac_address == "AA:BB:CC:DD:EE:FF"
+        assert tracker.mac_address == "aa:bb:cc:dd:ee:ff"
 
     def test_hostname(self, mock_coordinator) -> None:
         """Test hostname property."""
@@ -692,7 +693,7 @@ class TestUnifiClientTrackerEdgeCases:
         assert tracker.ip_address is None
 
     def test_mac_address_no_client_data(self, mock_coordinator) -> None:
-        """Test mac_address returns None when client data is missing."""
+        """Test mac_address survives the client vanishing from the snapshot."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
             site_id="site1",
@@ -702,7 +703,10 @@ class TestUnifiClientTrackerEdgeCases:
         # Remove client data
         mock_coordinator.data["clients"]["site1"] = {}
 
-        assert tracker.mac_address is None
+        # The MAC identifies the client; it is not a live reading. An absent
+        # client is exactly the case a restored tracker exists to report on,
+        # so dropping its identity here would defeat the purpose.
+        assert tracker.mac_address == "aa:bb:cc:dd:ee:ff"
 
     def test_hostname_no_client_data(self, mock_coordinator) -> None:
         """Test hostname returns None when client data is missing."""
@@ -979,11 +983,67 @@ class TestRegistryReconciliation:
             config_entry=entry,
         ).entity_id
 
-        await async_setup_entry(hass, entry, MagicMock())
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, entry, async_add_entities)
 
         legacy = entity_registry.async_get(legacy_id)
         assert legacy is not None
         assert legacy.unique_id == self.OFFLINE_MAC.upper()
+
+        # The unmigrated legacy entry must still receive a live, functional tracker
+        # rather than being skipped and left permanently unavailable.
+        entities = async_add_entities.call_args[0][0]
+        assert len(entities) == 2
+        legacy_tracker = next(
+            t for t in entities if t.unique_id == self.OFFLINE_MAC.upper()
+        )
+        assert legacy_tracker.is_connected is False
+        assert legacy_tracker.available is True
+
+    @pytest.mark.asyncio
+    async def test_rekey_collision_across_config_entries_is_skipped(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """Cross-entry collision avoids ValueError and preserves legacy tracker."""
+        other_entry = MockConfigEntry(
+            version=1,
+            minor_version=0,
+            domain=DOMAIN,
+            entry_id="other_entry",
+        )
+        other_entry.add_to_hass(hass)
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{self.OFFLINE_MAC}",
+            config_entry=other_entry,
+        )
+
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        legacy_id = entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            self.OFFLINE_MAC.upper(),
+            config_entry=entry,
+        ).entity_id
+
+        async_add_entities = MagicMock()
+        # Must not raise ValueError: Unique id ... already in use
+        await async_setup_entry(hass, entry, async_add_entities)
+
+        legacy = entity_registry.async_get(legacy_id)
+        assert legacy is not None
+        assert legacy.unique_id == self.OFFLINE_MAC.upper()
+
+        entities = async_add_entities.call_args[0][0]
+        assert len(entities) == 1
+        tracker = entities[0]
+        assert tracker.unique_id == self.OFFLINE_MAC.upper()
+        assert tracker.is_connected is False
+        assert tracker.available is True
 
     @pytest.mark.asyncio
     async def test_retained_entry_gets_a_live_tracker(
@@ -1104,3 +1164,163 @@ class TestRegistryReconciliation:
 
         assert entity_registry.async_get(offline) is None
         assert entity_registry.async_get(wifi) is None
+
+
+class TestEntityPlatformRestoration:
+    """End-to-end tests using Home Assistant's actual entity platform."""
+
+    @pytest.mark.asyncio
+    async def test_entity_platform_reports_not_home_then_home(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_local_auth: MagicMock,
+        enable_custom_integrations: None,
+    ) -> None:
+        """Original entity_id reports not_home offline, then home after reconnect."""
+        mac = "aa:bb:cc:dd:ee:22"
+        mock_config_entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(
+            mock_config_entry, options={CONF_TRACK_WIFI_CLIENTS: True}
+        )
+
+        reg_entry = entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{mac}",
+            config_entry=mock_config_entry,
+            suggested_object_id="test_phone",
+        )
+        entity_id = reg_entry.entity_id
+
+        # Setup sites so coordinator has a valid site
+        mock_network_client.sites.get_all.return_value = [
+            {"id": "default", "name": "Default"}
+        ]
+        # Client is initially absent from the network snapshot
+        mock_network_client.clients.get_all.return_value = []
+
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        # HA entity platform reports not_home, NOT unavailable
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_NOT_HOME
+
+        # Client reconnects to the network
+        client_data = {
+            "id": "client_22",
+            "macAddress": mac,
+            "name": "Test Phone",
+            "hostname": "test-phone",
+            "type": "WIRELESS",
+            "connected": True,
+            "uplinkDeviceId": None,
+            "ipAddress": "192.168.1.122",
+        }
+        mock_network_client.clients.get_all.return_value = [client_data]
+
+        data = mock_config_entry.runtime_data
+        await data.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        # HA entity platform reports home
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_HOME
+
+        # Simulate restart/reload with client absent again (live restart test)
+        mock_network_client.clients.get_all.return_value = []
+        await hass.config_entries.async_reload(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_NOT_HOME
+
+    @pytest.mark.asyncio
+    async def test_entity_platform_legacy_collision_retained_lifecycle(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_local_auth: MagicMock,
+        enable_custom_integrations: None,
+    ) -> None:
+        """Verify unmigrated legacy entry functions properly in HA entity platform."""
+        mac = "aa:bb:cc:dd:ee:33"
+        mock_config_entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(
+            mock_config_entry, options={CONF_TRACK_WIFI_CLIENTS: True}
+        )
+
+        # Another entry already occupies the migrated unique_id
+        other_entry = MockConfigEntry(
+            version=1,
+            minor_version=0,
+            domain=DOMAIN,
+            entry_id="colliding_entry",
+            data=dict(mock_config_entry.data),
+        )
+        other_entry.add_to_hass(hass)
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{mac}",
+            config_entry=other_entry,
+        )
+
+        # Legacy entry keyed by bare MAC
+        legacy_entry = entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            mac.upper(),
+            config_entry=mock_config_entry,
+            suggested_object_id="legacy_collided_phone",
+        )
+        entity_id = legacy_entry.entity_id
+
+        mock_network_client.sites.get_all.return_value = [
+            {"id": "default", "name": "Default"}
+        ]
+        mock_network_client.clients.get_all.return_value = []
+
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        # Check legacy entry unique_id is preserved
+        entry_after = entity_registry.async_get(entity_id)
+        assert entry_after is not None
+        assert entry_after.unique_id == mac.upper()
+
+        # Entity reports not_home (functional, not unavailable)
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_NOT_HOME
+
+        # Client reconnects
+        client_data = {
+            "id": "client_33",
+            "macAddress": mac,
+            "name": "Legacy Collided Phone",
+            "hostname": "legacy-collided-phone",
+            "type": "WIRELESS",
+            "connected": True,
+            "uplinkDeviceId": None,
+            "ipAddress": "192.168.1.133",
+        }
+        mock_network_client.clients.get_all.return_value = [client_data]
+
+        data = mock_config_entry.runtime_data
+        await data.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_HOME
