@@ -20,7 +20,7 @@ from custom_components.unifi_insights.device_tracker import (
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
-    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 
 class TestParallelUpdates:
@@ -1145,8 +1145,73 @@ class TestRegistryReconciliation:
         await async_setup_entry(hass, entry, async_add_entities)
 
         tracker = async_add_entities.call_args[0][0][0]
-        assert tracker.name == "Kitchen Tablet"
-        assert tracker.name != f"Client {self.OFFLINE_MAC}"
+        # An absent client has no uplink to group under, so it gets a standalone
+        # device that represents the client itself. The device carries the name
+        # and the entity has none -- see test_offline_tracker_name_is_not_doubled.
+        assert tracker.device_info["name"] == "Kitchen Tablet"
+        assert tracker.device_info["name"] != f"Client {self.OFFLINE_MAC}"
+        assert tracker.name is None
+
+    @pytest.mark.asyncio
+    async def test_offline_tracker_name_is_not_doubled(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """An absent client renders its name once, not "Tablet Tablet"."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{self.OFFLINE_MAC}",
+            config_entry=entry,
+            original_name="Kitchen Tablet",
+        )
+
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, entry, async_add_entities)
+
+        tracker = async_add_entities.call_args[0][0][0]
+        # `has_entity_name` composes "<device name> <entity name>". Setting both
+        # to the client name is what produced "Kitchen Tablet Kitchen Tablet",
+        # and an offline client takes this path on every start.
+        assert tracker.has_entity_name is True
+        assert tracker.name is None, (
+            "entity must not repeat the name its standalone device already has"
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_tracker_keeps_name_when_registry_name_is_gone(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        device_registry: dr.DeviceRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A second offline start reads the name back off the client device."""
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        # State after one offline start: the entity has no name of its own, the
+        # standalone client device holds it.
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, f"client_{self.OFFLINE_MAC}")},
+            name="Kitchen Tablet",
+        )
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{self.OFFLINE_MAC}",
+            config_entry=entry,
+            original_name=None,
+        )
+
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, entry, async_add_entities)
+
+        tracker = async_add_entities.call_args[0][0][0]
+        # Without the device-registry fallback this degrades to "Client <mac>".
+        assert tracker.device_info["name"] == "Kitchen Tablet"
 
     @pytest.mark.asyncio
     async def test_tracking_disabled_removes_all_trackers(

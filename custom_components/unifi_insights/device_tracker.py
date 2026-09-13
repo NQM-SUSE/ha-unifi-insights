@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.components.device_tracker.const import SourceType
 from homeassistant.core import callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -150,6 +150,30 @@ def _migrate_tracker_unique_ids(
         registry.async_update_entity(reg_entry.entity_id, new_unique_id=new_unique_id)
 
 
+def _restored_name(
+    hass: HomeAssistant, reg_entry: er.RegistryEntry, mac: str
+) -> str | None:
+    """
+    Return the display name a retained tracker should keep.
+
+    A tracker that last came up standalone has no entity name of its own -- the
+    `client_<mac>` device carries it -- so `original_name` is None and reading
+    only that would rename the client to a "Client <mac>" placeholder on its
+    second consecutive offline start. Fall back to the device registry, which
+    is where that name actually lives.
+    """
+    if reg_entry.original_name is not None:
+        return reg_entry.original_name
+    # Resolved lazily: the device registry is only consulted for the minority of
+    # entries that have no entity name of their own.
+    device = dr.async_get(hass).async_get_device(
+        identifiers={(DOMAIN, f"client_{mac}")}
+    )
+    if device is None:
+        return None
+    return device.name_by_user or device.name
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
@@ -232,7 +256,7 @@ async def async_setup_entry(
                 coordinator=coordinator,
                 mac=mac,
                 site_id=connected_macs.get(mac),
-                restored_name=reg_entry.original_name,
+                restored_name=_restored_name(hass, reg_entry, mac),
                 unique_id=reg_entry.unique_id,
             )
         )
@@ -303,14 +327,12 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         # Set unique ID based on MAC address for stability
         self._attr_unique_id = unique_id or f"{DOMAIN}_{self._mac}"
 
-        # Set name from client data. With no live data, prefer the name the
-        # registry retained over the "Client <mac>" placeholder, so restoring an
-        # offline client does not rewrite what the user already sees.
-        self._attr_name = get_field(
-            client_data,
-            "name",
-            "hostname",
-            default=restored_name or f"Client {self._mac}",
+        # The best display name available: the live payload, else the name the
+        # registry retained for a restored tracker, else a MAC placeholder. A
+        # restored offline client must not be rewritten to "Client <mac>".
+        display_name = (
+            get_field(client_data, "name", "hostname", default=restored_name)
+            or f"Client {self._mac}"
         )
 
         # Device info - associate with connected network device (switch/AP)
@@ -321,21 +343,31 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         # uplink on the next reload after the client reconnects.
         uplink_device_id = get_field(client_data, "uplinkDeviceId", "uplink_device_id")
         if uplink_device_id:
-            # Use the network device's identifiers to group under it
+            # Grouped under the uplink AP/switch. That device is not this
+            # client, so the entity carries the client's own name and
+            # `has_entity_name` renders "<uplink device> <client>".
             self._device_info = DeviceInfo(
                 identifiers={(DOMAIN, f"{self._site_id}_{uplink_device_id}")},
             )
+            self._attr_name = display_name
         else:
-            # Fallback: create a standalone client device if no uplink found
+            # Fallback: a standalone device representing the client itself.
+            # Here the tracker is that device's primary entity, so the device
+            # carries the name and the entity has none -- setting both makes
+            # `has_entity_name` compose "<device> <entity>" and render the name
+            # twice ("Kitchen Tablet Kitchen Tablet"). This path is the normal
+            # one for a client that is absent at setup, so the duplication would
+            # be the common case rather than an edge case.
             model = get_field(
                 client_data, "deviceName", "osName", default="Network Client"
             )
             self._device_info = DeviceInfo(
                 identifiers={(DOMAIN, f"client_{self._mac}")},
-                name=self._attr_name,
+                name=display_name,
                 manufacturer=MANUFACTURER,
                 model=model,
             )
+            self._attr_name = None
 
     @property
     def unique_id(self) -> str | None:
