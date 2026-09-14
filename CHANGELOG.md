@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.9.3] - 2026-09-14
+
 ### Fixed
 
 - Client device trackers now report `not_home` after a restart instead of sitting at `unavailable` until the client happens to reconnect. [#120](https://github.com/ruaan-deysel/ha-unifi-insights/pull/120) stopped the registry entry from being deleted, but no entity was created for a client that was absent from the first coordinator poll, so Home Assistant restored the entry as `unavailable` and a Person assigned to that tracker stayed `unknown`. Every surviving registry entry is now given a live entity at setup, and it keeps the name the registry retained rather than reverting to `Client <mac>`. This completes the fix for [#116](https://github.com/ruaan-deysel/ha-unifi-insights/issues/116).
