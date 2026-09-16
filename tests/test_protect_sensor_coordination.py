@@ -42,6 +42,7 @@ from custom_components.unifi_insights.coordinators.protect import (
     MAX_DOOR_STATE_PRESERVE_POLLS,
     MAX_WS_RECENCY_PRESERVE_POLLS,
     UnifiProtectCoordinator,
+    _normalize_epoch_seconds,
 )
 
 
@@ -1628,3 +1629,122 @@ class TestSensorTrackerCleanup:
 
         mock_task.cancel.assert_called_once()
         assert coordinator._sensor_refresh_task is None
+
+
+class TestRefreshWaiterPaths:
+    """Paths taken by a caller that arrives while a sensor fetch is in flight."""
+
+    @pytest.mark.asyncio
+    async def test_waiter_propagates_auth_failure_from_in_flight_fetch(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """An auth failure must reach a waiter, not be swallowed as a blip.
+
+        The waiter branch catches `Exception` to absorb transient errors,
+        and `ConfigEntryAuthFailed` is an `Exception` - without its explicit
+        re-raise a waiter would log the failure at debug and return, so a
+        revoked API key surfacing mid-collision would never start reauth.
+        """
+        fetch_gate = asyncio.Event()
+
+        async def slow_auth_failure() -> list[Any]:
+            await fetch_gate.wait()
+            msg = "Invalid credentials"
+            raise UniFiAuthenticationError(msg)
+
+        coordinator.protect_client.sensors.get_all = slow_auth_failure
+
+        owner_task = asyncio.create_task(coordinator.async_refresh_sensors())
+        await asyncio.sleep(0)
+        waiter_task = asyncio.create_task(coordinator.async_refresh_sensors())
+        await asyncio.sleep(0)
+
+        fetch_gate.set()
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await waiter_task
+        with pytest.raises(ConfigEntryAuthFailed):
+            await owner_task
+
+    @pytest.mark.asyncio
+    async def test_waiter_with_notify_false_does_not_notify_listeners(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """`notify=False` must hold on the waiter branch too.
+
+        `_async_update_data` passes `notify=False` because the coordinator
+        notifies once with the full poll result; a waiter that notified
+        anyway would push a partial update mid-poll.
+        """
+        fetch_gate = asyncio.Event()
+
+        async def slow_fetch() -> list[Any]:
+            await fetch_gate.wait()
+            return []
+
+        coordinator.protect_client.sensors.get_all = slow_fetch
+
+        with patch.object(coordinator, "async_update_listeners") as notify_mock:
+            owner_task = asyncio.create_task(
+                coordinator.async_refresh_sensors(notify=False)
+            )
+            await asyncio.sleep(0)
+            waiter_task = asyncio.create_task(
+                coordinator.async_refresh_sensors(notify=False)
+            )
+            await asyncio.sleep(0)
+
+            fetch_gate.set()
+            await waiter_task
+            await owner_task
+
+        notify_mock.assert_not_called()
+
+
+class TestGroupStateAgreement:
+    """`_group_state_agrees` decides when a latched WS-recency cap clears."""
+
+    @pytest.mark.parametrize(
+        ("cached", "rest", "expected"),
+        [
+            pytest.param({"isOpened": True}, {"isOpened": True}, True, id="equal"),
+            pytest.param({"isOpened": True}, {"isOpened": False}, False, id="differ"),
+            pytest.param({}, {}, True, id="absent-both"),
+            pytest.param({}, {"isOpened": False}, False, id="rest-only"),
+            pytest.param({"isOpened": True}, {}, False, id="cached-only"),
+        ],
+    )
+    def test_agreement(
+        self, cached: dict[str, Any], rest: dict[str, Any], *, expected: bool
+    ) -> None:
+        """A field present on only one side is a discrepancy, not agreement.
+
+        Treating it as agreement would clear the latch on a REST payload
+        that simply omitted the door field, re-arming WS-recency
+        preservation against a controller that never confirmed the state.
+        """
+        assert (
+            UnifiProtectCoordinator._group_state_agrees(cached, rest, "door")
+            is expected
+        )
+
+
+class TestNormalizeEpochSeconds:
+    """`_normalize_epoch_seconds` edge inputs return comparable or None."""
+
+    def test_naive_iso_string_is_assumed_utc(self) -> None:
+        """A naive ISO string compares equal to the same instant in UTC."""
+        aware = datetime(2026, 9, 16, 0, 47, 27, tzinfo=UTC)
+        assert _normalize_epoch_seconds("2026-09-16T00:47:27") == aware.timestamp()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("not-a-timestamp", id="unparseable-string"),
+            pytest.param(True, id="bool"),
+            pytest.param([1000], id="unsupported-type"),
+        ],
+    )
+    def test_uncomparable_values_return_none(self, value: object) -> None:
+        """Values that cannot be ordered become None rather than raising."""
+        assert _normalize_epoch_seconds(value) is None
