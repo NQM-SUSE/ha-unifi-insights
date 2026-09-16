@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import pytest
+from homeassistant.components.diagnostics.const import REDACTED
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.unifi_insights.coordinators.config import (
+    UnifiConfigCoordinator,
+)
 from custom_components.unifi_insights.diagnostics import (
     async_get_config_entry_diagnostics,
 )
@@ -66,3 +72,59 @@ async def test_diagnostics_includes_websocket_health(
         "connected": False,
         "last_message_at": None,
     }
+
+
+def _strings(value: Any) -> list[str]:
+    """Return every string key and value in a nested diagnostics payload."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in (*_strings(k), *_strings(v))]
+    if isinstance(value, (list, tuple, set)):
+        return [s for item in value for s in _strings(item)]
+    return []
+
+
+@pytest.mark.parametrize(
+    ("passphrase", "escaped"),
+    [
+        ("simple-password", "simple-password"),
+        ('sp;e:c,i"a\\l-pass', 'sp\\;e\\:c\\,i\\"a\\\\l-pass'),
+    ],
+)
+async def test_diagnostics_redacts_wifi_qr_code(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+    passphrase: str,
+    escaped: str,
+) -> None:
+    """Test diagnostics does not disclose password-bearing Wi-Fi QR payloads."""
+    wifi = {"wifi-1": {"name": "Test WiFi"}}
+    UnifiConfigCoordinator._enrich_wifi(
+        wifi,
+        [
+            {
+                "name": "Test WiFi",
+                "x_passphrase": passphrase,
+                "security": "wpa2",
+            }
+        ],
+        [],
+    )
+    qr_code = wifi["wifi-1"]["qr_code"]
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["wifi"] = {"site-1": wifi}
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    diagnostic_wifi = diagnostics["data"]["wifi"]["site-1"]["wifi-1"]
+
+    assert qr_code.startswith("WIFI:T:WPA;S:Test WiFi;P:")
+    assert wifi["wifi-1"]["passphrase"] == passphrase
+    assert coordinator.data["wifi"]["site-1"]["wifi-1"]["qr_code"] == qr_code
+    assert diagnostic_wifi["passphrase"] == REDACTED
+    assert diagnostic_wifi["qr_code"] == REDACTED
+    assert f"P:{escaped};" in qr_code
+    for text in _strings(diagnostics):
+        assert passphrase not in text
+        assert escaped not in text
