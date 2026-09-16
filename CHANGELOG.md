@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
 
+### Changed
+
+- The Protect `Sensor` model now declares `model_key` (`modelKey`), which every other Protect device model already did - `sensor.py` was the only one missing it. Because the model is dumped with `by_alias=True, exclude_none=False` and the field carries a default, every sensor dictionary the coordinator produces now includes `"modelKey": "sensor"`, including for controllers that omitted the field entirely, where the key was previously absent. Nothing in the integration reads that key off a sensor dictionary today.
+
 ## [2026.9.3] - 2026-09-14
 
 ### Fixed
