@@ -4,19 +4,27 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
-from custom_components.unifi_insights import UnifiInsightsData
+from custom_components.unifi_insights import (
+    SETUP_PROBE_RETRIES,
+    UnifiInsightsData,
+    _raise_for_setup_probes,
+)
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
+    UniFiNotFoundError,
     UniFiResponseError,
     UniFiTimeoutError,
 )
+from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
 
 
 async def test_setup_entry_success(
@@ -262,8 +270,19 @@ async def test_setup_entry_no_sites_found(
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    # Should fail with auth failed (no sites and no protect means bad API key)
+    # A console that is still starting answers this way, so setup retries
+    # first; once the retries are used up it asks for reauth as before.
+    assert mock_config_entry.state == ConfigEntryState.SETUP_RETRY
+
+    hass.data[DOMAIN]["setup_probe_attempts"][mock_config_entry.entry_id] = {
+        "inconclusive": SETUP_PROBE_RETRIES
+    }
+    await hass.config_entries.async_reload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
     assert mock_config_entry.state == ConfigEntryState.SETUP_ERROR
+    flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert [flow["context"]["source"] for flow in flows] == ["reauth"]
 
 
 async def test_setup_entry_remote_connection(
@@ -490,3 +509,283 @@ async def test_site_forbidden_at_setup_does_not_start_reauth(
 
     assert mock_config_entry.state == ConfigEntryState.SETUP_RETRY
     assert not hass.config_entries.flow.async_progress_by_handler("unifi_insights")
+
+
+def _set_network(client: MagicMock, behaviour: object) -> None:
+    if isinstance(behaviour, Exception):
+        client.sites.get_all = AsyncMock(side_effect=behaviour)
+    else:
+        client.sites.get_all = AsyncMock(return_value=behaviour)
+
+
+def _set_protect(client: MagicMock, cameras: object, nvr: object = None) -> None:
+    if isinstance(cameras, Exception):
+        client.cameras.get_all = AsyncMock(side_effect=cameras)
+    else:
+        client.cameras.get_all = AsyncMock(return_value=cameras)
+    if isinstance(nvr, Exception):
+        client.nvr.get = AsyncMock(side_effect=nvr)
+    else:
+        client.nvr.get = AsyncMock(return_value=nvr)
+
+
+_SITES = [{"id": "default", "name": "Default"}]
+
+
+@pytest.mark.parametrize(
+    ("network", "cameras", "nvr", "expected_state", "protect_loaded", "reauth"),
+    [
+        # Network works, Protect temporarily failing: retry, don't drop Protect.
+        (_SITES, UniFiTimeoutError("t"), None, "setup_retry", None, False),
+        (
+            _SITES,
+            UniFiResponseError("Bad gateway", status_code=502),
+            None,
+            "setup_retry",
+            None,
+            False,
+        ),
+        (
+            _SITES,
+            [],
+            UniFiResponseError("Unavailable", status_code=503),
+            "setup_retry",
+            None,
+            False,
+        ),
+        # Network-only console: Protect answers without an NVR.
+        (_SITES, [], ValueError("NVR not found"), "loaded", False, False),
+        # Protect-only console with an NVR and no cameras yet.
+        (
+            UniFiResponseError("HTML page", status_code=200),
+            [],
+            MagicMock(id="nvr1"),
+            "loaded",
+            True,
+            False,
+        ),
+        # Console still starting (seen live on HAOS: Network 5xx while Protect
+        # answered 404 used to end in reauth): retry, not reauth.
+        (
+            UniFiResponseError("Bad gateway", status_code=502),
+            UniFiNotFoundError("Not found", status_code=404),
+            None,
+            "setup_retry",
+            None,
+            False,
+        ),
+        (
+            UniFiConnectionError("Cannot connect"),
+            UniFiNotFoundError("Not found", status_code=404),
+            None,
+            "setup_retry",
+            None,
+            False,
+        ),
+        (
+            UniFiAuthenticationError("Unauthorized", status_code=401),
+            UniFiTimeoutError("t"),
+            None,
+            "setup_retry",
+            None,
+            False,
+        ),
+        # Nothing usable and nothing rejected (e.g. apps still starting):
+        # retry before falling back to reauth.
+        (
+            UniFiNotFoundError("Not found", status_code=404),
+            UniFiNotFoundError("Not found", status_code=404),
+            None,
+            "setup_retry",
+            None,
+            False,
+        ),
+        (
+            UniFiResponseError("HTML page", status_code=200),
+            UniFiNotFoundError("Not found", status_code=404),
+            None,
+            "setup_retry",
+            None,
+            False,
+        ),
+        # Rejected key everywhere: reauth.
+        (
+            UniFiAuthenticationError("Unauthorized", status_code=401),
+            UniFiAuthenticationError("Unauthorized", status_code=401),
+            None,
+            "setup_error",
+            None,
+            True,
+        ),
+    ],
+    ids=[
+        "protect-timeout",
+        "protect-502",
+        "camera-free-nvr-503",
+        "network-only",
+        "protect-only-camera-free-nvr",
+        "console-starting-502",
+        "console-starting-connection",
+        "network-401-protect-timeout",
+        "both-404",
+        "html-and-404",
+        "both-401",
+    ],
+)
+async def test_setup_classifies_probe_results(
+    hass: HomeAssistant,
+    *,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_local_auth: MagicMock,
+    enable_custom_integrations: None,
+    network: object,
+    cameras: object,
+    nvr: object,
+    expected_state: str,
+    protect_loaded: bool | None,
+    reauth: bool,
+) -> None:
+    """Setup retries temporary failures, reauths rejected keys, loads the rest."""
+    _set_network(mock_network_client, network)
+    _set_protect(mock_protect_client, cameras, nvr)
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state == ConfigEntryState(expected_state)
+    if protect_loaded is not None:
+        runtime = mock_config_entry.runtime_data
+        assert (runtime.protect_client is not None) is protect_loaded
+    flows = hass.config_entries.flow.async_progress_by_handler("unifi_insights")
+    assert bool(flows) is reauth
+
+
+def _probe(status: ProbeStatus, error: Exception | None = None) -> ProbeResult:
+    return ProbeResult(status, error)
+
+
+async def test_setup_probe_retries_then_loads_available_application(
+    hass: HomeAssistant,
+) -> None:
+    """A working app is held back only for a few retries, then loads alone."""
+    network = _probe(ProbeStatus.AVAILABLE)
+    protect = _probe(ProbeStatus.UNREACHABLE, UniFiTimeoutError("Timed out"))
+
+    for _ in range(SETUP_PROBE_RETRIES):
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", network, protect)
+
+    _raise_for_setup_probes(hass, "entry", network, protect)
+    assert "entry" not in hass.data[DOMAIN]["setup_probe_attempts"]
+
+
+async def test_setup_probe_unreachable_console_always_retries(
+    hass: HomeAssistant,
+) -> None:
+    """With nothing usable, a temporary failure keeps retrying."""
+    network = _probe(ProbeStatus.UNREACHABLE, UniFiConnectionError("Refused"))
+    protect = _probe(ProbeStatus.UNSUPPORTED)
+
+    for _ in range(SETUP_PROBE_RETRIES + 2):
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", network, protect)
+
+
+async def test_setup_probe_inconclusive_retries_then_reauths(
+    hass: HomeAssistant,
+) -> None:
+    """Nothing usable and nothing rejected: retry, then reauth, then reset."""
+    network = _probe(ProbeStatus.EMPTY)
+    protect = _probe(ProbeStatus.UNSUPPORTED, UniFiNotFoundError("x", 404))
+
+    for _ in range(SETUP_PROBE_RETRIES):
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", network, protect)
+    with pytest.raises(ConfigEntryAuthFailed):
+        _raise_for_setup_probes(hass, "entry", network, protect)
+
+    # The count starts over, so a later reload retries again.
+    with pytest.raises(ConfigEntryNotReady):
+        _raise_for_setup_probes(hass, "entry", network, protect)
+
+
+async def test_setup_probe_rejected_key_reauths_immediately(
+    hass: HomeAssistant,
+) -> None:
+    """A 401 with nothing usable goes straight to reauth and clears the count."""
+    hass.data.setdefault(DOMAIN, {})["setup_probe_attempts"] = {
+        "entry": {"inconclusive": 2, "partial": 1}
+    }
+    network = _probe(
+        ProbeStatus.AUTH_FAILED, UniFiAuthenticationError("x", status_code=401)
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        _raise_for_setup_probes(hass, "entry", network, _probe(ProbeStatus.UNSUPPORTED))
+
+    assert "entry" not in hass.data[DOMAIN]["setup_probe_attempts"]
+
+
+@pytest.mark.parametrize(
+    "then",
+    [
+        (ProbeStatus.AVAILABLE, ProbeStatus.UNREACHABLE),
+        (ProbeStatus.UNSUPPORTED, ProbeStatus.UNSUPPORTED),
+    ],
+    ids=["then-protect-502", "then-both-404"],
+)
+async def test_unreachable_console_does_not_use_up_retry_budget(
+    hass: HomeAssistant, then: tuple[ProbeStatus, ProbeStatus]
+) -> None:
+    """Reboot sequence seen live: many 'cannot connect', then partial answers.
+
+    The unlimited retries while nothing answers must not spend the budgets,
+    so the first conclusive-but-incomplete answer still gets its retries.
+    """
+    unreachable = _probe(ProbeStatus.UNREACHABLE, UniFiConnectionError("Refused"))
+    for _ in range(SETUP_PROBE_RETRIES + 2):
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", unreachable, unreachable)
+
+    network = _probe(then[0])
+    protect = _probe(then[1], UniFiResponseError("x", status_code=502))
+    for _ in range(SETUP_PROBE_RETRIES):
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", network, protect)
+
+
+async def test_flapping_console_keeps_partial_budget(hass: HomeAssistant) -> None:
+    """Flapping between unreachable and 502 neither resets nor extends the budget."""
+    down = _probe(ProbeStatus.UNREACHABLE, UniFiConnectionError("Refused"))
+    network = _probe(ProbeStatus.AVAILABLE)
+    protect = _probe(
+        ProbeStatus.UNREACHABLE, UniFiResponseError("Bad gateway", status_code=502)
+    )
+
+    for _ in range(SETUP_PROBE_RETRIES):
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", network, protect)
+        with pytest.raises(ConfigEntryNotReady):
+            _raise_for_setup_probes(hass, "entry", down, down)
+
+    # Budget spent by the partial answers only: now it loads with Network.
+    _raise_for_setup_probes(hass, "entry", network, protect)
+
+
+async def test_unload_and_remove_clear_retry_budget(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Unloading or deleting an entry forgets its setup retry budget."""
+    attempts = hass.data.setdefault(DOMAIN, {}).setdefault("setup_probe_attempts", {})
+    entry_id = init_integration.entry_id
+
+    attempts[entry_id] = {"inconclusive": 2}
+    await hass.config_entries.async_unload(entry_id)
+    assert entry_id not in attempts
+
+    attempts[entry_id] = {"partial": 1}
+    await hass.config_entries.async_remove(entry_id)
+    assert entry_id not in attempts
