@@ -5,11 +5,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.event import async_track_time_interval
 
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
@@ -34,6 +39,8 @@ from custom_components.unifi_insights.const import (
 from .base import UnifiBaseCoordinator
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
@@ -41,6 +48,8 @@ if TYPE_CHECKING:
     from custom_components.unifi_insights.api.protect import UniFiProtectClient
 
 _LOGGER = logging.getLogger(__name__)
+
+_MILLISECOND_EPOCH_THRESHOLD: Final = 100_000_000_000.0
 
 # Bounded auto-off for the event-derived motion/smart-detect/ring latch (see
 # `_reconcile_stale_events`). Protect gives no delivery guarantee on the
@@ -62,6 +71,60 @@ _LOGGER = logging.getLogger(__name__)
 STALE_EVENT_TIMEOUT: Final = timedelta(minutes=5)
 MAX_CONSECUTIVE_EMPTY_FETCHES: Final = 3
 
+# How many consecutive polls the door-state preservation in
+# `_should_preserve_cached_door_state` may keep a cached sensor state ahead
+# of what REST reports before REST is allowed to win regardless. Without
+# this bound, `_merge_preserved_door_state` copies the preserved timestamp
+# back onto the dict written to `self.data`, so a REST response that never
+# reports a timestamp (or a controller whose REST timestamp is stuck) makes
+# the cache re-seed its own "I am newer" signal every poll - a permanent
+# wedge, worse than the stale-read bug this preservation exists to fix.
+MAX_DOOR_STATE_PRESERVE_POLLS: Final = 3
+
+# Separate, more generous cap for branch 1 (WS-recency) of
+# `_should_preserve_cached_door_state`, evaluated independently per
+# door/motion/tamper/leak GROUP (see `_PRESERVED_SENSOR_STATE_FIELD_GROUPS`
+# below). Branch 1 only fires for a group when the incoming WebSocket frame
+# actually carried a field belonging to THAT group (see the gated per-group
+# stamp in `_handle_device_update`), so in the ordinary case it is
+# self-resolving: it cannot keep firing without genuine new state
+# continuing to arrive. This bound exists as a safety net for the residual
+# case where that keeps happening anyway (e.g. a device re-announcing the
+# same state over WS every poll while REST's own report of that state never
+# catches up). It is deliberately NOT the tight MAX_DOOR_STATE_PRESERVE_POLLS
+# cap: a genuinely flapping door legitimately produces a real WS state frame
+# on every single poll, and preserving WS in that case is *correct*, not a
+# bug - reusing the 3-poll cap here would let a stale REST value win over
+# live, currently-arriving WebSocket data during real activity, which is
+# worse than the wedge this exists to prevent.
+#
+# Once a group's cap trips, `_sensor_ws_recency_latched` LATCHES it: REST
+# keeps winning for that group on every subsequent poll - the per-group
+# counter is not reset to let the cycle restart - until REST's own report
+# actually agrees with the cached value (see `_group_state_agrees`). Without
+# the latch, resetting to 0 on trip let a sustained condition (a real WS
+# frame landing inside every fetch window while REST never reflects it) win
+# the cache back for another MAX_WS_RECENCY_PRESERVE_POLLS polls, then lose
+# it again for one poll, repeating forever - a 1-in-11 flip on contacts that
+# drive auto-lock automations, not the one-time resolution the cap is meant
+# to provide.
+MAX_WS_RECENCY_PRESERVE_POLLS: Final = 10
+
+# Coalescing window for a devices-stream reconnect refresh (see
+# `_on_websocket_connection_state_change`). A flapping stream (e.g. during a
+# controller firmware upgrade) can fire this handler many times per second;
+# a short cooldown collapses that into one immediate refresh plus at most
+# one trailing follow-up, instead of one REST /sensors call per flap.
+SENSOR_RECONNECT_DEBOUNCE_SECONDS: Final = 5.0
+
+# Hard cap on how many times `async_refresh_sensors`'s owner loop may
+# re-fetch for a request that keeps arriving while the previous fetch is
+# still in flight. Coalescing is intentionally "at most 2" per burst (see
+# that method's docstring), not true single-flight; this cap prevents an
+# unbroken stream of overlapping callers from turning that into an
+# unbounded back-to-back REST call loop.
+MAX_SENSOR_REFRESH_LOOP_ITERATIONS: Final = 2
+
 # How many consecutive polls a device may be absent from its collection before
 # `_cleanup_stale_devices` removes it from the device registry. That removal is
 # irreversible - it drops the area assignment, entity customizations and any
@@ -76,6 +139,81 @@ MAX_CONSECUTIVE_MISSING_POLLS: Final = 3
 # frame into a merged device/event dict - see `_pick_field` and the
 # `_on_websocket_message`/`_on_websocket_event_message` docstrings for why.
 _ENVELOPE_ONLY_KEYS: Final = frozenset({"type", "action", "payload", "item"})
+
+# Field names (both camelCase API aliases and snake_case attribute names)
+# that identify a door/motion/tamper/leak *state* frame, as opposed to an
+# ordinary telemetry frame (temperature, humidity, battery, signal, etc),
+# grouped by which physical state they describe. Used as the SINGLE source
+# of truth in two places that must never drift apart from each other, PER
+# GROUP:
+#   1. `_merge_preserved_door_state` - which fields get copied from the
+#      cache back onto an incoming REST response, for each group branch 1
+#      of `_should_preserve_cached_door_state` decided to preserve.
+#   2. `_handle_device_update` - which incoming WebSocket sensor frames are
+#      allowed to stamp `_sensor_last_ws_update[device_id][group]`, which in
+#      turn gates branch 1 of `_should_preserve_cached_door_state` for that
+#      SAME group.
+#
+# This used to be ONE set covering all four groups together. That let a
+# WebSocket frame carrying only e.g. `isMotionDetected` (a UP-Sense shares
+# one device id across door/motion/environment sensing, and motion at an
+# entryway fires constantly) make branch 1 preserve - and because the merge
+# then copied back ALL FOUR groups' fields together, one motion frame could
+# suppress a genuinely newer REST door transition for a poll. Splitting the
+# set per group means a frame that only touches one group can only ever
+# gate and merge THAT group - the other three are decided purely by their
+# own WebSocket activity (or, for the "door" group only, the timestamp
+# -comparison branches 2/3 below). The never-drift-apart guarantee is now
+# per group instead of global: (1) and (2) still can't disagree about what
+# counts as a "door" frame, but a "door" frame and a "motion" frame can no
+# longer be confused for each other the way one shared set allowed.
+_DOOR_STATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"isOpened", "is_opened", "opened"}
+)
+_DOOR_TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
+    {"openStatusChangedAt", "open_status_changed_at"}
+)
+_MOTION_STATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"isMotionDetected", "is_motion_detected"}
+)
+_MOTION_TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
+    {"motionDetectedAt", "motion_detected_at"}
+)
+_TAMPER_STATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"isTamperingDetected", "is_tampering_detected"}
+)
+_TAMPER_TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
+    {"tamperingDetectedAt", "tampering_detected_at"}
+)
+_LEAK_STATE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"isLeakDetected", "is_leak_detected"}
+)
+_LEAK_TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
+    {"leakDetectedAt", "leak_detected_at"}
+)
+
+# Group name -> every field spelling (state + timestamp) that identifies a
+# WS frame as belonging to that group, and that `_merge_preserved_door_state`
+# copies back when that group is preserved.
+_PRESERVED_SENSOR_STATE_FIELD_GROUPS: Final[dict[str, frozenset[str]]] = {
+    "door": _DOOR_STATE_FIELDS | _DOOR_TIMESTAMP_FIELDS,
+    "motion": _MOTION_STATE_FIELDS | _MOTION_TIMESTAMP_FIELDS,
+    "tamper": _TAMPER_STATE_FIELDS | _TAMPER_TIMESTAMP_FIELDS,
+    "leak": _LEAK_STATE_FIELDS | _LEAK_TIMESTAMP_FIELDS,
+}
+
+# Group name -> just the *state* field spelling(s), excluding the `*At`
+# timestamp. Used only by `_group_state_agrees` to decide whether a
+# WS-recency latch (see `_should_preserve_cached_door_state` and
+# `MAX_WS_RECENCY_PRESERVE_POLLS`) can clear: REST catching up on the
+# actual reported state is what matters there, not whether its timestamp
+# representation matches the cache byte-for-byte.
+_PRESERVED_SENSOR_STATE_GROUP_STATE_FIELDS: Final[dict[str, frozenset[str]]] = {
+    "door": _DOOR_STATE_FIELDS,
+    "motion": _MOTION_STATE_FIELDS,
+    "tamper": _TAMPER_STATE_FIELDS,
+    "leak": _LEAK_STATE_FIELDS,
+}
 
 
 def _pick_field(containers: list[dict[str, Any]], *keys: str) -> Any:
@@ -94,6 +232,56 @@ def _pick_field(containers: list[dict[str, Any]], *keys: str) -> Any:
             value = container.get(key)
             if value:
                 return value
+    return None
+
+
+def _normalize_epoch_seconds(value: Any) -> float | None:
+    """
+    Normalize a timestamp payload to a single epoch-seconds float.
+
+    Single normalization boundary for `_should_preserve_cached_door_state`,
+    used on BOTH sides of the comparison: the REST side (now always an int
+    epoch-millisecond value once it round-trips through the `Sensor` model's
+    `_coerce_epoch_millis` validator) and the cached side (which can be
+    whatever type was written into `self.data` last - the WebSocket path in
+    `_handle_device_update` merges raw JSON straight from the wire and
+    bypasses pydantic entirely, so it is NOT guaranteed to already be an
+    int).
+
+    Handles:
+    - `int`/`float`: epoch value in either seconds or milliseconds,
+      disambiguated by `_MILLISECOND_EPOCH_THRESHOLD` (mirrors the model
+      validator's own millisecond assumption for the int case).
+    - `datetime`: aware instances convert via `.timestamp()`; naive
+      instances are assumed UTC (the Protect controller does not appear to
+      emit naive local time, but a naive value must not raise or silently
+      compare against an aware one incorrectly).
+    - `str`: parsed as ISO 8601 via `datetime.fromisoformat`.
+
+    Returns `None` for `None`, `bool` (an `int` subclass - deliberately
+    excluded so a stray `True`/`False` can't be misread as an epoch of 1/0),
+    or any value that doesn't parse, so callers can treat "not comparable"
+    uniformly rather than needing a matrix of isinstance branches per
+    ordered pair (the bug this replaces: `_compare_timestamps` had no
+    branch at all for e.g. `(int, datetime)`, which returned `None` and
+    fell through to code that misread "no comparison possible" as "REST
+    wins").
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > _MILLISECOND_EPOCH_THRESHOLD else float(value)
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return dt.timestamp()
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.timestamp()
     return None
 
 
@@ -165,6 +353,7 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         self._consecutive_fetch_errors: dict[str, int] = {
             "cameras": 0,
             "lights": 0,
+            "sensors": 0,
         }
         # device_type -> {device_id: consecutive polls the device has been
         # missing from its collection}. Drives the registry-removal grace
@@ -257,6 +446,118 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         self._light_motion_started: dict[str, datetime] = {}
         self._camera_ring_started: dict[str, datetime] = {}
 
+        # Independent sensor reconciliation: camera traffic resets coordinator
+        # update interval via async_set_updated_data, postponing the 30s full
+        # poll indefinitely. An independent timer guarantees sensor state
+        # reconciliation every 30 seconds regardless of camera activity.
+        self._sensor_reconcile_interval: timedelta = SCAN_INTERVAL_PROTECT
+        self._unsub_sensor_reconcile: Callable[[], None] | None = None
+        self._sensor_refresh_task: asyncio.Task[None] | None = None
+        self._sensor_reconcile_task: asyncio.Task[None] | None = None
+        self._sensor_reconnect_task: asyncio.Task[None] | None = None
+        self._sensor_refresh_pending: bool = False
+        # ACCEPTED GAP (not fixed): `_cleanup_stale_devices` only prunes an
+        # id that appears in `previous_ids - current_ids`, and
+        # `previous_ids` is only ever populated from a successful REST
+        # `_fetch_sensors` poll (see that method's `current_ids` source,
+        # `self.data["sensors"].keys()`). A sensor id that `get_all()`
+        # keeps skipping on a `ValidationError` - so it never lands in a
+        # REST poll's `sensors` dict - can still receive WebSocket frames
+        # and pick up an entry here that is then never pruned. Left
+        # unbounded deliberately: the growth is one `float` per distinct
+        # id that both exists in Protect and is persistently unparseable
+        # by the `Sensor` model, which in practice is bounded by the
+        # controller's own device count and does not grow without limit -
+        # not worth the complexity of a second eviction path for a
+        # genuinely rare, self-limiting case.
+        # sensor_id -> group -> monotonic time of the last WebSocket frame
+        # that carried a field belonging to that group (see
+        # `_PRESERVED_SENSOR_STATE_FIELD_GROUPS`). A device_id key only
+        # exists here if at least one group has ever been stamped for it;
+        # an individual group key only exists once THAT group has been
+        # stamped. Gates branch 1 of `_should_preserve_cached_door_state`,
+        # per group.
+        self._sensor_last_ws_update: dict[str, dict[str, float]] = {}
+        # sensor_id -> consecutive polls `_should_preserve_cached_door_state`
+        # has preserved the cache over REST via the door-timestamp
+        # comparison (branches 2/3, "door" group only). Bounds preservation
+        # at MAX_DOOR_STATE_PRESERVE_POLLS so a REST response that never
+        # reports a timestamp - or one stuck below the cache - cannot wedge
+        # a door state forever; reset to 0 whenever REST wins normally.
+        self._sensor_preserve_counts: dict[str, int] = {}
+        # sensor_id -> group -> consecutive polls branch 1 (WS-recency) of
+        # `_should_preserve_cached_door_state` has preserved that group's
+        # cache. Kept separate from `_sensor_preserve_counts` (and bounded
+        # by the more generous MAX_WS_RECENCY_PRESERVE_POLLS, not
+        # MAX_DOOR_STATE_PRESERVE_POLLS) so the two branches' bounds can
+        # never conflate a WS-recency streak with a timestamp-comparison
+        # streak into hitting the wrong cap early - and per group, so one
+        # group's streak can never hit another group's cap early either.
+        self._sensor_ws_recency_preserve_counts: dict[str, dict[str, int]] = {}
+        # sensor_id -> set of groups currently LATCHED after hitting
+        # MAX_WS_RECENCY_PRESERVE_POLLS: while a group is in this set,
+        # branch 1 returns "do not preserve" for it unconditionally (REST
+        # keeps winning) regardless of new WebSocket activity, until
+        # `_group_state_agrees` reports REST has caught up to the cached
+        # value - see MAX_WS_RECENCY_PRESERVE_POLLS's docstring for why a
+        # plain counter-reset-to-0 on cap-trip produced a repeating flip
+        # instead of a one-time resolution. Safe to suppress the merge like
+        # this because `_handle_device_update` already wrote every genuine
+        # WebSocket frame directly into `self.data["sensors"]` as it
+        # arrived - latching only affects whether a REST *poll* is allowed
+        # to overwrite that already-current value, not whether live
+        # WebSocket state keeps updating in real time.
+        self._sensor_ws_recency_latched: dict[str, set[str]] = {}
+        # sensor_id set: which sensors have already logged the door-state
+        # -preservation cap-hit WARNING at least once (any branch, any
+        # group). Matches `_log_unparseable_ws_message`'s warn-once-then
+        # -debug precedent (`_ws_parse_warned`) - without it, a sensor
+        # stuck at the cap re-logs a WARNING roughly every cap-many polls
+        # for as long as the condition persists.
+        self._sensor_preserve_cap_warned: set[str] = set()
+        # Debounces a devices-stream reconnect refresh (see
+        # `_on_websocket_connection_state_change`): `immediate=True` runs
+        # the first refresh right away, and coalesces any reconnects that
+        # arrive during the cooldown into exactly one trailing follow-up -
+        # instead of one REST /sensors call per flap of a stream that can
+        # bounce many times a second during e.g. a controller upgrade.
+        self._sensor_reconnect_debouncer: Debouncer[Coroutine[Any, Any, None]] = (
+            Debouncer(
+                hass,
+                _LOGGER,
+                cooldown=SENSOR_RECONNECT_DEBOUNCE_SECONDS,
+                immediate=True,
+                function=self._debounced_sensor_reconnect_refresh,
+            )
+        )
+        # `Debouncer` schedules its trailing-edge cooldown via a raw
+        # `hass.loop.call_later` (see homeassistant.helpers.debounce),
+        # which - unlike `async_track_time_interval(cancel_on_shutdown=True)`
+        # above - has no shutdown-cancellation of its own. `async_shutdown`/
+        # `async_stop_websocket` already cancel it on the normal unload
+        # path, but this coordinator can also be constructed directly in
+        # tests without ever going through config-entry setup/unload; this
+        # listener is the same safety net `cancel_on_shutdown` gives the
+        # reconcile timer, so a scheduled cooldown can never outlive `hass`
+        # itself and trip pytest-homeassistant-custom-component's
+        # lingering-timer check.
+        #
+        # Registered via `entry.async_on_unload` (not called bare): the
+        # unsub `hass.bus.async_listen_once` returns was previously
+        # discarded, and the lambda closes over `self` - HA's
+        # `_OneTimeListener` holds that closure (and therefore this whole
+        # coordinator, including `self.data`) alive until
+        # EVENT_HOMEASSISTANT_STOP actually fires, which in practice means
+        # "never" for a coordinator that lives through a config-entry
+        # reload. `async_on_unload` runs the unsub on every unload/reload,
+        # not just final HA shutdown, closing that leak.
+        self.config_entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP,
+                lambda _event: self._sensor_reconnect_debouncer.async_shutdown(),
+            )
+        )
+
     async def async_start_websocket(self) -> None:
         """
         Start the real-time Protect WebSocket subscription.
@@ -320,6 +621,7 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
             host_id,
             self._site_id,
         )
+        self._start_sensor_reconcile_timer()
 
     async def async_stop_websocket(self) -> None:
         """
@@ -341,6 +643,15 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         completes) and also called directly from `async_unload_entry`'s
         normal unload path.
         """
+        self._stop_sensor_reconcile_timer()
+        self._cancel_sensor_background_task("_sensor_refresh_task")
+        self._cancel_sensor_background_task("_sensor_reconcile_task")
+        self._cancel_sensor_background_task("_sensor_reconnect_task")
+        # Only cancels a pending trailing-edge timer - does not permanently
+        # disable the debouncer, since `async_stop_websocket` can be called
+        # while this coordinator instance otherwise stays alive (see
+        # `async_shutdown` below for the permanent teardown).
+        self._sensor_reconnect_debouncer.async_cancel()
         if self._protect_websocket:
             self._protect_websocket.stop()
         for task in (self.websocket_task, self.events_websocket_task):
@@ -349,6 +660,192 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                 if isinstance(task, asyncio.Task):
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
+
+    async def async_shutdown(self) -> None:
+        """Cancel background tasks and timers on shutdown."""
+        self._stop_sensor_reconcile_timer()
+        self._cancel_sensor_background_task("_sensor_refresh_task")
+        self._cancel_sensor_background_task("_sensor_reconcile_task")
+        self._cancel_sensor_background_task("_sensor_reconnect_task")
+        self._sensor_reconnect_debouncer.async_shutdown()
+        await super().async_shutdown()
+
+    def _cancel_sensor_background_task(self, attr: str) -> None:
+        """
+        Cancel and null a tracked sensor background task attribute.
+
+        `async_stop_websocket`/`async_shutdown` previously cancelled
+        `_sensor_refresh_task` without clearing the reference, so a later
+        `async_refresh_sensors` call could see a non-None, not-yet-done
+        (cancelling) task and `await` it, taking a `CancelledError` instead
+        of treating the slot as free. Nulling the reference here closes
+        that window for every tracked sensor task, not just the inner fetch
+        task - `_sensor_reconcile_task`/`_sensor_reconnect_task` are the
+        "outer driver" tasks spawned by the reconcile timer and the
+        devices-reconnect handler respectively.
+        """
+        task: asyncio.Task[None] | None = getattr(self, attr)
+        if task is not None and not task.done():
+            task.cancel()
+        setattr(self, attr, None)
+
+    @callback
+    def _start_sensor_reconcile_timer(self) -> None:
+        """Start independent sensor reconciliation timer."""
+        if self._unsub_sensor_reconcile is not None or not self.protect_client:
+            return
+        self._unsub_sensor_reconcile = async_track_time_interval(
+            self.hass,
+            self._handle_sensor_reconcile_interval,
+            self._sensor_reconcile_interval,
+            cancel_on_shutdown=True,
+        )
+
+    @callback
+    def _stop_sensor_reconcile_timer(self) -> None:
+        """Stop independent sensor reconciliation timer."""
+        if self._unsub_sensor_reconcile is not None:
+            self._unsub_sensor_reconcile()
+            self._unsub_sensor_reconcile = None
+
+    @callback
+    def _handle_sensor_reconcile_interval(self, _now: datetime | None = None) -> None:
+        """Handle sensor reconciliation timer tick."""
+        self._sensor_reconcile_task = self.config_entry.async_create_background_task(
+            self.hass,
+            self._reconcile_sensor_refresh(),
+            name=f"{DOMAIN}_protect_sensor_reconciliation",
+        )
+
+    async def _reconcile_sensor_refresh(self) -> None:
+        """
+        Run the periodic reconcile-timer refresh, routing auth failures to reauth.
+
+        `async_refresh_sensors` re-raises `ConfigEntryAuthFailed` rather
+        than swallowing it (see that method), which is correct for the
+        `_async_update_data` poll path where the coordinator's own
+        exception handling converts it into a reauth flow. But this
+        coroutine only ever runs detached inside a background task (see
+        `_handle_sensor_reconcile_interval`) - nothing above it will ever
+        catch that exception, so without this wrapper it becomes an
+        unhandled background-task traceback and reauth never fires.
+        """
+        try:
+            await self.async_refresh_sensors()
+        except ConfigEntryAuthFailed:
+            self.config_entry.async_start_reauth(self.hass)
+
+    async def _debounced_sensor_reconnect_refresh(self) -> None:
+        """
+        Run the devices-reconnect sensor refresh, routing auth failures to reauth.
+
+        Used as the wrapped function for `_sensor_reconnect_debouncer` -
+        see `_on_websocket_connection_state_change`. Same reasoning as
+        `_reconcile_sensor_refresh`: this always runs detached from a
+        background task, so `ConfigEntryAuthFailed` must be handled here or
+        it is lost.
+        """
+        try:
+            await self.async_refresh_sensors()
+        except ConfigEntryAuthFailed:
+            self.config_entry.async_start_reauth(self.hass)
+
+    async def async_refresh_sensors(
+        self, *, notify: bool = True, raise_on_error: bool = False
+    ) -> None:
+        """
+        Refresh sensor data independently with request coalescing.
+
+        Coalescing is "at most 2 REST calls per overlapping burst", not
+        true single-flight: a caller that arrives while a fetch is already
+        in flight (a "waiter") awaits that in-flight fetch AND marks a
+        follow-up as pending, so the owner runs exactly one more fetch
+        after the first completes. The waiter's own `await` returns as
+        soon as the *original* in-flight fetch finishes - it does not wait
+        for that follow-up fetch. This is a deliberate, bounded trade-off
+        (see `MAX_SENSOR_REFRESH_LOOP_ITERATIONS`): the 30s reconcile timer
+        and the 30s main poll share `SCAN_INTERVAL_PROTECT`, so this
+        collision is routine, not a rare edge case.
+
+        `raise_on_error`: when True, an error from the underlying fetch
+        (after `_fetch_sensors`'s own bounded absorption has already given
+        up) is re-raised to the caller instead of only being logged at
+        debug. `_async_update_data` passes this so a sustained /sensors
+        outage still fails the scheduled poll; background/timer-driven
+        callers leave this False so a blip doesn't crash a fire-and-forget
+        task. `ConfigEntryAuthFailed` always propagates regardless of this
+        flag - it is a distinct concern (see `_reconcile_sensor_refresh`).
+        """
+        if not self.protect_client:
+            return
+
+        if (
+            self._sensor_refresh_task is not None
+            and not self._sensor_refresh_task.done()
+        ):
+            self._sensor_refresh_pending = True
+            error: Exception | None = None
+            try:
+                await self._sensor_refresh_task
+            except ConfigEntryAuthFailed:
+                raise
+            except Exception as err:
+                error = err
+                _LOGGER.debug(
+                    "Protect coordinator: Awaited sensor refresh failed: %s",
+                    err,
+                )
+            if notify:
+                self.async_update_listeners()
+            if raise_on_error and error is not None:
+                raise error
+            return
+
+        error = None
+        iterations = 0
+        while True:
+            iterations += 1
+            self._sensor_refresh_pending = False
+            # Entry-scoped (not `self.hass.async_create_background_task`),
+            # matching both outer driver tasks (`_sensor_reconcile_task`/
+            # `_sensor_reconnect_task`) - keeps this inner fetch task
+            # consistent with the rest of the sensor-refresh machinery and
+            # auto-cancelled on unload rather than only hass-scoped.
+            task = self.config_entry.async_create_background_task(
+                self.hass,
+                self._fetch_sensors(),
+                name=f"{DOMAIN}_protect_fetch_sensors",
+            )
+            self._sensor_refresh_task = task
+            try:
+                await task
+                error = None
+            except ConfigEntryAuthFailed:
+                raise
+            except Exception as err:
+                error = err
+                _LOGGER.debug("Protect coordinator: Sensor refresh failed: %s", err)
+            finally:
+                if self._sensor_refresh_task is task:
+                    self._sensor_refresh_task = None
+
+            if notify:
+                self.async_update_listeners()
+
+            if not self._sensor_refresh_pending:
+                break
+            if iterations >= MAX_SENSOR_REFRESH_LOOP_ITERATIONS:
+                _LOGGER.debug(
+                    "Protect coordinator: sensor refresh loop hit the %d-"
+                    "iteration cap with a refresh still pending; deferring "
+                    "to the next reconcile tick instead of looping "
+                    "indefinitely",
+                    MAX_SENSOR_REFRESH_LOOP_ITERATIONS,
+                )
+                break
+
+        if raise_on_error and error is not None:
+            raise error
 
     @callback
     def _on_websocket_message(self, message: Any) -> None:
@@ -508,6 +1005,24 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
         self._recompute_ws_health_rollup()
         if connected:
             self._reconcile_stale_events()
+            if stream == "devices":
+                # Routed through `_sensor_reconnect_debouncer` (finding 6):
+                # a flapping devices stream can fire this handler many
+                # times a second (e.g. during a controller upgrade), and
+                # each one used to spawn its own `async_refresh_sensors()`
+                # background task - a waiter that marks a follow-up
+                # pending on every single flap, which combined with the
+                # (now-capped) owner loop still adds up to unbounded REST
+                # calls over a sustained flapping period. The debouncer
+                # collapses that into one immediate refresh plus at most
+                # one trailing follow-up.
+                self._sensor_reconnect_task = (
+                    self.config_entry.async_create_background_task(
+                        self.hass,
+                        self._sensor_reconnect_debouncer.async_call(),
+                        name=f"{DOMAIN}_protect_sensor_reconnect_refresh",
+                    )
+                )
 
     def _recompute_ws_health_rollup(self) -> None:
         """
@@ -587,6 +1102,22 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                 **device_data,
             }
         elif model_key == DEVICE_TYPE_SENSOR:
+            # Gated PER GROUP to door/motion/tamper/leak *state* frames
+            # only (see `_PRESERVED_SENSOR_STATE_FIELD_GROUPS`) - stamping
+            # this for every sensor WS frame (temperature, humidity,
+            # battery, signal...) regardless of content let one benign
+            # telemetry push make branch 1 of
+            # `_should_preserve_cached_door_state` preserve the cache, and
+            # stamping all four groups together off of any ONE group's
+            # frame let e.g. a motion-only frame suppress a genuinely
+            # newer REST door transition. A frame only stamps the specific
+            # group(s) whose fields it actually carries; a frame matching
+            # no group leaves `device_id` absent from
+            # `_sensor_last_ws_update` entirely.
+            now = time.monotonic()
+            for group, fields in _PRESERVED_SENSOR_STATE_FIELD_GROUPS.items():
+                if not fields.isdisjoint(device_data):
+                    self._sensor_last_ws_update.setdefault(device_id, {})[group] = now
             self.data["sensors"][device_id] = {
                 **self.data["sensors"].get(device_id, {}),
                 **device_data,
@@ -1012,8 +1543,16 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
             # Fetch lights
             await self._fetch_lights()
 
-            # Fetch sensors
-            await self._fetch_sensors()
+            # Fetch sensors (coordinated through async_refresh_sensors).
+            # raise_on_error=True: `_fetch_sensors` already bounds its own
+            # transient-error absorption (MAX_CONSECUTIVE_EMPTY_FETCHES),
+            # but async_refresh_sensors's own coalescing wrapper otherwise
+            # only logs a swallowed error at debug - without this flag a
+            # sustained /sensors outage never fails the scheduled poll
+            # (finding 4). Cameras/lights/etc. are unaffected: they call
+            # their `_fetch_*` methods directly, so their escalated errors
+            # already propagate here.
+            await self.async_refresh_sensors(notify=False, raise_on_error=True)
 
             # Fetch NVR
             await self._fetch_nvr()
@@ -1048,6 +1587,15 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
 
             return self.data
 
+        except ConfigEntryAuthFailed:
+            # `_fetch_sensors` converts UniFiAuthenticationError to
+            # ConfigEntryAuthFailed itself (via `_handle_auth_error`) before
+            # `async_refresh_sensors(raise_on_error=True)` re-raises it
+            # here - it does NOT arrive as a UniFiAuthenticationError like
+            # the other fetchers' errors do. Without this explicit clause
+            # it falls into the generic `except Exception` below and gets
+            # relabeled as UpdateFailed, losing the reauth flow entirely.
+            raise
         except UniFiAuthenticationError as err:
             self._handle_auth_error(err)
         except UniFiConnectionError as err:
@@ -1315,6 +1863,7 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
             return
 
         _LOGGER.debug("Protect coordinator: Fetching sensors")
+        fetch_start_time = time.monotonic()
         try:
             sensors_models = await self.protect_client.sensors.get_all()
             sensors: dict[str, Any] = {}
@@ -1323,19 +1872,284 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                 sensor_id = sensor.get("id")
                 if sensor_id:
                     sensors[sensor_id] = sensor
+
+            # Protect newer door/sensor states from being overwritten
+            # by older REST responses
+            existing_sensors = self.data.get("sensors", {})
+            if isinstance(existing_sensors, dict):
+                for s_id, rest_sensor in sensors.items():
+                    cached_sensor = existing_sensors.get(s_id)
+                    if not isinstance(cached_sensor, dict):
+                        continue
+                    preserved_groups = self._should_preserve_cached_door_state(
+                        cached_sensor, rest_sensor, fetch_start_time, s_id
+                    )
+                    if preserved_groups:
+                        self._merge_preserved_door_state(
+                            cached_sensor, rest_sensor, preserved_groups
+                        )
+
             self._update_device_collection(
                 "sensors",
                 sensors,
                 is_partial=not self.protect_client.sensors.last_result_complete,
             )
+            self._consecutive_fetch_errors["sensors"] = 0
             _LOGGER.debug(
                 "Protect coordinator: Successfully fetched %d sensors",
                 len(sensors_models),
             )
         except UniFiNotFoundError:
+            self._consecutive_fetch_errors["sensors"] = 0
             self._update_device_collection("sensors", {}, is_404=True)
+        except UniFiAuthenticationError as err:
+            self._handle_auth_error(err)
+        except (UniFiConnectionError, UniFiTimeoutError, UniFiResponseError) as err:
+            if not self._absorb_transient_fetch_error("sensors", err):
+                raise
         except Exception as err:
             _LOGGER.warning("Protect coordinator: Error fetching sensors: %s", err)
+
+    def _should_preserve_cached_door_state(
+        self,
+        cached_sensor: dict[str, Any],
+        rest_sensor: dict[str, Any],
+        fetch_start_time: float,
+        sensor_id: str,
+    ) -> frozenset[str]:
+        """
+        Determine which door/motion/tamper/leak field GROUPS to keep cached.
+
+        Returns the subset of `_PRESERVED_SENSOR_STATE_FIELD_GROUPS` keys
+        whose fields `_merge_preserved_door_state` should copy from the
+        cache onto the incoming REST sensor dict, instead of letting REST's
+        own value win. Evaluated independently per group so that a
+        WebSocket frame carrying only one group's fields (e.g. a
+        motion-only frame from a UP-Sense that shares one device id across
+        door/motion/environment sensing) can only ever preserve THAT
+        group - it can no longer suppress a genuinely newer REST
+        transition on an unrelated group the way a single shared
+        preservation decision used to.
+
+        Branch 1 (WebSocket-recency) below is genuinely per-group: it reads
+        `self._sensor_last_ws_update[sensor_id]`, which
+        `_handle_device_update` only stamps for the specific group(s) a
+        frame actually carried. Branches 2/3 (REST-vs-cache
+        `openStatusChangedAt` timestamp comparison) have no equivalent
+        signal for motion/tamper/leak - they only ever reasoned about the
+        door group's own timestamp - so they can only ever contribute
+        "door" to the returned set, exactly as before this method returned
+        a single bool.
+
+        Bounded by `MAX_DOOR_STATE_PRESERVE_POLLS` via
+        `self._sensor_preserve_counts` for the door-timestamp branches:
+        `_merge_preserved_door_state` copies the preserved timestamp back
+        onto the dict written to `self.data["sensors"]`, so without a
+        bound the cache would re-seed its own "I am newer" signal on every
+        subsequent poll whenever REST never reports a timestamp, or
+        reports one that never advances past the cache - a permanent
+        wedge, worse than the stale-read bug this preservation exists to
+        fix.
+
+        The WebSocket-recency check (branch 1) is bounded separately, per
+        group, by `MAX_WS_RECENCY_PRESERVE_POLLS` via
+        `self._sensor_ws_recency_preserve_counts` - NOT the tighter
+        `MAX_DOOR_STATE_PRESERVE_POLLS` used below - and additionally
+        LATCHED via `self._sensor_ws_recency_latched` once a group's cap
+        trips, so a sustained condition resolves once instead of flipping
+        every `MAX_WS_RECENCY_PRESERVE_POLLS`-th poll. See both constants'
+        docstrings for the full history of why an earlier, unbounded
+        version of this branch wedged the cache, and why a naive bounded
+        -but-not-latched version merely turned the wedge into a periodic
+        flip.
+        """
+        preserved_groups: set[str] = set()
+
+        # 1. WebSocket update arrived during or after this REST request
+        # started, for a SPECIFIC group - i.e. a real frame carrying that
+        # group's field(s) (see the gated per-group stamp in
+        # `_handle_device_update`) raced ahead of this specific REST
+        # request. Bounded and latched per (sensor, group) pair so that
+        # neither counters nor latches from one group, or from the
+        # timestamp-comparison branches below, can conflate with another.
+        group_ws_updates = self._sensor_last_ws_update.get(sensor_id, {})
+        ws_counts = self._sensor_ws_recency_preserve_counts.setdefault(sensor_id, {})
+        latched_groups = self._sensor_ws_recency_latched.setdefault(sensor_id, set())
+
+        def _evaluate_ws_recency(group: str) -> bool:
+            if group in latched_groups:
+                if self._group_state_agrees(cached_sensor, rest_sensor, group):
+                    # REST has caught up: clear the latch and fall through
+                    # to a fresh evaluation below, exactly as if this group
+                    # had never hit the cap.
+                    latched_groups.discard(group)
+                    ws_counts[group] = 0
+                else:
+                    # Still disagreeing: keep letting REST win, and do NOT
+                    # touch the counter - this is what makes the
+                    # resolution a one-time event, not a repeating flip.
+                    return False
+
+            last_ws_update = group_ws_updates.get(group)
+            if last_ws_update is None or last_ws_update < fetch_start_time:
+                ws_counts[group] = 0
+                return False
+
+            ws_preserve_count = ws_counts.get(group, 0)
+            if ws_preserve_count >= MAX_WS_RECENCY_PRESERVE_POLLS:
+                self._log_preserve_cap_hit(
+                    sensor_id,
+                    "Protect coordinator: sensor %s %s WS-recency door "
+                    "state preservation hit the %d-poll cap; letting REST "
+                    "win until it agrees with the cached state, to avoid "
+                    "wedging or flip-flopping the cached state",
+                    sensor_id,
+                    group,
+                    MAX_WS_RECENCY_PRESERVE_POLLS,
+                )
+                latched_groups.add(group)
+                return False
+            ws_counts[group] = ws_preserve_count + 1
+            return True
+
+        for group in _PRESERVED_SENSOR_STATE_FIELD_GROUPS:
+            if _evaluate_ws_recency(group):
+                preserved_groups.add(group)
+
+        # 2/3. Door-only timestamp comparison, skipped if branch 1 above
+        # already decided to preserve "door" via WS-recency.
+        if "door" not in preserved_groups:
+            cached_ts = self._get_field(
+                cached_sensor, "openStatusChangedAt", "open_status_changed_at"
+            )
+            rest_ts = self._get_field(
+                rest_sensor, "openStatusChangedAt", "open_status_changed_at"
+            )
+            preserve_count = self._sensor_preserve_counts.get(sensor_id, 0)
+
+            def _preserve_bounded() -> bool:
+                if preserve_count >= MAX_DOOR_STATE_PRESERVE_POLLS:
+                    self._log_preserve_cap_hit(
+                        sensor_id,
+                        "Protect coordinator: sensor %s door state "
+                        "preservation hit the %d-poll cap; letting REST "
+                        "win to avoid wedging the cached state "
+                        "permanently",
+                        sensor_id,
+                        MAX_DOOR_STATE_PRESERVE_POLLS,
+                    )
+                    self._sensor_preserve_counts[sensor_id] = 0
+                    return False
+                self._sensor_preserve_counts[sensor_id] = preserve_count + 1
+                return True
+
+            # Both sides report a timestamp: normalize to a common unit
+            # (finding 2: raw numeric comparison let a ms-epoch cache
+            # value always beat a genuinely newer s-epoch REST value) and
+            # compare regardless of the two payloads' original Python
+            # types (finding 3: the old isinstance-per-pair comparator had
+            # no (int, datetime) branch, so a type mismatch fell through
+            # and was misread as "REST wins").
+            cached_norm = _normalize_epoch_seconds(cached_ts)
+            rest_norm = _normalize_epoch_seconds(rest_ts)
+            if cached_norm is not None and rest_norm is not None:
+                if cached_norm > rest_norm:
+                    if _preserve_bounded():
+                        preserved_groups.add("door")
+                else:
+                    self._sensor_preserve_counts[sensor_id] = 0
+            elif cached_norm is not None and rest_norm is None:
+                # Cached has a (normalizable) timestamp but REST's is
+                # missing or unparseable: preserve, bounded the same way.
+                if _preserve_bounded():
+                    preserved_groups.add("door")
+            else:
+                self._sensor_preserve_counts[sensor_id] = 0
+
+        return frozenset(preserved_groups)
+
+    @staticmethod
+    def _group_state_agrees(
+        cached_sensor: dict[str, Any], rest_sensor: dict[str, Any], group: str
+    ) -> bool:
+        """
+        Return True if REST's report for `group` already matches the cache.
+
+        Compares only the group's *state* field(s) (see
+        `_PRESERVED_SENSOR_STATE_GROUP_STATE_FIELDS`), not its `*At`
+        timestamp - a matching timestamp representation is not required for
+        the WS-recency latch in `_should_preserve_cached_door_state` to
+        clear, only agreement on what actually happened. A field spelling
+        absent from both sides is treated as agreeing (nothing to disagree
+        about); present on only one side is treated as NOT agreeing, since
+        that is itself a discrepancy.
+        """
+        for field in _PRESERVED_SENSOR_STATE_GROUP_STATE_FIELDS[group]:
+            cached_has = field in cached_sensor
+            rest_has = field in rest_sensor
+            if cached_has != rest_has:
+                return False
+            if cached_has and cached_sensor[field] != rest_sensor[field]:
+                return False
+        return True
+
+    @staticmethod
+    def _merge_preserved_door_state(
+        cached_sensor: dict[str, Any],
+        rest_sensor: dict[str, Any],
+        preserved_groups: frozenset[str],
+    ) -> None:
+        """
+        Preserve cached sensor event states on the incoming REST sensor dictionary.
+
+        Copies ONLY the fields belonging to `preserved_groups` - the exact
+        groups `_should_preserve_cached_door_state` decided to preserve -
+        using `_PRESERVED_SENSOR_STATE_FIELD_GROUPS` as the SAME
+        per-group field mapping `_handle_device_update` uses to decide
+        whether an incoming WebSocket frame counts as belonging to that
+        group, so "what we preserve" and "what counts as a group's state
+        frame" can never drift apart per group (see that constant's
+        docstring). Groups NOT in `preserved_groups` are left alone, so a
+        WebSocket frame that only justified preserving e.g. "motion"
+        cannot also drag a stale cached "door" value back over a
+        genuinely newer REST door transition.
+        """
+        for group in preserved_groups:
+            for field in _PRESERVED_SENSOR_STATE_FIELD_GROUPS[group]:
+                if field in cached_sensor:
+                    rest_sensor[field] = cached_sensor[field]
+
+    def _log_preserve_cap_hit(self, sensor_id: str, msg: str, *args: Any) -> None:
+        """
+        Log a door-state-preservation cap-hit warning once per sensor id.
+
+        Matches `_log_unparseable_ws_message`'s warn-once-then-debug
+        precedent (`_ws_parse_warned`): without this, a sensor whose REST
+        timestamp is persistently stuck below the cache - or whose
+        WebSocket stream keeps re-announcing the same state - re-logs a
+        WARNING roughly every cap-many polls (~90s at
+        MAX_DOOR_STATE_PRESERVE_POLLS's default) for as long as the
+        condition persists, which can log-storm a production instance the
+        same way an unparseable WS frame could before that precedent was
+        added. Shared across both the WS-recency cap and the timestamp
+        -comparison cap - a sensor that already warned for one does not
+        need a second first-time WARNING for the other.
+        """
+        level = (
+            logging.DEBUG
+            if sensor_id in self._sensor_preserve_cap_warned
+            else logging.WARNING
+        )
+        _LOGGER.log(level, msg, *args)
+        self._sensor_preserve_cap_warned.add(sensor_id)
+
+    @staticmethod
+    def _get_field(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        """Get a field from data using multiple possible key names."""
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+        return default
 
     async def _fetch_nvr(self) -> None:
         """Fetch NVR data."""
@@ -1509,6 +2323,27 @@ class UnifiProtectCoordinator(UnifiBaseCoordinator):
                             remove_config_entry_id=self.config_entry.entry_id,
                         )
                         break
+
+                if device_type == "sensors":
+                    # Matches `_drop_rebuilt_latch_trackers` / the removed-
+                    # device branch of `_expire_stale_latch`: a sensor's
+                    # per-device tracking state must not survive its
+                    # eviction from the registry, or a device ID reused
+                    # (unlikely but not impossible) or simply retained in
+                    # these dicts forever would leak memory and could feed
+                    # a stale `_sensor_last_ws_update` timestamp into
+                    # `_should_preserve_cached_door_state` for an unrelated
+                    # future adoption of the same ID. Popping by device_id
+                    # removes the whole per-group sub-dict/sub-set for the
+                    # nested trackers below in one call, so a sensor
+                    # re-adopted on a later poll always starts with a
+                    # counter of 0 and no latch or warning flag, never
+                    # inheriting state left over from the evicted device.
+                    self._sensor_last_ws_update.pop(device_id, None)
+                    self._sensor_preserve_counts.pop(device_id, None)
+                    self._sensor_ws_recency_preserve_counts.pop(device_id, None)
+                    self._sensor_ws_recency_latched.pop(device_id, None)
+                    self._sensor_preserve_cap_warned.discard(device_id)
 
             self._previous_protect_device_ids[device_type] = current_ids | pending_ids
 
