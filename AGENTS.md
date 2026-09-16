@@ -452,6 +452,12 @@ See `.github/instructions/tests.instructions.md` for comprehensive testing patte
 ## UniFi-Specific Considerations
 
 - **UniFi Developer Portal:** Consult [developer.ui.com](https://developer.ui.com/) for official UniFi API documentation, endpoint specifications, and latest developer capabilities
+- **Machine-readable API references (use these, not the HTML docs):** the portal's documentation pages are JavaScript-rendered, so a plain HTTP fetch returns an empty app shell — an agent gets HTTP 200 and no API content. These endpoints return real content and are the ones to fetch:
+  - `https://developer.ui.com/llms.txt` — root index: which APIs exist and their current versions
+  - `https://developer.ui.com/{service}/{version}/llms.txt` — full endpoint list for one service
+  - `https://developer.ui.com/{service}/{version}/openapi.json` — request/response schemas
+  - `https://developer.ui.com/network/v10.4.57/ai-gettingstarted.md` — agent-oriented onboarding for the Network API
+  - Current versions as of 2026-09-16: Network `v10.4.57`, Protect `v7.3.53`, Site Manager `v1.0.0`. Resolve versions from the root index rather than hardcoding them.
 - **API Rate Limiting:** Be mindful of UniFi controller API rate limits when setting polling intervals
 - **Device Discovery:** Handle dynamic device discovery as UniFi networks can change
 - **Connection Resilience:** UniFi controllers may restart or become temporarily unavailable
@@ -481,6 +487,9 @@ See `.github/instructions/tests.instructions.md` for comprehensive testing patte
 ## Additional Resources
 
 - [UniFi Developer Portal](https://developer.ui.com/) — Official UniFi API documentation and developer resources
+- [UniFi API root index (`llms.txt`)](https://developer.ui.com/llms.txt) — machine-readable list of APIs and versions; the HTML pages are JS-rendered and unreadable to agents
+- [UniFi Network AI onboarding](https://developer.ui.com/network/v10.4.57/ai-gettingstarted.md) — agent-oriented Network API primer
+- [UniFi Protect OpenAPI spec](https://developer.ui.com/protect/v7.3.53/openapi.json) — authoritative sensor/camera schemas
 - [Home Assistant Developer Docs](https://developers.home-assistant.io/) — Primary reference
 - [Integration Quality Scale Rules](https://developers.home-assistant.io/docs/core/integration-quality-scale/rules)
 - [Architecture Docs](https://developers.home-assistant.io/docs/architecture_index)

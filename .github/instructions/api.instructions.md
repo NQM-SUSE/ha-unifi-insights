@@ -24,6 +24,7 @@ This integration vendors the upstream `unifi-official-api` project under `custom
 - Reuse `network_client` and `protect_client` methods
 - Never duplicate API endpoint paths — reference `const.py`
 - Always consult the [UniFi Developer Portal](https://developer.ui.com/) for official API documentation, endpoint specifications, and latest developer features
+- Fetch the **machine-readable** refs rather than the HTML docs — the portal is JavaScript-rendered and a plain fetch yields an empty app shell. Use [`llms.txt`](https://developer.ui.com/llms.txt) for the API/version index and `https://developer.ui.com/{service}/{version}/openapi.json` for request/response schemas. When adding or changing a model field, verify it against that spec
 
 ## Client Setup
 

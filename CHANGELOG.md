@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
 
+### Documentation
+
+- Agent-facing guidance (`AGENTS.md`, `CONTRIBUTING.md`, Copilot instructions, `api.instructions.md`) now points at the UniFi Developer Portal's **machine-readable** endpoints alongside the human docs. The portal's documentation pages are JavaScript-rendered, so a coding agent fetching `developer.ui.com/...` receives HTTP 200 and an empty app shell with no API content - a silent dead end that reads like a successful fetch. The `llms.txt` index, per-service `llms.txt`, `openapi.json` specs and the Network `ai-gettingstarted.md` primer all return real content and are now named explicitly, along with the current service versions and a note to resolve versions from the root index rather than hardcoding them.
+
 ## [2026.9.3] - 2026-09-14
 
 ### Fixed
