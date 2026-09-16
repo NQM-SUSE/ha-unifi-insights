@@ -29,6 +29,7 @@ TO_REDACT = {
     "password",
     "psk",
     "passphrase",
+    "qr_code",
     "secret",
     "voucher",
     "fingerprint",

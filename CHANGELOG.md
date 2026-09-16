@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
+
 ## [2026.9.3] - 2026-09-14
 
 ### Fixed
