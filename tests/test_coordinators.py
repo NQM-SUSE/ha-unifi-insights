@@ -23,6 +23,7 @@ from custom_components.unifi_insights.api import (
 )
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
+    CONF_SITE_IDS,
     CONNECTION_TYPE_LOCAL,
     DOMAIN,
     SCAN_INTERVAL_CONFIG,
@@ -495,6 +496,61 @@ class TestUnifiConfigCoordinator:
         assert "policy_based_routes" in result
         assert "route1" in result["policy_based_routes"]["default"]
         assert coordinator._available is True
+        assert coordinator.available_sites == {
+            "default": "Default",
+            "site2": "Site 2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_filters_selected_sites(self, hass: HomeAssistant):
+        """Only the sites picked in options are polled (Issue #128)."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_API_KEY: "test_api_key"},
+            options={CONF_SITE_IDS: ["site2"]},
+        )
+        network_client = _create_mock_network_client()
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=network_client,
+            protect_client=None,
+            entry=entry,
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert list(result["sites"]) == ["site2"]
+        assert coordinator.get_site_ids() == ["site2"]
+        # Every site stays selectable in the options flow.
+        assert coordinator.available_sites == {
+            "default": "Default",
+            "site2": "Site 2",
+        }
+        polled = [call.args[0] for call in network_client.wifi.get_all.await_args_list]
+        assert polled == ["site2"]
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_selected_sites_all_gone(
+        self, hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+    ):
+        """A selection matching no current site polls nothing and says why."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_API_KEY: "test_api_key"},
+            options={CONF_SITE_IDS: ["removed-site"]},
+        )
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=None,
+            entry=entry,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await coordinator._async_update_data()
+
+        assert result["sites"] == {}
+        assert "none of the selected sites" in caplog.text
 
     @pytest.mark.asyncio
     async def test_async_update_data_wifi_error(

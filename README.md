@@ -114,6 +114,7 @@ After setup, open the integration's options flow (**Settings** → **Devices & S
 | Track WiFi Clients    | Off     | Creates device tracker entities for connected wireless clients. May add a large number of entities on busy networks.                                                                                                                 |
 | Track Wired Clients   | Off     | Creates device tracker entities for connected wired clients.                                                                                                                                                                         |
 | Enable Client Control | On      | Creates allow/block switch and reconnect button entities for each connected client. Disable this if you only need read-only monitoring — it prevents orphaned unavailable entities from accumulating when clients leave the network. |
+| Sites                 | All     | Only shown when the console has more than one site. Pick the sites to poll; unselected sites are not queried at all, which cuts API traffic on multi-site consoles. Leave empty to include every site.                             |
 
 ## Entities
 
