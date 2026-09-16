@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A **Sites** option lets a multi-site console poll only the sites you pick. Unselected sites are not queried at all, which cuts API traffic when Home Assistant only needs one site out of many. Leave it empty to keep polling every site. The picker only appears when the console has more than one site. Devices of a site you deselect can now be deleted from the device page, since they will never update again. [#128](https://github.com/ruaan-deysel/ha-unifi-insights/issues/128)
+
 ### Fixed
 
 - Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
+- Network devices the API lists without an `id` (reported with a UAP-AC-M "AC Mesh") are no longer dropped with `Failed to validate device ... id Field required`. They are now keyed on their MAC address. Their legacy port and PoE metrics load, but the official per-device statistics endpoint is skipped because it can only be addressed by id. [#128](https://github.com/ruaan-deysel/ha-unifi-insights/issues/128)
 
 ## [2026.9.3] - 2026-09-14
 
