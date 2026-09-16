@@ -449,11 +449,26 @@ async def async_remove_config_entry_device(
     return any(
         domain == DOMAIN
         and any(
-            identifier.startswith(f"{site_id}_") or identifier.endswith(f"_{site_id}")
-            for site_id in deselected
+            _is_site_scoped_identifier(identifier, site_id) for site_id in deselected
         )
         for domain, identifier in device_entry.identifiers
     )
+
+
+def _is_site_scoped_identifier(identifier: str, site_id: str) -> bool:
+    """
+    Return True if a device identifier belongs to the given site.
+
+    Only the exact formats built for site-scoped devices match: network
+    devices (``{site}_{device}``) and the per-site firewall, route and VPN
+    devices. A loose suffix check would also match a Protect or WiFi id that
+    merely ends in the site id.
+    """
+    return identifier.startswith(f"{site_id}_") or identifier in {
+        f"firewall_policies_{site_id}",
+        f"policy_based_routes_{site_id}",
+        f"vpn_clients_{site_id}",
+    }
 
 
 async def async_reload_entry(

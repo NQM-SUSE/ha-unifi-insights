@@ -553,7 +553,20 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             # Get site IDs from config coordinator
             site_ids = self.config_coordinator.get_site_ids()
 
+            # Drop data for sites no longer polled so their entities stop
+            # reporting last-known values. Site-level fetch failures below
+            # still keep a polled site's previous data.
+            for key in ("devices", "stats", "clients"):
+                self.data[key] = {
+                    site_id: value
+                    for site_id, value in self.data[key].items()
+                    if site_id in site_ids
+                }
+
             if not site_ids:
+                # Deliberately no stale-device cleanup here: an empty site
+                # list is also what a transient Network API failure looks
+                # like, and purging the registry on it would lose devices.
                 _LOGGER.debug(
                     "Device coordinator: No sites available from config coordinator"
                 )

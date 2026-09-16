@@ -267,6 +267,16 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 self.data["last_update"] = datetime.now(tz=UTC)
                 return self.data
 
+            # Per-site maps are updated in place below, so drop any site that
+            # is no longer polled (removed from the console, or deselected)
+            # rather than keep serving its last values.
+            for key in ("wifi", "firewall_rules", "policy_based_routes", "vpn_clients"):
+                self.data[key] = {
+                    site_id: value
+                    for site_id, value in self.data[key].items()
+                    if site_id in self.data["sites"]
+                }
+
             # Resolve classic site names so we can enrich WiFi data with secrets
             # and per-SSID client counts that the official API does not expose.
             legacy_site_names: dict[str, str] = {}

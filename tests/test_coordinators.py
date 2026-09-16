@@ -534,6 +534,20 @@ class TestUnifiConfigCoordinator:
         assert polled == ["site2"]
 
     @pytest.mark.asyncio
+    async def test_async_update_data_prunes_per_site_maps(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """Per-site config data for a site no longer polled is dropped."""
+        for key in ("wifi", "firewall_rules", "policy_based_routes", "vpn_clients"):
+            coordinator.data[key]["gone"] = {"stale": {"id": "stale"}}
+
+        result = await coordinator._async_update_data()
+
+        for key in ("wifi", "firewall_rules", "policy_based_routes", "vpn_clients"):
+            assert "gone" not in result[key]
+            assert "default" in result[key]
+
+    @pytest.mark.asyncio
     async def test_async_update_data_selected_sites_all_gone(
         self, hass: HomeAssistant, caplog: pytest.LogCaptureFixture
     ):
@@ -1106,6 +1120,42 @@ class TestUnifiDeviceCoordinator:
         # Should return existing data without changes
         assert result == coordinator.data
         assert coordinator._available is True
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_prunes_sites_no_longer_listed(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Data for a site no longer listed is dropped, and its devices go stale."""
+        for key in ("devices", "stats", "clients"):
+            coordinator.data[key]["gone"] = {"dev-gone": {"id": "dev-gone"}}
+        coordinator._previous_network_device_ids = {"gone_dev-gone"}
+
+        with patch.object(coordinator, "_cleanup_stale_devices") as cleanup:
+            await coordinator._async_update_data()
+
+        for key in ("devices", "stats", "clients"):
+            assert "gone" not in coordinator.data[key]
+            assert "default" in coordinator.data[key]
+        cleanup.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_no_sites_clears_data_keeps_registry(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """An empty site list clears stale data but never purges registry devices."""
+        for key in ("devices", "stats", "clients"):
+            coordinator.data[key]["default"] = {"device1": {"id": "device1"}}
+        coordinator._previous_network_device_ids = {"default_device1"}
+        coordinator.config_coordinator.data["sites"] = {}
+
+        with patch.object(coordinator, "_cleanup_stale_devices") as cleanup:
+            await coordinator._async_update_data()
+
+        for key in ("devices", "stats", "clients"):
+            assert coordinator.data[key] == {}
+        # An empty list is also what a transient API failure looks like.
+        cleanup.assert_not_called()
+        assert coordinator._previous_network_device_ids == {"default_device1"}
 
     @pytest.mark.asyncio
     async def test_process_device_stats_error(

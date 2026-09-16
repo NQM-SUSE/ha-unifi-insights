@@ -390,6 +390,11 @@ def _entry_with_sites(available: dict[str, str], polled: list[str]) -> MagicMock
     [
         (("site2_device-1",), True),
         (("policy_based_routes_site2",), True),
+        (("firewall_policies_site2",), True),
+        (("vpn_clients_site2",), True),
+        # A Protect or WiFi id that happens to end in a site id is not site-scoped.
+        (("protect_camera_site2",), False),
+        (("wifi_site2",), False),
         (("default_device-1",), False),
         (("protect_camera_cam-1",), False),
         (("client_aa:bb:cc:dd:ee:ff",), False),
