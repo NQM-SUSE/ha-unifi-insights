@@ -112,7 +112,9 @@ class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntit
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return bool(self.coordinator.last_update_success and self._current_payload())
+        return bool(
+            self.coordinator.wifi_available(self._site_id) and self._current_payload()
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:

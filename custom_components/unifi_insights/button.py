@@ -378,6 +378,8 @@ class UnifiClientReconnectButton(ButtonEntity):
     @property
     def available(self) -> bool:
         """Return if button is available."""
+        if not self.coordinator.device_available:
+            return False
         client_data = self._get_client_data()
         return bool(client_data)
 

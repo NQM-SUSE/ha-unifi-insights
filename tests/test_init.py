@@ -14,6 +14,7 @@ from custom_components.unifi_insights import UnifiInsightsData
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
+    UniFiResponseError,
     UniFiTimeoutError,
 )
 
@@ -365,3 +366,127 @@ async def test_unifi_insights_data_coordinator_not_initialized(
     # Accessing coordinator property should raise RuntimeError
     with pytest.raises(RuntimeError, match="Facade coordinator not initialized"):
         _ = data.coordinator
+
+
+async def test_revoked_key_after_setup_starts_reauth(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    mock_network_client: MagicMock,
+) -> None:
+    """A key revoked while running starts reauth instead of failing silently."""
+    assert init_integration.state == ConfigEntryState.LOADED
+    config_coordinator = init_integration.runtime_data.config_coordinator
+    device_coordinator = init_integration.runtime_data.device_coordinator
+    mock_network_client.sites.get_all.return_value = [{"id": "default"}]
+    await config_coordinator.async_refresh()
+    await device_coordinator.async_refresh()
+    assert device_coordinator.last_update_success is True
+
+    mock_network_client.devices.get_all = AsyncMock(
+        side_effect=UniFiAuthenticationError("Revoked", status_code=401)
+    )
+    await device_coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert device_coordinator.last_update_success is False
+    assert init_integration.runtime_data.coordinator.device_available is False
+    flows = hass.config_entries.flow.async_progress_by_handler("unifi_insights")
+    assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+
+
+async def test_failed_wifi_refresh_marks_wifi_unavailable(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    mock_network_client: MagicMock,
+) -> None:
+    """A failed WiFi refresh is reported, then recovery restores availability."""
+    config_coordinator = init_integration.runtime_data.config_coordinator
+    facade = init_integration.runtime_data.coordinator
+    mock_network_client.sites.get_all.return_value = [{"id": "default"}]
+    await config_coordinator.async_refresh()
+    assert facade.config_available is True
+
+    mock_network_client.wifi.get_all = AsyncMock(
+        side_effect=UniFiConnectionError("Console rebooting")
+    )
+    await config_coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert facade.wifi_available("default") is False
+    assert facade.firewall_available("default") is True
+    assert facade.config_available is True
+    assert facade.device_available is True
+
+    mock_network_client.wifi.get_all = AsyncMock(return_value=[])
+    await config_coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert facade.wifi_available("default") is True
+
+
+@pytest.mark.parametrize(
+    ("namespace", "method", "error", "flag"),
+    [
+        (
+            "firewall",
+            "list_rules",
+            UniFiResponseError("Bad gateway", status_code=502),
+            "firewall_available",
+        ),
+        (
+            "wifi",
+            "get_all",
+            UniFiConnectionError("Connection reset"),
+            "wifi_available",
+        ),
+    ],
+    ids=["firewall-502", "wifi-connection"],
+)
+async def test_optional_section_failure_does_not_block_setup(
+    hass: HomeAssistant,
+    *,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_local_auth: MagicMock,
+    enable_custom_integrations: None,
+    namespace: str,
+    method: str,
+    error: Exception,
+    flag: str,
+) -> None:
+    """A WiFi/firewall outage at startup loads the entry, flagging only it."""
+    mock_network_client.sites.get_all.return_value = [{"id": "default"}]
+    setattr(
+        getattr(mock_network_client, namespace), method, AsyncMock(side_effect=error)
+    )
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state == ConfigEntryState.LOADED
+    facade = mock_config_entry.runtime_data.coordinator
+    assert getattr(facade, flag)("default") is False
+    assert facade.config_available is True
+
+
+async def test_site_forbidden_at_setup_does_not_start_reauth(
+    hass: HomeAssistant,
+    *,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_local_auth: MagicMock,
+    enable_custom_integrations: None,
+) -> None:
+    """A 403 on the devices endpoint retries setup instead of looping reauth."""
+    mock_network_client.sites.get_all.return_value = [{"id": "default"}]
+    mock_network_client.devices.get_all = AsyncMock(
+        side_effect=UniFiAuthenticationError("Forbidden", status_code=403)
+    )
+    mock_config_entry.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state == ConfigEntryState.SETUP_RETRY
+    assert not hass.config_entries.flow.async_progress_by_handler("unifi_insights")

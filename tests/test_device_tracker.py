@@ -529,6 +529,22 @@ class TestUnifiClientTracker:
         mock_coordinator.last_update_success = False
         assert tracker.available is False
 
+    def test_available_while_device_refresh_fails(self, mock_coordinator) -> None:
+        """A failing device refresh keeps the tracker's last home/not_home.
+
+        person ignores unavailable trackers and goes unknown when it has no
+        other tracker (#116), so the tracker must not follow device_available.
+        """
+        tracker = UnifiClientTracker(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            mac="AA:BB:CC:DD:EE:FF",
+        )
+        mock_coordinator.last_update_success = True
+        mock_coordinator.device_available = False
+
+        assert tracker.available is True
+
     def test_ip_address(self, mock_coordinator) -> None:
         """Test IP address property."""
         tracker = UnifiClientTracker(

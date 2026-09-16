@@ -15,16 +15,18 @@ from homeassistant.helpers.update_coordinator import (
 
 from custom_components.unifi_insights.const import DOMAIN
 
+from custom_components.unifi_insights.api import (
+    UniFiAuthenticationError,
+    UniFiConnectionError,
+    UniFiRateLimitError,
+    UniFiResponseError,
+    UniFiTimeoutError,
+)
+
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
-    from custom_components.unifi_insights.api import (
-        UniFiAuthenticationError,
-        UniFiConnectionError,
-        UniFiResponseError,
-        UniFiTimeoutError,
-    )
     from custom_components.unifi_insights.api.network import UniFiNetworkClient
     from custom_components.unifi_insights.api.protect import UniFiProtectClient
 
@@ -88,6 +90,35 @@ class UnifiBaseCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if hasattr(model, "__dict__"):
             return {k: v for k, v in model.__dict__.items() if not k.startswith("_")}
         return {}
+
+    @staticmethod
+    def _is_unsupported_response(err: Exception) -> bool:
+        """
+        Return True when an optional endpoint is simply not offered to this key.
+
+        A 403, a 404 or another 4xx client error from an optional feature
+        endpoint (WiFi, firewall policies, per-device statistics) means this
+        console or API key does not expose that feature. So does a 2xx whose
+        body is not JSON: api/base.py raises that for consoles that answer an
+        endpoint they lack with the web UI's HTML page (see the sites fetch
+        in coordinators/config.py). Both are valid, stable answers, so the
+        caller treats them as "no data" instead of a failure. A 401 is
+        excluded because it means the credentials themselves were rejected
+        and must trigger reauth, and 429 is excluded because rate limiting is
+        transient.
+        """
+        if isinstance(err, UniFiAuthenticationError):
+            return err.status_code == HTTPStatus.FORBIDDEN
+        if isinstance(err, UniFiRateLimitError):
+            return False
+        if isinstance(err, UniFiResponseError):
+            return (
+                err.status_code < HTTPStatus.MULTIPLE_CHOICES
+                or HTTPStatus.BAD_REQUEST
+                <= err.status_code
+                < HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        return False
 
     def _handle_auth_error(self, err: UniFiAuthenticationError) -> None:
         """Handle authentication error."""

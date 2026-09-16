@@ -122,7 +122,7 @@ class TestUnifiWifiQrCodeImage:
     ) -> None:
         """Entity is unavailable when the coordinator update failed."""
         entity = self._make_entity(hass, mock_coordinator)
-        mock_coordinator.last_update_success = False
+        mock_coordinator.wifi_available.return_value = False
         assert entity.available is False
 
     @pytest.mark.asyncio

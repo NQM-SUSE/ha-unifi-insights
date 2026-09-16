@@ -789,6 +789,22 @@ class TestUnifiFirewallRuleSwitch:
         )
 
         assert switch._attr_unique_id == "site1_rule1_firewall_rule"
+
+    def test_available_follows_site_firewall_fetch(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """Firewall switch is unavailable when its site's firewall fetch failed."""
+        switch = UnifiFirewallRuleSwitch(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            rule_id="rule1",
+        )
+        mock_coordinator.firewall_available = MagicMock(return_value=True)
+        assert switch.available is True
+
+        mock_coordinator.firewall_available.return_value = False
+        assert switch.available is False
+        mock_coordinator.firewall_available.assert_called_with("site1")
         assert switch._attr_translation_key == "firewall_rule"
         assert switch._attr_translation_placeholders == {"rule_name": "Block Instagram"}
         assert switch._attr_entity_category == EntityCategory.CONFIG
@@ -1084,6 +1100,21 @@ class TestUnifiPolicyBasedRouteSwitch:
         }
         assert switch._attr_entity_category == EntityCategory.CONFIG
         assert switch._attr_device_info["identifiers"] == {(DOMAIN, "site1_gateway1")}
+
+    def test_available_follows_config_refresh(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """Route switch is unavailable while the config refresh is failing."""
+        switch = UnifiPolicyBasedRouteSwitch(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            route_id="route1",
+        )
+        mock_coordinator.config_available = True
+        assert switch.available is True
+
+        mock_coordinator.config_available = False
+        assert switch.available is False
 
     def test_is_on(self, mock_coordinator: MagicMock) -> None:
         """Test switch state mirrors route enabled state."""
@@ -1640,7 +1671,7 @@ class TestUnifiVpnClientSwitch:
             client_id="vpn1",
         )
         assert switch.available is True
-        mock_coordinator.last_update_success = False
+        mock_coordinator.config_available = False
         assert switch.available is False
 
         mock_coordinator.last_update_success = True

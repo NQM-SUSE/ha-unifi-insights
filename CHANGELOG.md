@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
+- A revoked API key (HTTP 401) now starts Home Assistant's re-authentication flow even when it is first detected by a device, client, statistics, WiFi or firewall refresh; previously those errors were swallowed and the integration kept reporting success.
+- When a site's devices or clients cannot be fetched, the device refresh now fails: entities fed by it (devices, ports, client controls, firmware updates) show as unavailable and keep their last known values until the next successful refresh, instead of silently going stale. A 403 on those endpoints no longer sends the entry into a re-authentication loop.
+- A WiFi or firewall fetch failure no longer blanks those entities while reporting success. Only that site's WiFi or firewall entities become unavailable, keeping their last known values, and the rest of the integration (including Protect, and setup itself) keeps working.
+- One device's statistics timing out or erroring now keeps that device's last known statistics for up to three polls instead of dropping its sensors to unknown, without distorting its port throughput rates.
 
 ## [2026.9.3] - 2026-09-14
 

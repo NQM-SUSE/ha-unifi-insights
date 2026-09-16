@@ -455,7 +455,15 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available."""
+        """
+        Return True if entity is available.
+
+        Deliberately not gated on ``device_available``: a tracker that goes
+        ``unavailable`` during a controller outage is ignored by ``person``,
+        which then drops to ``unknown`` when it is the person's only tracker -
+        the failure #116 was about. The tracker keeps its last home/not_home
+        until the device refresh recovers.
+        """
         return bool(self.coordinator.last_update_success)
 
     @property

@@ -411,7 +411,9 @@ class UnifiFirewallRuleSwitch(
     @property
     def available(self) -> bool:
         """Return if the switch is available."""
-        return bool(self.coordinator.last_update_success and self._get_rule_data())
+        return bool(
+            self.coordinator.firewall_available(self._site_id) and self._get_rule_data()
+        )
 
     @property
     def is_on(self) -> bool:
@@ -547,7 +549,7 @@ class UnifiInsightsPolicyBasedRouteSwitch(
     @property
     def available(self) -> bool:
         """Return if the switch is available."""
-        return bool(self.coordinator.last_update_success and self._get_route_data())
+        return bool(self.coordinator.config_available and self._get_route_data())
 
     @property
     def is_on(self) -> bool:
@@ -737,9 +739,7 @@ class UnifiInsightsVpnClientSwitch(
     @property
     def available(self) -> bool:
         """Return if the switch is available."""
-        return bool(
-            self.coordinator.last_update_success and self._get_vpn_client_data()
-        )
+        return bool(self.coordinator.config_available and self._get_vpn_client_data())
 
     @property
     def is_on(self) -> bool:
@@ -1196,7 +1196,7 @@ class UnifiClientBlockSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
     @property
     def available(self) -> bool:
         """Return if switch is available."""
-        return bool(self.coordinator.last_update_success and self._get_client_data())
+        return bool(self.coordinator.device_available and self._get_client_data())
 
     @property
     def is_on(self) -> bool:
@@ -1294,7 +1294,9 @@ class UnifiWifiSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity)
     @property
     def available(self) -> bool:
         """Return if switch is available."""
-        return bool(self.coordinator.last_update_success and self._get_wifi_data())
+        return bool(
+            self.coordinator.wifi_available(self._site_id) and self._get_wifi_data()
+        )
 
     @property
     def is_on(self) -> bool:
