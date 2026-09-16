@@ -21,6 +21,10 @@ from custom_components.unifi_insights.api import (
     UniFiResponseError,
     UniFiTimeoutError,
 )
+from custom_components.unifi_insights.api.network.models import (
+    LegacyPortMetrics,
+    PortBytesMetrics,
+)
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
     CONF_SITE_IDS,
@@ -548,9 +552,11 @@ class TestUnifiConfigCoordinator:
 
         with caplog.at_level(logging.WARNING):
             result = await coordinator._async_update_data()
+            await coordinator._async_update_data()
 
         assert result["sites"] == {}
-        assert "none of the selected sites" in caplog.text
+        # Warned once, not on every 5-minute poll.
+        assert caplog.text.count("none of the selected sites") == 1
 
     @pytest.mark.asyncio
     async def test_async_update_data_wifi_error(
@@ -1115,6 +1121,34 @@ class TestUnifiDeviceCoordinator:
         # Devices should still be fetched, just without stats
         assert "devices" in result
         assert "default" in result["devices"]
+
+    @pytest.mark.asyncio
+    async def test_mac_keyed_device_skips_statistics_keeps_legacy_metrics(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A device keyed on its MAC has no controller id to fetch stats by (#128)."""
+        mac = "e0:63:da:00:00:01"
+        coordinator.network_client.devices.get_all = AsyncMock(
+            return_value=[
+                _create_mock_model(
+                    {"id": mac, "macAddress": mac, "name": "AC Mesh", "state": "ONLINE"}
+                )
+            ]
+        )
+        coordinator.network_client.devices.get_port_metrics = AsyncMock(
+            return_value=LegacyPortMetrics(
+                port_bytes={1: PortBytesMetrics(rx_bytes=10, tx_bytes=20)}
+            )
+        )
+
+        result = await coordinator._async_update_data()
+
+        coordinator.network_client.devices.get_statistics.assert_not_awaited()
+        coordinator.network_client.devices.get_port_metrics.assert_awaited_once()
+        assert mac in result["devices"]["default"]
+        stats = result["stats"]["default"][mac]
+        assert stats["port_bytes"] == {1: {"rx_bytes": 10, "tx_bytes": 20}}
+        assert stats["id"] == mac
 
     @pytest.mark.asyncio
     async def test_process_site_error(self, coordinator: UnifiDeviceCoordinator):

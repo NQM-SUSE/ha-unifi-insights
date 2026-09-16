@@ -41,6 +41,7 @@ from .services import async_setup_services
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.device_registry import DeviceEntry
 
 
 @dataclass
@@ -422,6 +423,37 @@ async def async_unload_entry(
                 _LOGGER.debug("Error closing Network client: %s", err)
 
     return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,  # noqa: ARG001
+    entry: UnifiInsightsConfigEntry,
+    device_entry: DeviceEntry,
+) -> bool:
+    """
+    Allow deleting a device that belongs to a site no longer being polled.
+
+    Deselecting a site in options stops it being polled, so its devices can
+    never come back and would otherwise sit unavailable with no way to remove
+    them. Everything else is refused: devices of polled sites are live, and
+    Protect, client and WiFi devices are not site-scoped.
+    """
+    runtime_data = getattr(entry, "runtime_data", None)
+    if runtime_data is None:
+        return False
+
+    config_coordinator = runtime_data.config_coordinator
+    deselected = set(config_coordinator.available_sites) - set(
+        config_coordinator.get_site_ids()
+    )
+    return any(
+        domain == DOMAIN
+        and any(
+            identifier.startswith(f"{site_id}_") or identifier.endswith(f"_{site_id}")
+            for site_id in deselected
+        )
+        for domain, identifier in device_entry.identifiers
+    )
 
 
 async def async_reload_entry(

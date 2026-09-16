@@ -1864,6 +1864,31 @@ async def test_options_flow_empty_site_selection_means_all_sites(
     assert CONF_SITE_IDS not in result["data"]
 
 
+async def test_options_flow_omitted_site_selection_clears_filter(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A submit without the site field clears the filter instead of restoring it."""
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, options={CONF_SITE_IDS: ["site2"]}
+    )
+    _attach_sites(mock_config_entry, {"default": "Default", "site2": "Branch"})
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            "track_wifi_clients": False,
+            "track_wired_clients": False,
+            "client_control": True,
+        },
+    )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert CONF_SITE_IDS not in result["data"]
+
+
 async def test_options_flow_lists_saved_site_that_vanished(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,

@@ -762,19 +762,22 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
                 for site_id in current_site_ids
                 if site_id not in available_sites
             )
-            schema[vol.Optional(CONF_SITE_IDS, default=current_site_ids)] = (
-                SelectSelector(
-                    SelectSelectorConfig(
-                        options=site_options,
-                        multiple=True,
-                        mode=SelectSelectorMode.DROPDOWN,
-                    )
+            # Suggested value, not a default: a default would be re-applied
+            # when the field is submitted empty, so the filter could never
+            # be cleared.
+            schema[vol.Optional(CONF_SITE_IDS)] = SelectSelector(
+                SelectSelectorConfig(
+                    options=site_options,
+                    multiple=True,
+                    mode=SelectSelectorMode.DROPDOWN,
                 )
             )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(schema),
+            data_schema=self.add_suggested_values_to_schema(
+                vol.Schema(schema), {CONF_SITE_IDS: current_site_ids}
+            ),
         )
 
     def _available_sites(self) -> dict[str, str]:

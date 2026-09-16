@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from pydantic import BaseModel, Field, model_validator
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class DeviceType(str, Enum):
@@ -170,6 +173,19 @@ class Device(BaseModel):
             msg = "device payload has neither an id nor a macAddress"
             raise ValueError(msg)
         return self
+
+
+def device_id_is_mac(device: Mapping[str, Any]) -> bool:
+    """
+    Return True when a device's id is its MAC address rather than a controller id.
+
+    ``Device`` falls back to the MAC when the API omits ``id``. Such a device
+    cannot be addressed by id on the official API (statistics, restart,
+    upgrade), so callers use this to skip those endpoints.
+    """
+    device_id = device.get("id")
+    mac = device.get("macAddress") or device.get("mac")
+    return bool(device_id and mac and str(device_id).lower() == str(mac).lower())
 
 
 class PortBytesMetrics(BaseModel):

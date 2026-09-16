@@ -67,6 +67,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
         # Every site the console reports (id -> display name), before the
         # site filter is applied, so the options flow can offer all of them.
         self.available_sites: dict[str, str] = {}
+        self._warned_no_selected_sites = False
 
     @staticmethod
     def _map_legacy_site_names(
@@ -495,7 +496,11 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
         filtered = {
             site_id: site for site_id, site in sites.items() if site_id in selected
         }
-        if not filtered:
+        if filtered:
+            self._warned_no_selected_sites = False
+        elif not self._warned_no_selected_sites:
+            # Warn once rather than on every poll until the user acts.
+            self._warned_no_selected_sites = True
             _LOGGER.warning(
                 "Config coordinator: none of the selected sites (%s) exist on "
                 "the console any more; re-select sites in the integration options",
