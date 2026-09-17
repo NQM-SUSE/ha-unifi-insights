@@ -1075,7 +1075,7 @@ class TestUnifiPortSensorEdgeCases:
             port_idx=1,
         )
 
-        # Set last_update_success to False
+        # Mark the device coordinator unavailable
         mock_coordinator.device_available = False
 
         assert sensor.available is False

@@ -1443,17 +1443,21 @@ class TestUnifiDeviceCoordinator:
 
     @pytest.mark.asyncio
     async def test_site_forbidden_fails_refresh_without_reauth(
-        self, coordinator: UnifiDeviceCoordinator
+        self,
+        coordinator: UnifiDeviceCoordinator,
+        caplog: pytest.LogCaptureFixture,
     ):
         """A 403 on devices fails the refresh but does not start a reauth loop."""
         coordinator.network_client.devices.get_all = AsyncMock(
             side_effect=UniFiAuthenticationError("Forbidden", status_code=403)
         )
 
-        with pytest.raises(UpdateFailed, match="Access forbidden"):
+        with pytest.raises(UpdateFailed, match="^Access forbidden for site"):
             await coordinator._async_update_data()
 
         assert coordinator._available is False
+        # Not re-wrapped and logged as an unexpected error on every poll.
+        assert "Unexpected error" not in caplog.text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -708,6 +708,10 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             self._handle_timeout_error(err)
         except UniFiResponseError as err:
             self._handle_response_error(err)
+        except UpdateFailed:
+            # Already classified above (a site 403); the generic handler would
+            # log it as an unexpected error with a traceback on every poll.
+            raise
         except Exception as err:
             self._handle_generic_error(err)
 
