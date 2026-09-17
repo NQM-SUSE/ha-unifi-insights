@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -14,6 +14,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
+from homeassistant.core import callback
 from homeassistant.helpers.entity import EntityCategory
 
 from .const import (
@@ -314,138 +315,197 @@ async def async_setup_entry(
     """Set up binary sensors for UniFi Insights integration."""
     _ = hass
     coordinator: UnifiFacadeCoordinator = config_entry.runtime_data.coordinator
-    entities: list[BinarySensorEntity] = []
+    known_sensor_keys: set[tuple[Any, ...]] = set()
 
-    _LOGGER.debug("Setting up binary sensors for UniFi Insights")
+    @callback
+    def async_discover_binary_sensors() -> None:
+        """Discover and add new binary sensors."""
+        if not coordinator.data or not isinstance(coordinator.data, dict):
+            return
 
-    # Add binary sensors for each device in each site
-    for site_id, devices in coordinator.data["devices"].items():
-        site_data = coordinator.get_site(site_id)
-        site_name = (
-            site_data.get("meta", {}).get("name", site_id) if site_data else site_id
-        )
+        entities: list[BinarySensorEntity] = []
 
-        _LOGGER.debug(
-            "Processing site %s (%s) with %d devices", site_id, site_name, len(devices)
-        )
-
-        for device_id in devices:
-            device_data = (
-                coordinator.data.get("devices", {}).get(site_id, {}).get(device_id, {})
-            )
-            device_name = device_data.get("name", device_id)
-
-            _LOGGER.debug(
-                "Creating binary sensors for device %s (%s) in site %s (%s)",
-                device_id,
-                device_name,
-                site_id,
-                site_name,
-            )
-
-            for description in BINARY_SENSOR_TYPES:
-                if description.entity_type == "device":
-                    # Skip WAN status sensor for non-gateway devices
-                    if description.key == "wan_status" and not device_data.get(
-                        "model", ""
-                    ).startswith("UDM"):
-                        _LOGGER.debug(
-                            "Skipping WAN status sensor for non-gateway device %s (%s)",
-                            device_id,
-                            device_name,
-                        )
-                        continue
-
-                    entities.append(
-                        UnifiInsightsBinarySensor(
-                            coordinator=coordinator,
-                            description=description,
-                            site_id=site_id,
-                            device_id=device_id,
-                        )
-                    )
-
-            # Add SFP module binary sensors for ports with SFP media type
-            ports = device_data.get("ports", [])
-            for port in ports:
-                media = port.get("media", "")
-                if not isinstance(media, str) or not media.startswith("SFP"):
+        # Add binary sensors for each device in each site
+        devices_by_site = coordinator.data.get("devices", {})
+        if isinstance(devices_by_site, dict):
+            for site_id, devices in devices_by_site.items():
+                if not isinstance(devices, dict):
                     continue
-                port_idx = port.get("idx") or port.get("port_idx")
-                if port_idx is None:
-                    continue
-                port_name = port.get("name") or f"{media} {port_idx}"
-                entities.append(
-                    UnifiPortBinarySensor(
-                        coordinator=coordinator,
-                        site_id=site_id,
-                        device_id=device_id,
-                        port_idx=port_idx,
-                        port_label=port_name,
-                    )
+                site_data = coordinator.get_site(site_id)
+                site_name = (
+                    (site_data.get("meta") or {}).get("name", site_id)
+                    if site_data
+                    else site_id
                 )
 
-    # Add binary sensors for Protect devices
-    if coordinator.protect_client:
-        # Add camera binary sensors
-        for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-            camera_name = camera_data.get("name", camera_id)
+                _LOGGER.debug(
+                    "Processing site %s (%s) with %d devices",
+                    site_id,
+                    site_name,
+                    len(devices),
+                )
 
-            _LOGGER.debug(
-                "Creating binary sensors for camera %s (%s)", camera_id, camera_name
-            )
+                for device_id, device_data in devices.items():
+                    if not isinstance(device_data, dict):
+                        continue
+                    device_name = device_data.get("name", device_id)
 
-            for description in BINARY_SENSOR_TYPES:
-                if (
-                    description.entity_type == "protect"
-                    and description.device_type == DEVICE_TYPE_CAMERA
-                ):
-                    # Skip package detection and doorbell ring for non-doorbell cameras
-                    if description.key in [
-                        "camera_package_detection",
-                        "camera_doorbell_ring",
-                    ] and not _is_doorbell_camera(camera_data):
+                    _LOGGER.debug(
+                        "Creating binary sensors for device %s (%s) in site %s (%s)",
+                        device_id,
+                        device_name,
+                        site_id,
+                        site_name,
+                    )
+
+                    for description in BINARY_SENSOR_TYPES:
+                        if description.entity_type == "device":
+                            # Skip WAN status sensor for non-gateway devices
+                            if description.key == "wan_status" and not device_data.get(
+                                "model", ""
+                            ).startswith("UDM"):
+                                _LOGGER.debug(
+                                    "Skipping WAN status sensor for non-gateway device "
+                                    "%s (%s)",
+                                    device_id,
+                                    device_name,
+                                )
+                                continue
+
+                            key = (site_id, device_id, description.key)
+                            if key in known_sensor_keys:
+                                continue
+                            known_sensor_keys.add(key)
+                            entities.append(
+                                UnifiInsightsBinarySensor(
+                                    coordinator=coordinator,
+                                    description=description,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                )
+                            )
+
+                    # Add SFP module binary sensors for ports with SFP media type
+                    ports = device_data.get("ports", [])
+                    if isinstance(ports, list):
+                        for port in ports:
+                            if not isinstance(port, dict):
+                                continue
+                            media = port.get("media", "")
+                            if not isinstance(media, str) or not media.startswith(
+                                "SFP"
+                            ):
+                                continue
+                            port_idx = port.get("idx") or port.get("port_idx")
+                            if port_idx is None:
+                                continue
+                            sfp_key = (site_id, device_id, port_idx, "sfp_present")
+                            if sfp_key in known_sensor_keys:
+                                continue
+                            known_sensor_keys.add(sfp_key)
+                            port_name = port.get("name") or f"{media} {port_idx}"
+                            entities.append(
+                                UnifiPortBinarySensor(
+                                    coordinator=coordinator,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                    port_idx=port_idx,
+                                    port_label=port_name,
+                                )
+                            )
+
+        # Add binary sensors for Protect devices
+        if coordinator.protect_client:
+            protect = coordinator.data.get("protect", {})
+            if isinstance(protect, dict):
+                # Add camera binary sensors
+                cameras = protect.get("cameras", {})
+                if isinstance(cameras, dict):
+                    for camera_id, camera_data in cameras.items():
+                        if not isinstance(camera_data, dict):
+                            continue
+                        camera_name = camera_data.get("name", camera_id)
+
                         _LOGGER.debug(
-                            "Skipping %s sensor for non-doorbell camera %s (%s)",
-                            description.key,
+                            "Creating binary sensors for camera %s (%s)",
                             camera_id,
                             camera_name,
                         )
-                        continue
 
-                    entities.append(
-                        UnifiProtectBinarySensor(
-                            coordinator=coordinator,
-                            description=description,
-                            device_id=camera_id,
+                        for description in BINARY_SENSOR_TYPES:
+                            if (
+                                description.entity_type == "protect"
+                                and description.device_type == DEVICE_TYPE_CAMERA
+                            ):
+                                # Skip doorbell sensors for non-doorbell cameras
+                                if description.key in [
+                                    "camera_package_detection",
+                                    "camera_doorbell_ring",
+                                ] and not _is_doorbell_camera(camera_data):
+                                    _LOGGER.debug(
+                                        "Skipping %s sensor for non-doorbell "
+                                        "camera %s (%s)",
+                                        description.key,
+                                        camera_id,
+                                        camera_name,
+                                    )
+                                    continue
+
+                                cam_key = (camera_id, description.key)
+                                if cam_key in known_sensor_keys:
+                                    continue
+                                known_sensor_keys.add(cam_key)
+                                entities.append(
+                                    UnifiProtectBinarySensor(
+                                        coordinator=coordinator,
+                                        description=description,
+                                        device_id=camera_id,
+                                    )
+                                )
+
+                # Add sensor binary sensors
+                sensors = protect.get("sensors", {})
+                if isinstance(sensors, dict):
+                    for sensor_id, sensor_data in sensors.items():
+                        if not isinstance(sensor_data, dict):
+                            continue
+                        sensor_name = sensor_data.get("name", sensor_id)
+
+                        _LOGGER.debug(
+                            "Creating binary sensors for sensor %s (%s)",
+                            sensor_id,
+                            sensor_name,
                         )
-                    )
 
-        # Add sensor binary sensors
-        for sensor_id, sensor_data in coordinator.data["protect"]["sensors"].items():
-            sensor_name = sensor_data.get("name", sensor_id)
+                        for description in BINARY_SENSOR_TYPES:
+                            if (
+                                description.entity_type == "protect"
+                                and description.device_type == DEVICE_TYPE_SENSOR
+                                and (
+                                    description.capability_fn is None
+                                    or description.capability_fn(sensor_data)
+                                )
+                            ):
+                                s_key = (sensor_id, description.key)
+                                if s_key in known_sensor_keys:
+                                    continue
+                                known_sensor_keys.add(s_key)
+                                entities.append(
+                                    UnifiProtectBinarySensor(
+                                        coordinator=coordinator,
+                                        description=description,
+                                        device_id=sensor_id,
+                                    )
+                                )
 
-            _LOGGER.debug(
-                "Creating binary sensors for sensor %s (%s)", sensor_id, sensor_name
-            )
+        if entities:
+            _LOGGER.info("Adding %d UniFi Insights binary sensors", len(entities))
+            async_add_entities(entities)
 
-            entities.extend(
-                UnifiProtectBinarySensor(
-                    coordinator=coordinator,
-                    description=description,
-                    device_id=sensor_id,
-                )
-                for description in BINARY_SENSOR_TYPES
-                if description.entity_type == "protect"
-                and description.device_type == DEVICE_TYPE_SENSOR
-                and (
-                    description.capability_fn is None
-                    or description.capability_fn(sensor_data)
-                )
-            )
-
-    _LOGGER.info("Adding %d UniFi Insights binary sensors", len(entities))
-    async_add_entities(entities)
+    async_discover_binary_sensors()
+    config_entry.async_on_unload(
+        coordinator.async_add_listener(async_discover_binary_sensors)
+    )
 
 
 class UnifiInsightsBinarySensor(UnifiInsightsEntity, BinarySensorEntity):

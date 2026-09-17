@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.button import (
     ButtonEntity,
     ButtonEntityDescription,
 )
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -71,7 +72,6 @@ async def async_setup_entry(
     client_control = config_entry.options.get(
         CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
     )
-    entities: list[ButtonEntity] = []
 
     # Remove orphaned client reconnect buttons when client control is disabled.
     registry = er.async_get(hass)
@@ -91,102 +91,131 @@ async def async_setup_entry(
                 registry.async_remove(reg_entry.entity_id)
 
     _LOGGER.debug("Setting up buttons for UniFi Insights")
+    known_button_keys: set[tuple[Any, ...]] = set()
 
-    # Add buttons for each device in each site
-    for site_id, devices in coordinator.data["devices"].items():
-        site_data = coordinator.get_site(site_id)
-        site_name = (
-            site_data.get("meta", {}).get("name", site_id) if site_data else site_id
+    @callback
+    def async_discover_buttons() -> None:
+        """Discover and add new button entities."""
+        if not coordinator.data or not isinstance(coordinator.data, dict):
+            return
+
+        current_client_control = config_entry.options.get(
+            CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
         )
+        entities: list[ButtonEntity] = []
 
-        _LOGGER.debug(
-            "Processing site %s (%s) with %d devices", site_id, site_name, len(devices)
-        )
-
-        for device_id in devices:
-            device_data = (
-                coordinator.data.get("devices", {}).get(site_id, {}).get(device_id, {})
-            )
-            device_name = device_data.get("name", device_id)
-
-            _LOGGER.debug(
-                "Creating buttons for device %s (%s) in site %s (%s)",
-                device_id,
-                device_name,
-                site_id,
-                site_name,
-            )
-
-            entities.extend(
-                UnifiInsightsButton(
-                    coordinator=coordinator,
-                    description=description,
-                    site_id=site_id,
-                    device_id=device_id,
-                )
-                for description in BUTTON_TYPES
-            )
-
-    # Add reconnect buttons for connected clients (when client control is enabled)
-    if client_control:
-        for site_id, clients in coordinator.data.get("clients", {}).items():
-            for client_id, client_data in clients.items():
-                client_name = (
-                    client_data.get("name")
-                    or client_data.get("hostname")
-                    or client_data.get("mac", client_id)
+        # Add buttons for each device in each site
+        devices_by_site = coordinator.data.get("devices", {})
+        if isinstance(devices_by_site, dict):
+            for site_id, devices in devices_by_site.items():
+                if not isinstance(devices, dict):
+                    continue
+                site_data = coordinator.get_site(site_id)
+                site_name = (
+                    (site_data.get("meta") or {}).get("name", site_id)
+                    if site_data
+                    else site_id
                 )
 
-                _LOGGER.debug("Adding reconnect button for client %s", client_name)
-                entities.append(
-                    UnifiClientReconnectButton(
-                        coordinator=coordinator,
-                        site_id=site_id,
-                        client_id=client_id,
-                    )
+                _LOGGER.debug(
+                    "Processing site %s (%s) with %d devices",
+                    site_id,
+                    site_name,
+                    len(devices),
                 )
 
-    # Add UniFi Protect chime play buttons
-    if coordinator.protect_client:
-        _LOGGER.debug("Setting up UniFi Protect chime play buttons")
+                for device_id, device_data in devices.items():
+                    if not isinstance(device_data, dict):
+                        continue
+                    for description in BUTTON_TYPES:
+                        btn_key = (site_id, device_id, description.key)
+                        if btn_key in known_button_keys:
+                            continue
+                        known_button_keys.add(btn_key)
+                        entities.append(
+                            UnifiInsightsButton(
+                                coordinator=coordinator,
+                                description=description,
+                                site_id=site_id,
+                                device_id=device_id,
+                            )
+                        )
 
-        # Add play button for each chime
-        for chime_id, chime_data in coordinator.data["protect"]["chimes"].items():
-            chime_name = chime_data.get("name", f"Chime {chime_id}")
+        # Add reconnect buttons for connected clients (when client control is enabled)
+        if current_client_control:
+            clients_by_site = coordinator.data.get("clients", {})
+            if isinstance(clients_by_site, dict):
+                for site_id, clients in clients_by_site.items():
+                    if not isinstance(clients, dict):
+                        continue
+                    for client_id, client_data in clients.items():
+                        if not isinstance(client_data, dict):
+                            continue
+                        client_key = (site_id, client_id, "reconnect")
+                        if client_key in known_button_keys:
+                            continue
+                        known_button_keys.add(client_key)
+                        entities.append(
+                            UnifiClientReconnectButton(
+                                coordinator=coordinator,
+                                site_id=site_id,
+                                client_id=client_id,
+                            )
+                        )
 
-            _LOGGER.debug("Adding play button for chime %s", chime_name)
-            entities.append(
-                UnifiProtectChimePlayButton(
-                    coordinator=coordinator,
-                    chime_id=chime_id,
-                )
-            )
+        # Add UniFi Protect buttons
+        if coordinator.protect_client:
+            protect = coordinator.data.get("protect", {})
+            if isinstance(protect, dict):
+                # Add play button for each chime
+                chimes = protect.get("chimes", {})
+                if isinstance(chimes, dict):
+                    for chime_id, chime_data in chimes.items():
+                        if not isinstance(chime_data, dict):
+                            continue
+                        chime_key = (chime_id, "play")
+                        if chime_key not in known_button_keys:
+                            known_button_keys.add(chime_key)
+                            entities.append(
+                                UnifiProtectChimePlayButton(
+                                    coordinator=coordinator,
+                                    chime_id=chime_id,
+                                )
+                            )
 
-        # Add PTZ patrol start/stop buttons for cameras with PTZ support
-        for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-            if camera_supports_ptz(camera_data):
-                camera_name = camera_data.get("name", f"Camera {camera_id}")
+                # Add PTZ patrol start/stop buttons for cameras with PTZ support
+                cameras = protect.get("cameras", {})
+                if isinstance(cameras, dict):
+                    for camera_id, camera_data in cameras.items():
+                        if not isinstance(camera_data, dict):
+                            continue
+                        if camera_supports_ptz(camera_data):
+                            start_key = (camera_id, "ptz_start")
+                            if start_key not in known_button_keys:
+                                known_button_keys.add(start_key)
+                                entities.append(
+                                    UnifiProtectPTZPatrolStartButton(
+                                        coordinator=coordinator,
+                                        camera_id=camera_id,
+                                    )
+                                )
 
-                _LOGGER.debug("Adding PTZ patrol buttons for camera %s", camera_name)
+                            stop_key = (camera_id, "ptz_stop")
+                            if stop_key not in known_button_keys:
+                                known_button_keys.add(stop_key)
+                                entities.append(
+                                    UnifiProtectPTZPatrolStopButton(
+                                        coordinator=coordinator,
+                                        camera_id=camera_id,
+                                    )
+                                )
 
-                # Add start patrol button
-                entities.append(
-                    UnifiProtectPTZPatrolStartButton(
-                        coordinator=coordinator,
-                        camera_id=camera_id,
-                    )
-                )
+        if entities:
+            _LOGGER.info("Adding %d UniFi Insights buttons", len(entities))
+            async_add_entities(entities)
 
-                # Add stop patrol button
-                entities.append(
-                    UnifiProtectPTZPatrolStopButton(
-                        coordinator=coordinator,
-                        camera_id=camera_id,
-                    )
-                )
-
-    _LOGGER.info("Adding %d UniFi Insights buttons", len(entities))
-    async_add_entities(entities)
+    async_discover_buttons()
+    config_entry.async_on_unload(coordinator.async_add_listener(async_discover_buttons))
 
 
 class UnifiInsightsButton(UnifiInsightsEntity, ButtonEntity):
