@@ -28,11 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - One device's statistics timing out or erroring now keeps that device's last known statistics for up to three polls instead of dropping its sensors to unknown, without distorting its port throughput rates.
 - Setup no longer asks you to re-authenticate when the console is only temporarily unavailable, for example while it is still starting after a power cut. If the Network or Protect API times out, drops the connection or answers with a server error (5xx) or rate limit, setup is retried automatically. If one application works while the other keeps failing, setup retries a few times and then loads with the working one instead of silently dropping the other or keeping both offline. A Protect console whose NVR has no cameras yet no longer fails setup when the NVR check itself errors.
 - The configuration flow now reports "Failed to connect" instead of "Unknown error" or "Invalid authentication" when the console answers with a server error or is temporarily unavailable, including while discovering and validating cloud consoles.
+- Service actions now run against the console that owns the target instead of always the first configured one. With two consoles set up, `restart_device`, the Protect camera, light, PTZ, chime and viewer actions, and guest authorisation were all sent to console 1 regardless of which console owned the device, camera or site.
+- `authorize_guest` resolves a client given by MAC address, not only by client ID, so guest actions reach the right site.
 
 ### Changed
 
 - Protect sensor `openStatusChangedAt` and `motionDetectedAt` are normalized to integer epoch milliseconds at the model boundary. The controller has been observed sending these as epoch integers, ISO 8601 strings and native datetimes depending on payload path, which previously left REST and WebSocket values for the same field as different Python types. Unparseable values become `None` rather than raising, so a reshaped field cannot drop the whole sensor from a fetch.
 - The Protect `Sensor` model now declares `model_key` (`modelKey`), which every other Protect device model already did - `sensor.py` was the only one missing it. Because the model is dumped with `by_alias=True, exclude_none=False` and the field carries a default, every sensor dictionary the coordinator produces now includes `"modelKey": "sensor"`, including for controllers that omitted the field entirely, where the key was previously absent. Nothing in the integration reads that key off a sensor dictionary today.
+- Targeting a resource that belongs to a different console now raises a validation error naming the conflict, rather than silently acting on the first console. Single-console setups are unaffected.
+- `trigger_alarm` and `create_liveview` accept an optional `console_id` (the integration entry title or its entry ID). It is only needed when more than one UniFi Protect console is configured, because neither action carries a target that can be routed on - `alarm_id` is an alarm manager webhook trigger, not a device.
+- The `camera_id` field on the chime actions is documented as what it actually is: a hint for picking the console that owns the chime. This integration applies volume, ringtone and repeat count chime-wide.
 
 ### Documentation
 
