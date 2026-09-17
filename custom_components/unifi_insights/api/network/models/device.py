@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class DeviceType(str, Enum):
@@ -123,7 +126,7 @@ class DevicePort(BaseModel):
 class Device(BaseModel):
     """Model representing a UniFi network device."""
 
-    id: str
+    id: str | None = None
     mac: str | None = Field(default=None, alias="macAddress")
     name: str | None = None
     model: str | None = None
@@ -152,6 +155,37 @@ class Device(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True, "extra": "allow"}
+
+    @model_validator(mode="after")
+    def populate_id_fallback(self) -> Self:
+        """
+        Key a device off its MAC address when ``id`` is missing.
+
+        Some controllers list certain devices (seen with a UAP-AC-M "AC Mesh")
+        without an ``id``. Rejecting the payload silently drops the device
+        from Home Assistant, so fall back to the MAC, which is unique and
+        stable. The name is neither, so a payload without an id or MAC is
+        still rejected rather than keyed on something that can collide.
+        """
+        if not self.id:
+            self.id = self.mac
+        if not self.id:
+            msg = "device payload has neither an id nor a macAddress"
+            raise ValueError(msg)
+        return self
+
+
+def device_id_is_mac(device: Mapping[str, Any]) -> bool:
+    """
+    Return True when a device's id is its MAC address rather than a controller id.
+
+    ``Device`` falls back to the MAC when the API omits ``id``. Such a device
+    cannot be addressed by id on the official API (statistics, restart,
+    upgrade), so callers use this to skip those endpoints.
+    """
+    device_id = device.get("id")
+    mac = device.get("macAddress") or device.get("mac")
+    return bool(device_id and mac and str(device_id).lower() == str(mac).lower())
 
 
 class PortBytesMetrics(BaseModel):

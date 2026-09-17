@@ -121,7 +121,10 @@ class DevicesEndpoint:
                 except Exception as err:
                     _LOGGER.warning(
                         "Failed to validate device (%s): %s",
-                        item.get("id") or item.get("name") or "unknown",
+                        item.get("id")
+                        or item.get("name")
+                        or item.get("macAddress")
+                        or "unknown",
                         err,
                     )
             return devices
@@ -269,7 +272,10 @@ class DevicesEndpoint:
                 except Exception as err:
                     _LOGGER.warning(
                         "Failed to validate pending device (%s): %s",
-                        item.get("id") or item.get("name") or "unknown",
+                        item.get("id")
+                        or item.get("name")
+                        or item.get("macAddress")
+                        or "unknown",
                         err,
                     )
             return devices

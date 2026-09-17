@@ -30,6 +30,7 @@ from .device import (
     LegacyPortMetrics,
     Outlet,
     PortBytesMetrics,
+    device_id_is_mac,
     parse_outlet_metrics,
 )
 from .dns import DNSPolicy, DNSPolicyMetadata, DNSRecordType
@@ -105,6 +106,7 @@ __all__ = [
     "LegacyPortMetrics",
     "Outlet",
     "PortBytesMetrics",
+    "device_id_is_mac",
     "parse_outlet_metrics",
     # DNS
     "DNSPolicy",

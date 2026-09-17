@@ -10,7 +10,10 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
-from custom_components.unifi_insights import UnifiInsightsData
+from custom_components.unifi_insights import (
+    UnifiInsightsData,
+    async_remove_config_entry_device,
+)
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
@@ -365,3 +368,61 @@ async def test_unifi_insights_data_coordinator_not_initialized(
     # Accessing coordinator property should raise RuntimeError
     with pytest.raises(RuntimeError, match="Facade coordinator not initialized"):
         _ = data.coordinator
+
+
+def _device_entry(*identifiers: str) -> MagicMock:
+    """Build a device registry entry stub with unifi_insights identifiers."""
+    device = MagicMock()
+    device.identifiers = {("unifi_insights", identifier) for identifier in identifiers}
+    return device
+
+
+def _entry_with_sites(available: dict[str, str], polled: list[str]) -> MagicMock:
+    """Build a config entry whose config coordinator polls only some sites."""
+    entry = MagicMock()
+    entry.runtime_data.config_coordinator.available_sites = available
+    entry.runtime_data.config_coordinator.get_site_ids.return_value = polled
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("identifiers", "expected"),
+    [
+        (("site2_device-1",), True),
+        (("policy_based_routes_site2",), True),
+        (("firewall_policies_site2",), True),
+        (("vpn_clients_site2",), True),
+        (("site_site2",), True),
+        (("site_default",), False),
+        # A Protect or WiFi id that happens to end in a site id is not site-scoped.
+        (("protect_camera_site2",), False),
+        (("wifi_site2",), False),
+        (("default_device-1",), False),
+        (("protect_camera_cam-1",), False),
+        (("client_aa:bb:cc:dd:ee:ff",), False),
+    ],
+)
+async def test_remove_config_entry_device_only_for_deselected_sites(
+    hass: HomeAssistant,
+    identifiers: tuple[str, ...],
+    expected: bool,  # noqa: FBT001
+) -> None:
+    """Devices of a site dropped from the filter can be removed; nothing else (#128)."""
+    entry = _entry_with_sites({"default": "Default", "site2": "Branch"}, ["default"])
+
+    assert (
+        await async_remove_config_entry_device(hass, entry, _device_entry(*identifiers))
+        is expected
+    )
+
+
+async def test_remove_config_entry_device_refused_when_not_loaded(
+    hass: HomeAssistant,
+) -> None:
+    """Without runtime data nothing is known about sites, so refuse."""
+    entry = MagicMock(spec=["entry_id"])
+
+    assert (
+        await async_remove_config_entry_device(hass, entry, _device_entry("site2_dev"))
+        is False
+    )

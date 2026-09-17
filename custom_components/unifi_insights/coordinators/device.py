@@ -16,7 +16,10 @@ from custom_components.unifi_insights.api import (
     UniFiResponseError,
     UniFiTimeoutError,
 )
-from custom_components.unifi_insights.api.network.models import parse_outlet_metrics
+from custom_components.unifi_insights.api.network.models import (
+    device_id_is_mac,
+    parse_outlet_metrics,
+)
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
 
 from .base import UnifiBaseCoordinator
@@ -349,11 +352,14 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         device_name = device_dict.get("name", device_id)
 
         try:
-            # Get device statistics
-            stats_model = await self.network_client.devices.get_statistics(
-                site_id, device_id=device_id
-            )
-            stats = self._model_to_dict(stats_model) if stats_model else {}
+            # Get device statistics. A device keyed on its MAC (the API sent
+            # no id) cannot be looked up by id, so only legacy metrics apply.
+            stats: dict[str, Any] = {}
+            if not device_id_is_mac(device_dict):
+                stats_model = await self.network_client.devices.get_statistics(
+                    site_id, device_id=device_id
+                )
+                stats = self._model_to_dict(stats_model) if stats_model else {}
 
             # Use vendored API for legacy per-port PoE/byte metrics
             try:
@@ -547,7 +553,20 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             # Get site IDs from config coordinator
             site_ids = self.config_coordinator.get_site_ids()
 
+            # Drop data for sites no longer polled so their entities stop
+            # reporting last-known values. Site-level fetch failures below
+            # still keep a polled site's previous data.
+            for key in ("devices", "stats", "clients"):
+                self.data[key] = {
+                    site_id: value
+                    for site_id, value in self.data[key].items()
+                    if site_id in site_ids
+                }
+
             if not site_ids:
+                # Deliberately no stale-device cleanup here: an empty site
+                # list is also what a transient Network API failure looks
+                # like, and purging the registry on it would lose devices.
                 _LOGGER.debug(
                     "Device coordinator: No sites available from config coordinator"
                 )

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A **Sites** option lets a multi-site console poll only the sites you pick. Unselected sites are not queried at all, which cuts API traffic when Home Assistant only needs one site out of many. Leave it empty to keep polling every site. The picker only appears when the console has more than one site. Devices of a site you deselect can now be deleted from the device page, since they will never update again. [#128](https://github.com/ruaan-deysel/ha-unifi-insights/issues/128)
+
 ### Fixed
 
 - Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
@@ -17,13 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Door, motion, tamper and leak are tracked as independent groups. A WebSocket frame marks only the group whose fields it actually carries, and preservation copies back only the groups it decided to preserve. Ambient telemetry (temperature, humidity, battery, signal) therefore no longer suppresses a reconciliation at all, and a motion frame can no longer drag a stale cached door value over a genuinely newer REST door transition.
 - Sensor fetch errors are now bounded the same way the camera and light endpoints already were: absorbed for up to 3 consecutive polls to ride out a blip, then allowed through so a genuine controller outage marks entities unavailable instead of serving a stale cache indefinitely. Authentication failures on the background refresh paths now trigger the Home Assistant reauth flow rather than surfacing as an unhandled task exception.
 - Reloading the UniFi Insights config entry no longer leaks a Protect coordinator. A shutdown listener was registered without retaining its unsubscribe callback, so each reload stranded a coordinator and its cached device data for the lifetime of the Home Assistant process.
+- Network devices the API lists without an `id` (reported with a UAP-AC-M "AC Mesh") are no longer dropped with `Failed to validate device ... id Field required`. They are now keyed on their MAC address. Their legacy port and PoE metrics load, but the official per-device statistics endpoint is skipped because it can only be addressed by id. [#128](https://github.com/ruaan-deysel/ha-unifi-insights/issues/128)
 
 ### Changed
 
 - Protect sensor `openStatusChangedAt` and `motionDetectedAt` are normalized to integer epoch milliseconds at the model boundary. The controller has been observed sending these as epoch integers, ISO 8601 strings and native datetimes depending on payload path, which previously left REST and WebSocket values for the same field as different Python types. Unparseable values become `None` rather than raising, so a reshaped field cannot drop the whole sensor from a fetch.
-
-### Changed
-
 - The Protect `Sensor` model now declares `model_key` (`modelKey`), which every other Protect device model already did - `sensor.py` was the only one missing it. Because the model is dumped with `by_alias=True, exclude_none=False` and the field carries a default, every sensor dictionary the coordinator produces now includes `"modelKey": "sensor"`, including for controllers that omitted the field entirely, where the key was previously absent. Nothing in the integration reads that key off a sensor dictionary today.
 
 ### Documentation

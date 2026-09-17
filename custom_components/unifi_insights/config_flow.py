@@ -37,6 +37,7 @@ from .const import (
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
+    CONF_SITE_IDS,
     CONF_TRACK_CLIENTS,
     CONF_TRACK_WIFI_CLIENTS,
     CONF_TRACK_WIRED_CLIENTS,
@@ -697,8 +698,29 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
+        available_sites = self._available_sites()
+        current_site_ids: list[str] = list(
+            self.config_entry.options.get(CONF_SITE_IDS) or []
+        )
+        # Sites are only known while the entry is loaded. Offer the picker for
+        # multi-site consoles, or whenever a filter is already saved so it can
+        # be cleared.
+        show_site_picker = bool(available_sites) and (
+            len(available_sites) > 1 or bool(current_site_ids)
+        )
+
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            options = dict(user_input)
+            if not show_site_picker:
+                # The picker was not shown (entry not loaded, or a single-site
+                # console), so keep whatever filter was saved before.
+                options.pop(CONF_SITE_IDS, None)
+                if current_site_ids:
+                    options[CONF_SITE_IDS] = current_site_ids
+            elif not options.get(CONF_SITE_IDS):
+                # No selection means every site; don't store an empty filter.
+                options.pop(CONF_SITE_IDS, None)
+            return self.async_create_entry(title="", data=options)
 
         # Get current values, migrating from old CONF_TRACK_CLIENTS if needed
         old_track_clients = self.config_entry.options.get(
@@ -714,22 +736,53 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
             CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
         )
 
+        schema: dict[Any, Any] = {
+            vol.Optional(
+                CONF_TRACK_WIFI_CLIENTS,
+                default=default_wifi,
+            ): bool,
+            vol.Optional(
+                CONF_TRACK_WIRED_CLIENTS,
+                default=default_wired,
+            ): bool,
+            vol.Optional(
+                CONF_CLIENT_CONTROL,
+                default=default_client_control,
+            ): bool,
+        }
+        if show_site_picker:
+            site_options = [
+                SelectOptionDict(value=site_id, label=name)
+                for site_id, name in available_sites.items()
+            ]
+            # Keep a saved site that has since vanished visible, so it can be
+            # deselected rather than silently lingering in the stored filter.
+            site_options.extend(
+                SelectOptionDict(value=site_id, label=site_id)
+                for site_id in current_site_ids
+                if site_id not in available_sites
+            )
+            # Suggested value, not a default: a default would be re-applied
+            # when the field is submitted empty, so the filter could never
+            # be cleared.
+            schema[vol.Optional(CONF_SITE_IDS)] = SelectSelector(
+                SelectSelectorConfig(
+                    options=site_options,
+                    multiple=True,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            )
+
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        CONF_TRACK_WIFI_CLIENTS,
-                        default=default_wifi,
-                    ): bool,
-                    vol.Optional(
-                        CONF_TRACK_WIRED_CLIENTS,
-                        default=default_wired,
-                    ): bool,
-                    vol.Optional(
-                        CONF_CLIENT_CONTROL,
-                        default=default_client_control,
-                    ): bool,
-                }
+            data_schema=self.add_suggested_values_to_schema(
+                vol.Schema(schema), {CONF_SITE_IDS: current_site_ids}
             ),
         )
+
+    def _available_sites(self) -> dict[str, str]:
+        """Return the console's sites (id -> name) when the entry is loaded."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        config_coordinator = getattr(runtime_data, "config_coordinator", None)
+        sites = getattr(config_coordinator, "available_sites", None)
+        return dict(sites) if isinstance(sites, dict) else {}

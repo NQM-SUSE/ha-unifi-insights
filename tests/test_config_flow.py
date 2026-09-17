@@ -24,6 +24,7 @@ from custom_components.unifi_insights.config_flow import (
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
+    CONF_SITE_IDS,
     CONNECTION_TYPE_LOCAL,
     CONNECTION_TYPE_REMOTE,
     DOMAIN,
@@ -1791,6 +1792,145 @@ async def test_options_flow_submit(
         "track_wired_clients": False,
         "client_control": True,
     }
+
+
+def _attach_sites(entry: MockConfigEntry, sites: dict[str, str]) -> None:
+    """Give a config entry runtime data exposing the console's sites."""
+    entry.runtime_data = MagicMock()
+    entry.runtime_data.config_coordinator.available_sites = sites
+
+
+async def test_options_flow_hides_site_picker_for_single_site(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A single-site console has nothing to filter, so no picker is shown."""
+    mock_config_entry.add_to_hass(hass)
+    _attach_sites(mock_config_entry, {"default": "Default"})
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+
+    assert CONF_SITE_IDS not in result["data_schema"].schema
+
+
+async def test_options_flow_filters_sites(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A multi-site console offers a site picker and stores the pick (Issue #128)."""
+    mock_config_entry.add_to_hass(hass)
+    _attach_sites(mock_config_entry, {"default": "Default", "site2": "Branch"})
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+    assert CONF_SITE_IDS in result["data_schema"].schema
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            "track_wifi_clients": False,
+            "track_wired_clients": False,
+            "client_control": True,
+            CONF_SITE_IDS: ["site2"],
+        },
+    )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_SITE_IDS] == ["site2"]
+
+
+async def test_options_flow_empty_site_selection_means_all_sites(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Clearing the picker stores no filter rather than an empty one."""
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, options={CONF_SITE_IDS: ["site2"]}
+    )
+    _attach_sites(mock_config_entry, {"default": "Default", "site2": "Branch"})
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            "track_wifi_clients": False,
+            "track_wired_clients": False,
+            "client_control": True,
+            CONF_SITE_IDS: [],
+        },
+    )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert CONF_SITE_IDS not in result["data"]
+
+
+async def test_options_flow_omitted_site_selection_clears_filter(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A submit without the site field clears the filter instead of restoring it."""
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, options={CONF_SITE_IDS: ["site2"]}
+    )
+    _attach_sites(mock_config_entry, {"default": "Default", "site2": "Branch"})
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            "track_wifi_clients": False,
+            "track_wired_clients": False,
+            "client_control": True,
+        },
+    )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert CONF_SITE_IDS not in result["data"]
+
+
+async def test_options_flow_lists_saved_site_that_vanished(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A saved site no longer on the console stays listed so it can be cleared."""
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, options={CONF_SITE_IDS: ["gone"]}
+    )
+    _attach_sites(mock_config_entry, {"default": "Default"})
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+
+    selector = result["data_schema"].schema[CONF_SITE_IDS]
+    values = [option["value"] for option in selector.config["options"]]
+    assert values == ["default", "gone"]
+
+
+async def test_options_flow_keeps_site_filter_when_sites_unknown(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Saving options while the entry is not loaded must not drop the filter."""
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry, options={CONF_SITE_IDS: ["site2"]}
+    )
+
+    result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
+    assert CONF_SITE_IDS not in result["data_schema"].schema
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            "track_wifi_clients": True,
+            "track_wired_clients": False,
+            "client_control": True,
+        },
+    )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_SITE_IDS] == ["site2"]
 
 
 async def test_options_flow_migrates_old_track_clients(

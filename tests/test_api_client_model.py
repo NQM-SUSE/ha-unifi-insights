@@ -1,9 +1,13 @@
 """Tests for vendored UniFi API client model parsing."""
 
+import pytest
+from pydantic import ValidationError
+
 from custom_components.unifi_insights.api.network.models.client import Client
 from custom_components.unifi_insights.api.network.models.device import (
     Device,
     DeviceState,
+    device_id_is_mac,
 )
 from custom_components.unifi_insights.api.network.models.dns import DNSPolicy
 from custom_components.unifi_insights.api.network.models.lag import LAG, LagType
@@ -207,6 +211,39 @@ def test_device_parses_mixed_types_and_tolerates_unknowns() -> None:
     assert device.features == ["switching", "accessPoint"]
     assert device.interfaces == ["ports"]
     assert len(device.ports) == 2
+
+
+def test_device_without_id_falls_back_to_mac_issue_128() -> None:
+    """A device payload with no id should key off its MAC address (Issue #128)."""
+    device = Device.model_validate(
+        {
+            "macAddress": "e0:63:da:00:00:01",
+            "name": "AC Mesh",
+            "model": "UAP-AC-M",
+            "interfaces": ["radios"],
+        }
+    )
+
+    assert device.id == "e0:63:da:00:00:01"
+    assert device.mac == "e0:63:da:00:00:01"
+    assert device.name == "AC Mesh"
+
+
+def test_device_id_is_mac_flags_only_mac_keyed_devices() -> None:
+    """Callers can tell a MAC-keyed device apart from one with a controller id."""
+    mac_keyed = Device.model_validate({"macAddress": "E0:63:DA:00:00:01"})
+    with_id = Device.model_validate({"id": "dev-1", "macAddress": "e0:63:da:00:00:02"})
+
+    assert device_id_is_mac(mac_keyed.model_dump(by_alias=True)) is True
+    assert device_id_is_mac({"id": "e0:63:da:00:00:01", "mac": "E0:63:DA:00:00:01"})
+    assert device_id_is_mac(with_id.model_dump(by_alias=True)) is False
+    assert device_id_is_mac({}) is False
+
+
+def test_device_without_id_or_mac_is_rejected() -> None:
+    """A name is not a stable key, so a payload with no id or MAC is rejected."""
+    with pytest.raises(ValidationError):
+        Device.model_validate({"name": "AC Mesh", "model": "UAP-AC-M"})
 
 
 def test_client_model_accepts_unknown_client_type() -> None:

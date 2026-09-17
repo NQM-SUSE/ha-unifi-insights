@@ -21,8 +21,13 @@ from custom_components.unifi_insights.api import (
     UniFiResponseError,
     UniFiTimeoutError,
 )
+from custom_components.unifi_insights.api.network.models import (
+    LegacyPortMetrics,
+    PortBytesMetrics,
+)
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
+    CONF_SITE_IDS,
     CONNECTION_TYPE_LOCAL,
     DOMAIN,
     SCAN_INTERVAL_CONFIG,
@@ -495,6 +500,77 @@ class TestUnifiConfigCoordinator:
         assert "policy_based_routes" in result
         assert "route1" in result["policy_based_routes"]["default"]
         assert coordinator._available is True
+        assert coordinator.available_sites == {
+            "default": "Default",
+            "site2": "Site 2",
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_filters_selected_sites(self, hass: HomeAssistant):
+        """Only the sites picked in options are polled (Issue #128)."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_API_KEY: "test_api_key"},
+            options={CONF_SITE_IDS: ["site2"]},
+        )
+        network_client = _create_mock_network_client()
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=network_client,
+            protect_client=None,
+            entry=entry,
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert list(result["sites"]) == ["site2"]
+        assert coordinator.get_site_ids() == ["site2"]
+        # Every site stays selectable in the options flow.
+        assert coordinator.available_sites == {
+            "default": "Default",
+            "site2": "Site 2",
+        }
+        polled = [call.args[0] for call in network_client.wifi.get_all.await_args_list]
+        assert polled == ["site2"]
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_prunes_per_site_maps(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """Per-site config data for a site no longer polled is dropped."""
+        for key in ("wifi", "firewall_rules", "policy_based_routes", "vpn_clients"):
+            coordinator.data[key]["gone"] = {"stale": {"id": "stale"}}
+
+        result = await coordinator._async_update_data()
+
+        for key in ("wifi", "firewall_rules", "policy_based_routes", "vpn_clients"):
+            assert "gone" not in result[key]
+            assert "default" in result[key]
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_selected_sites_all_gone(
+        self, hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+    ):
+        """A selection matching no current site polls nothing and says why."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_API_KEY: "test_api_key"},
+            options={CONF_SITE_IDS: ["removed-site"]},
+        )
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=None,
+            entry=entry,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await coordinator._async_update_data()
+            await coordinator._async_update_data()
+
+        assert result["sites"] == {}
+        # Warned once, not on every 5-minute poll.
+        assert caplog.text.count("none of the selected sites") == 1
 
     @pytest.mark.asyncio
     async def test_async_update_data_wifi_error(
@@ -1046,6 +1122,42 @@ class TestUnifiDeviceCoordinator:
         assert coordinator._available is True
 
     @pytest.mark.asyncio
+    async def test_async_update_data_prunes_sites_no_longer_listed(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Data for a site no longer listed is dropped, and its devices go stale."""
+        for key in ("devices", "stats", "clients"):
+            coordinator.data[key]["gone"] = {"dev-gone": {"id": "dev-gone"}}
+        coordinator._previous_network_device_ids = {"gone_dev-gone"}
+
+        with patch.object(coordinator, "_cleanup_stale_devices") as cleanup:
+            await coordinator._async_update_data()
+
+        for key in ("devices", "stats", "clients"):
+            assert "gone" not in coordinator.data[key]
+            assert "default" in coordinator.data[key]
+        cleanup.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_no_sites_clears_data_keeps_registry(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """An empty site list clears stale data but never purges registry devices."""
+        for key in ("devices", "stats", "clients"):
+            coordinator.data[key]["default"] = {"device1": {"id": "device1"}}
+        coordinator._previous_network_device_ids = {"default_device1"}
+        coordinator.config_coordinator.data["sites"] = {}
+
+        with patch.object(coordinator, "_cleanup_stale_devices") as cleanup:
+            await coordinator._async_update_data()
+
+        for key in ("devices", "stats", "clients"):
+            assert coordinator.data[key] == {}
+        # An empty list is also what a transient API failure looks like.
+        cleanup.assert_not_called()
+        assert coordinator._previous_network_device_ids == {"default_device1"}
+
+    @pytest.mark.asyncio
     async def test_process_device_stats_error(
         self, coordinator: UnifiDeviceCoordinator
     ):
@@ -1059,6 +1171,34 @@ class TestUnifiDeviceCoordinator:
         # Devices should still be fetched, just without stats
         assert "devices" in result
         assert "default" in result["devices"]
+
+    @pytest.mark.asyncio
+    async def test_mac_keyed_device_skips_statistics_keeps_legacy_metrics(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A device keyed on its MAC has no controller id to fetch stats by (#128)."""
+        mac = "e0:63:da:00:00:01"
+        coordinator.network_client.devices.get_all = AsyncMock(
+            return_value=[
+                _create_mock_model(
+                    {"id": mac, "macAddress": mac, "name": "AC Mesh", "state": "ONLINE"}
+                )
+            ]
+        )
+        coordinator.network_client.devices.get_port_metrics = AsyncMock(
+            return_value=LegacyPortMetrics(
+                port_bytes={1: PortBytesMetrics(rx_bytes=10, tx_bytes=20)}
+            )
+        )
+
+        result = await coordinator._async_update_data()
+
+        coordinator.network_client.devices.get_statistics.assert_not_awaited()
+        coordinator.network_client.devices.get_port_metrics.assert_awaited_once()
+        assert mac in result["devices"]["default"]
+        stats = result["stats"]["default"][mac]
+        assert stats["port_bytes"] == {1: {"rx_bytes": 10, "tx_bytes": 20}}
+        assert stats["id"] == mac
 
     @pytest.mark.asyncio
     async def test_process_site_error(self, coordinator: UnifiDeviceCoordinator):
