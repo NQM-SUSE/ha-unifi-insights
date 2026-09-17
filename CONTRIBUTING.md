@@ -101,7 +101,7 @@ This integration follows Home Assistant's [integration quality standards](https:
 When submitting a pull request:
 
 1. Create a descriptive feature/bugfix branch from `main`.
-2. Check the [UniFi Developer Portal](https://developer.ui.com/) for official API documentation, specifications, and latest capabilities offered to developers.
+2. Check the [UniFi Developer Portal](https://developer.ui.com/) for official API documentation, specifications, and latest capabilities offered to developers. The portal's HTML pages are JavaScript-rendered, so if you (or a coding agent) are fetching them programmatically, use the machine-readable endpoints instead: [`llms.txt`](https://developer.ui.com/llms.txt) for the API/version index, `https://developer.ui.com/{service}/{version}/openapi.json` for schemas, and [the Network AI primer](https://developer.ui.com/network/v10.4.57/ai-gettingstarted.md).
 3. Follow the checklist provided in the [Pull Request Template](.github/pull_request_template.md).
 4. Ensure all automated validation steps pass:
    ```bash
