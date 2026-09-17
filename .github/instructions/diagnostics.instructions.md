@@ -35,6 +35,29 @@ async def async_get_config_entry_diagnostics(
     )
 ```
 
+## Three redaction layers
+
+`diagnostics.py` redacts in three passes; a new collection has to be fitted into
+the right one:
+
+1. `TO_REDACT` - keys that are sensitive wherever they appear (credentials,
+   hosts and IPs, SSIDs, serials, location).
+2. `CLIENT_TO_REDACT` / `WIFI_TO_REDACT` - the same list plus the name fields,
+   applied only to client and Wi-Fi records. A client is named after its owner,
+   while a device, site or camera name is what makes a report readable, so
+   `name` is **not** redacted globally.
+3. `_anonymize_macs()` - a final pass over the assembled payload that replaces
+   every MAC-shaped value, and every value under a known MAC key, with a
+   placeholder that is stable within one report. Key lists cannot keep up with
+   `bssid`/`apMac`/`swMac`/future fields, and API models accept unknown extra
+   fields.
+
+When you add a collection to the coordinator data, add a test to
+`tests/test_diagnostics.py` that asserts none of its identifying values reach
+the payload. Build the fixture from the real API model (`model_dump(by_alias=True)`),
+not a hand-written dict, or the test will pass on keys the integration never
+stores.
+
 ## Structure
 
 Return a dictionary with:

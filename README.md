@@ -311,6 +311,12 @@ To download a sanitized diagnostic report for troubleshooting:
 2. Select **UniFi Insights**.
 3. Click the three-dot menu and choose **Download diagnostics**.
 
+The report is sanitized before it is written: API keys, passwords and Wi-Fi
+secrets, host names and IP addresses, SSIDs, and the names of your clients are
+redacted, and every MAC address is replaced with a placeholder that stays
+consistent within a single report. Device, site and camera names are kept so
+the report remains readable.
+
 ## Contributing
 
 Contributions are welcome. Please open an issue before submitting significant changes. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
