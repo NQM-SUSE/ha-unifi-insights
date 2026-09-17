@@ -1,4 +1,4 @@
-"""Sensor models for UniFi Protect API."""
+"""UniFi Protect Sensor model."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class SensorType(str, Enum):
 
 
 class BatteryStatus(BaseModel):
-    """Model representing battery status for a UniFi Protect sensor."""
+    """Battery status for Protect sensors."""
 
     percentage: int | None = None
     is_low: bool = Field(default=False, alias="isLow")
@@ -32,11 +32,16 @@ class BatteryStatus(BaseModel):
 
 
 class Sensor(BaseModel):
-    """Model representing a UniFi Protect sensor."""
+    """
+    UniFi Protect Sensor device.
+
+    Represents Protect UP-Sense sensors.
+    """
 
     id: str
-    mac: str
     name: str | None = None
+    mac: str
+    model_key: str = Field(default="sensor", alias="modelKey")
     type: str | None = None
     model: str | None = None
     state: str | None = None

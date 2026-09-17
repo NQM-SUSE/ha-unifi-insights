@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Redact WiFi QR payloads from downloaded diagnostics so they cannot expose WiFi passwords.
 
+### Changed
+
+- The Protect `Sensor` model now declares `model_key` (`modelKey`), which every other Protect device model already did - `sensor.py` was the only one missing it. Because the model is dumped with `by_alias=True, exclude_none=False` and the field carries a default, every sensor dictionary the coordinator produces now includes `"modelKey": "sensor"`, including for controllers that omitted the field entirely, where the key was previously absent. Nothing in the integration reads that key off a sensor dictionary today.
+
 ### Documentation
 
 - Agent-facing guidance (`AGENTS.md`, `CONTRIBUTING.md`, Copilot instructions, `api.instructions.md`) now points at the UniFi Developer Portal's **machine-readable** endpoints alongside the human docs. The portal's documentation pages are JavaScript-rendered, so a coding agent fetching `developer.ui.com/...` receives HTTP 200 and an empty app shell with no API content - a silent dead end that reads like a successful fetch. The `llms.txt` index, per-service `llms.txt`, `openapi.json` specs and the Network `ai-gettingstarted.md` primer all return real content and are now named explicitly, along with the current service versions and a note to resolve versions from the root index rather than hardcoding them.
