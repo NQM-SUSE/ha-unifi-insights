@@ -460,14 +460,16 @@ def _is_site_scoped_identifier(identifier: str, site_id: str) -> bool:
     Return True if a device identifier belongs to the given site.
 
     Only the exact formats built for site-scoped devices match: network
-    devices (``{site}_{device}``) and the per-site firewall, route and VPN
-    devices. A loose suffix check would also match a Protect or WiFi id that
+    devices (``{site}_{device}``), the per-site firewall, route and VPN
+    devices, and the ``site_{site}`` device that holds a gateway-less site's
+    client count. A loose suffix check would also match a Protect or WiFi id that
     merely ends in the site id.
     """
     return identifier.startswith(f"{site_id}_") or identifier in {
         f"firewall_policies_{site_id}",
         f"policy_based_routes_{site_id}",
         f"vpn_clients_{site_id}",
+        f"site_{site_id}",
     }
 
 
