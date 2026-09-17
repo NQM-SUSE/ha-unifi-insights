@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,7 @@ from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiNotFoundError,
+    UniFiRateLimitError,
     UniFiResponseError,
     UniFiTimeoutError,
 )
@@ -36,7 +38,10 @@ from custom_components.unifi_insights.const import (
 )
 from custom_components.unifi_insights.coordinators.base import UnifiBaseCoordinator
 from custom_components.unifi_insights.coordinators.config import UnifiConfigCoordinator
-from custom_components.unifi_insights.coordinators.device import UnifiDeviceCoordinator
+from custom_components.unifi_insights.coordinators.device import (
+    MAX_STATS_REUSE_POLLS,
+    UnifiDeviceCoordinator,
+)
 from custom_components.unifi_insights.coordinators.facade import UnifiFacadeCoordinator
 from custom_components.unifi_insights.coordinators.protect import (
     MAX_CONSECUTIVE_EMPTY_FETCHES,
@@ -573,38 +578,177 @@ class TestUnifiConfigCoordinator:
         assert caplog.text.count("none of the selected sites") == 1
 
     @pytest.mark.asyncio
-    async def test_async_update_data_wifi_error(
-        self, coordinator: UnifiConfigCoordinator
+    @pytest.mark.parametrize("endpoint", ["wifi.get_all", "firewall.list_rules"])
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiNotFoundError("Not found", status_code=404),
+            UniFiResponseError("Bad request", status_code=400),
+            UniFiAuthenticationError("Forbidden", status_code=403),
+            UniFiResponseError("HTML instead of JSON", status_code=200),
+        ],
+        ids=["404", "400", "403", "200-non-json"],
+    )
+    async def test_async_update_data_optional_endpoint_unsupported(
+        self, coordinator: UnifiConfigCoordinator, endpoint: str, error: Exception
     ):
-        """Test data fetch with WiFi error (should not fail)."""
-        coordinator.network_client.wifi.get_all = AsyncMock(
-            side_effect=Exception("WiFi fetch failed")
+        """A 4xx from WiFi/firewall means the feature is absent, not a failure."""
+        namespace, method = endpoint.split(".")
+        setattr(
+            getattr(coordinator.network_client, namespace),
+            method,
+            AsyncMock(side_effect=error),
         )
 
         result = await coordinator._async_update_data()
 
-        # Sites should still be fetched
-        assert "sites" in result
+        section = "wifi" if namespace == "wifi" else "firewall_rules"
+        assert result[section]["default"] == {}
         assert "default" in result["sites"]
-        # WiFi should be empty for failed sites
-        assert result["wifi"]["default"] == {}
         assert coordinator._available is True
 
     @pytest.mark.asyncio
-    async def test_async_update_data_firewall_error(
+    @pytest.mark.parametrize(
+        ("endpoint", "section", "other_section"),
+        [
+            ("wifi.get_all", "wifi", "firewall_rules"),
+            ("firewall.list_rules", "firewall_rules", "wifi"),
+        ],
+        ids=["wifi", "firewall"],
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiResponseError("Server error", status_code=500),
+            UniFiRateLimitError("Slow down", status_code=429),
+            UniFiConnectionError("Connection refused"),
+            UniFiTimeoutError("Timed out"),
+            ValueError("Unparseable payload"),
+        ],
+        ids=["500", "429", "connection", "timeout", "unexpected"],
+    )
+    async def test_async_update_data_optional_section_failure(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        endpoint: str,
+        section: str,
+        other_section: str,
+        error: Exception,
+    ):
+        """A failed WiFi/firewall fetch keeps that section's data and flags it."""
+        await coordinator.async_refresh()
+        assert coordinator.wifi_available("default") is True
+        assert coordinator.firewall_available("default") is True
+        previous = copy.deepcopy(coordinator.data[section])
+        assert previous["default"]
+
+        namespace, method = endpoint.split(".")
+        working = getattr(getattr(coordinator.network_client, namespace), method)
+        setattr(
+            getattr(coordinator.network_client, namespace),
+            method,
+            AsyncMock(side_effect=error),
+        )
+
+        await coordinator.async_refresh()
+
+        # The refresh itself succeeds so other sections and platforms keep
+        # working, but the failed section is not reported as fresh.
+        assert coordinator.last_update_success is True
+        assert coordinator.data[section] == previous
+        section_flag = {
+            "wifi": coordinator.wifi_available,
+            "firewall_rules": coordinator.firewall_available,
+        }
+        assert section_flag[section]("default") is False
+        assert section_flag[other_section]("default") is True
+
+        setattr(getattr(coordinator.network_client, namespace), method, working)
+        await coordinator.async_refresh()
+        assert section_flag[section]("default") is True
+
+    @pytest.mark.asyncio
+    async def test_optional_section_failure_is_per_site(
         self, coordinator: UnifiConfigCoordinator
     ):
-        """Test firewall rules are optional when the endpoint is unavailable."""
-        coordinator.network_client.firewall.list_rules = AsyncMock(
-            side_effect=Exception("Firewall endpoint unavailable")
+        """A WiFi failure on one site leaves other sites' WiFi available."""
+        working = coordinator.network_client.wifi.get_all
+
+        async def get_all(site_id: str):
+            if site_id == "site2":
+                msg = "site2 WiFi down"
+                raise UniFiConnectionError(msg)
+            return await working(site_id)
+
+        coordinator.network_client.wifi.get_all = AsyncMock(side_effect=get_all)
+        await coordinator.async_refresh()
+
+        assert coordinator.wifi_available("default") is True
+        assert coordinator.wifi_available("site2") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("endpoint", ["wifi.get_all", "firewall.list_rules"])
+    async def test_async_update_data_optional_endpoint_auth_failure_reauths(
+        self, coordinator: UnifiConfigCoordinator, endpoint: str
+    ):
+        """A 401 from WiFi/firewall means revoked credentials and starts reauth."""
+        namespace, method = endpoint.split(".")
+        setattr(
+            getattr(coordinator.network_client, namespace),
+            method,
+            AsyncMock(side_effect=UniFiAuthenticationError("Revoked", status_code=401)),
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+        assert coordinator._available is False
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_enriches_wifi_and_collects_sections(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """Legacy WiFi enrichment, VPN clients and id-less rules on a good poll."""
+        client = coordinator.network_client
+        client.wifi.get_legacy_configs = AsyncMock(
+            return_value=[
+                {"name": "MainWiFi", "x_passphrase": "secret", "security": "wpapsk"}
+            ]
+        )
+        client.clients.get_active_legacy = AsyncMock(
+            return_value=[
+                {"essid": "MainWiFi"},
+                {"essid": "MainWiFi", "is_wired": True},
+            ]
+        )
+        client.vpn_clients.list_vpn_clients = AsyncMock(
+            return_value=[{"_id": "vpn1", "name": "Office"}, {"name": "no id"}]
+        )
+        client.firewall.list_rules = AsyncMock(
+            return_value=[_create_mock_model({"name": "rule without id"})]
         )
 
         result = await coordinator._async_update_data()
 
-        assert "sites" in result
-        assert "default" in result["sites"]
+        wifi = result["wifi"]["default"]["wifi1"]
+        assert wifi["num_connected_clients"] == 1
+        assert wifi["qr_code"].startswith("WIFI:T:WPA;S:MainWiFi;P:")
+        assert list(result["vpn_clients"]["default"]) == ["vpn1"]
         assert result["firewall_rules"]["default"] == {}
-        assert coordinator._available is True
+        assert coordinator.firewall_available("default") is True
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_drops_sites_that_disappeared(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """Per-site sections are rebuilt, so a removed site's data is not kept."""
+        coordinator.data["wifi"]["gone"] = {"wifi-x": {"id": "wifi-x"}}
+        coordinator.data["firewall_rules"]["gone"] = {"rule-x": {"id": "rule-x"}}
+
+        result = await coordinator._async_update_data()
+
+        assert "gone" not in result["wifi"]
+        assert "gone" not in result["firewall_rules"]
 
     @pytest.mark.asyncio
     async def test_async_update_data_routes_error(
@@ -1173,6 +1317,7 @@ class TestUnifiDeviceCoordinator:
         assert "default" in result["devices"]
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
     async def test_mac_keyed_device_skips_statistics_keeps_legacy_metrics(
         self, coordinator: UnifiDeviceCoordinator
     ):
@@ -1200,85 +1345,302 @@ class TestUnifiDeviceCoordinator:
         assert stats["port_bytes"] == {1: {"rx_bytes": 10, "tx_bytes": 20}}
         assert stats["id"] == mac
 
-    @pytest.mark.asyncio
-    async def test_process_site_error(self, coordinator: UnifiDeviceCoordinator):
-        """Test site processing with error."""
-        coordinator.network_client.devices.get_all = AsyncMock(
-            side_effect=Exception("Site fetch failed")
+    @pytest.mark.parametrize("endpoint", ["devices.get_all", "clients.get_all"])
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiConnectionError("Connection refused"),
+            UniFiTimeoutError("Request timed out"),
+            UniFiResponseError("Server error", status_code=502),
+            UniFiResponseError("Bad response", status_code=400),
+            Exception("Something broke"),
+        ],
+        ids=["connection", "timeout", "502", "400", "unexpected"],
+    )
+    async def test_site_failure_fails_refresh_and_keeps_snapshot(
+        self, coordinator: UnifiDeviceCoordinator, endpoint: str, error: Exception
+    ):
+        """A site that cannot be fetched fails the refresh; old data is kept."""
+        await coordinator._async_update_data()
+        previous_devices = copy.deepcopy(coordinator.data["devices"]["default"])
+        previous_stats = copy.deepcopy(coordinator.data["stats"]["default"])
+        assert previous_devices
+
+        namespace, method = endpoint.split(".")
+        setattr(
+            getattr(coordinator.network_client, namespace),
+            method,
+            AsyncMock(side_effect=error),
         )
 
-        await coordinator._async_update_data()
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
 
-        # Should handle error gracefully
+        assert coordinator._available is False
+        assert coordinator.data["devices"]["default"] == previous_devices
+        assert coordinator.data["stats"]["default"] == previous_stats
+
+    @pytest.mark.asyncio
+    async def test_site_auth_failure_starts_reauth(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A revoked key on the devices endpoint raises ConfigEntryAuthFailed."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiAuthenticationError("Invalid API key", status_code=401)
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+        assert coordinator._available is False
+
+    @pytest.mark.asyncio
+    async def test_one_failed_site_fails_refresh_without_partial_write(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """With several sites, one failure fails the refresh and writes nothing."""
+        coordinator.config_coordinator.data["sites"]["site2"] = {"id": "site2"}
+        original_get_all = coordinator.network_client.devices.get_all
+
+        async def get_all(site_id: str):
+            if site_id == "site2":
+                msg = "site2 unreachable"
+                raise UniFiConnectionError(msg)
+            return await original_get_all(site_id)
+
+        coordinator.network_client.devices.get_all = AsyncMock(side_effect=get_all)
+
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+        assert coordinator.data["devices"] == {}
+        assert coordinator.data["stats"] == {}
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_wins_over_other_site_failures(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """If any site reports revoked credentials, reauth is triggered."""
+        coordinator.config_coordinator.data["sites"]["site2"] = {"id": "site2"}
+
+        async def get_all(site_id: str):
+            if site_id == "site2":
+                msg = "Revoked"
+                raise UniFiAuthenticationError(msg, status_code=401)
+            msg = "default unreachable"
+            raise UniFiConnectionError(msg)
+
+        coordinator.network_client.devices.get_all = AsyncMock(side_effect=get_all)
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+    @pytest.mark.asyncio
+    async def test_stats_auth_failure_starts_reauth(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Revoked credentials surfacing on the stats endpoint start reauth."""
+        coordinator.network_client.devices.get_statistics = AsyncMock(
+            side_effect=UniFiAuthenticationError("Revoked", status_code=401)
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiConnectionError("Connection lost"),
+            UniFiTimeoutError("Timed out"),
+            UniFiResponseError("Server error", status_code=500),
+            UniFiRateLimitError("Slow down", status_code=429),
+        ],
+        ids=["connection", "timeout", "500", "429"],
+    )
+    async def test_stats_transient_failure_keeps_previous_stats(
+        self, coordinator: UnifiDeviceCoordinator, error: Exception
+    ):
+        """One device's stats failing keeps its last stats, not the refresh."""
+        await coordinator._async_update_data()
+        previous = copy.deepcopy(coordinator.data["stats"]["default"]["device1"])
+        assert previous
+
+        coordinator.network_client.devices.get_statistics = AsyncMock(side_effect=error)
+        result = await coordinator._async_update_data()
+
+        assert coordinator._available is True
+        assert result["stats"]["default"]["device1"] == previous
+
+    @pytest.mark.asyncio
+    async def test_refresh_without_legacy_site_mapping(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Sites still refresh when the classic site mapping is unavailable."""
+        coordinator.network_client.sites.get_legacy_all = AsyncMock(
+            side_effect=UniFiConnectionError("classic API down")
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock()
+
+        result = await coordinator._async_update_data()
+
+        assert "device1" in result["devices"]["default"]
+        coordinator.network_client.devices.get_legacy_site_devices.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stats_reuse_is_capped(self, coordinator: UnifiDeviceCoordinator):
+        """A device whose stats keep failing stops reusing them after the cap."""
+        await coordinator._async_update_data()
+        assert coordinator.data["stats"]["default"]["device1"]
+        coordinator.network_client.devices.get_statistics = AsyncMock(
+            side_effect=UniFiTimeoutError("Timed out")
+        )
+
+        for _ in range(MAX_STATS_REUSE_POLLS):
+            result = await coordinator._async_update_data()
+            assert result["stats"]["default"]["device1"]
+
+        result = await coordinator._async_update_data()
+        assert result["stats"]["default"]["device1"] == {}
+
+    @pytest.mark.asyncio
+    async def test_stats_failure_count_resets(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Unsupported responses and vanished devices clear the failure count."""
+        await coordinator._async_update_data()
+        client = coordinator.network_client
+        client.devices.get_statistics = AsyncMock(
+            side_effect=UniFiTimeoutError("Timed out")
+        )
+        await coordinator._async_update_data()
+        assert coordinator._stats_failures == {"device1": 1}
+
+        client.devices.get_statistics = AsyncMock(
+            side_effect=UniFiNotFoundError("Not found", status_code=404)
+        )
+        await coordinator._async_update_data()
+        assert coordinator._stats_failures == {}
+
+        coordinator._stats_failures["gone-device"] = 2
+        await coordinator._async_update_data()
+        assert "gone-device" not in coordinator._stats_failures
+
+    @pytest.mark.asyncio
+    async def test_port_rates_skip_reused_stats(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Reused stats don't produce a 0 rate or a doubled rate on recovery."""
+        counters = {"bytes": 0}
+
+        async def port_metrics(*_args, **_kwargs):
+            return MagicMock(
+                port_bytes={
+                    1: MagicMock(rx_bytes=counters["bytes"], tx_bytes=counters["bytes"])
+                },
+                poe_ports={},
+                poe_total_w=None,
+            )
+
+        coordinator.network_client.devices.get_port_metrics = AsyncMock(
+            side_effect=port_metrics
+        )
+        coordinator.data["devices"] = {}
+        working_stats = coordinator.network_client.devices.get_statistics
+        clock = {"now": 1000.0}
+
+        def rate() -> float:
+            return coordinator.data["stats"]["default"]["device1"]["port_rates"][1][
+                "rx_bytes_rate"
+            ]
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.device.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            await coordinator._async_update_data()  # first sample
+            await coordinator._async_update_data()  # no time elapsed: no rate
+            assert "port_rates" not in coordinator.data["stats"]["default"]["device1"]
+
+            clock["now"] += 10
+            counters["bytes"] += 1000
+            await coordinator._async_update_data()
+            assert rate() == 100.0
+
+            clock["now"] += 10
+            counters["bytes"] += 1000
+            coordinator.network_client.devices.get_statistics = AsyncMock(
+                side_effect=UniFiTimeoutError("Timed out")
+            )
+            await coordinator._async_update_data()
+            assert rate() == 100.0  # last real rate kept, not 0
+
+            clock["now"] += 10
+            counters["bytes"] += 1000
+            coordinator.network_client.devices.get_statistics = working_stats
+            await coordinator._async_update_data()
+            assert rate() == 100.0  # 2000 bytes over 20 s, not 200
+
+    @pytest.mark.asyncio
+    async def test_site_forbidden_fails_refresh_without_reauth(
+        self,
+        coordinator: UnifiDeviceCoordinator,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """A 403 on devices fails the refresh but does not start a reauth loop."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiAuthenticationError("Forbidden", status_code=403)
+        )
+
+        with pytest.raises(UpdateFailed, match="^Access forbidden for site"):
+            await coordinator._async_update_data()
+
+        assert coordinator._available is False
+        # Not re-wrapped and logged as an unexpected error on every poll.
+        assert "Unexpected error" not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiAuthenticationError("Forbidden", status_code=403),
+            UniFiNotFoundError("Not found", status_code=404),
+        ],
+        ids=["403", "404"],
+    )
+    async def test_stats_unavailable_for_one_device_is_tolerated(
+        self, coordinator: UnifiDeviceCoordinator, error: Exception
+    ):
+        """A per-device stats error leaves that device without stats only."""
+        coordinator.network_client.devices.get_statistics = AsyncMock(side_effect=error)
+
+        result = await coordinator._async_update_data()
+
+        assert "device1" in result["devices"]["default"]
+        assert result["stats"]["default"]["device1"] == {}
         assert coordinator._available is True
 
     @pytest.mark.asyncio
-    async def test_async_update_data_auth_error(
+    async def test_refresh_recovers_after_failure(
         self, coordinator: UnifiDeviceCoordinator
     ):
-        """Test data fetch handles auth error gracefully at site level."""
-        # Errors in _process_site are caught and logged, not re-raised
-        # The coordinator continues processing other sites
+        """last_update_success goes False on failure and True again on recovery."""
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is True
+
+        working = coordinator.network_client.devices.get_all
         coordinator.network_client.devices.get_all = AsyncMock(
-            side_effect=UniFiAuthenticationError("Invalid API key")
+            side_effect=UniFiConnectionError("Console rebooting")
         )
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is False
+        assert coordinator.available is False
+        assert "device1" in coordinator.data["devices"]["default"]
 
-        # Should complete without raising (error is caught in _process_site)
-        result = await coordinator._async_update_data()
-        # Returns existing data when sites fail
-        assert result is not None
-
-    @pytest.mark.asyncio
-    async def test_async_update_data_connection_error(
-        self, coordinator: UnifiDeviceCoordinator
-    ):
-        """Test data fetch handles connection error gracefully at site level."""
-        coordinator.network_client.devices.get_all = AsyncMock(
-            side_effect=UniFiConnectionError("Connection refused")
-        )
-
-        # Should complete without raising (error is caught in _process_site)
-        result = await coordinator._async_update_data()
-        assert result is not None
-
-    @pytest.mark.asyncio
-    async def test_async_update_data_timeout_error(
-        self, coordinator: UnifiDeviceCoordinator
-    ):
-        """Test data fetch handles timeout error gracefully at site level."""
-        coordinator.network_client.devices.get_all = AsyncMock(
-            side_effect=UniFiTimeoutError("Request timed out")
-        )
-
-        # Should complete without raising (error is caught in _process_site)
-        result = await coordinator._async_update_data()
-        assert result is not None
-
-    @pytest.mark.asyncio
-    async def test_async_update_data_response_error(
-        self, coordinator: UnifiDeviceCoordinator
-    ):
-        """Test data fetch handles response error gracefully at site level."""
-        coordinator.network_client.devices.get_all = AsyncMock(
-            side_effect=UniFiResponseError("Bad response", status_code=400)
-        )
-
-        # Should complete without raising (error is caught in _process_site)
-        result = await coordinator._async_update_data()
-        assert result is not None
-
-    @pytest.mark.asyncio
-    async def test_async_update_data_generic_error(
-        self, coordinator: UnifiDeviceCoordinator
-    ):
-        """Test data fetch handles generic error gracefully at site level."""
-        coordinator.network_client.devices.get_all = AsyncMock(
-            side_effect=Exception("Something broke")
-        )
-
-        # Should complete without raising (error is caught in _process_site)
-        result = await coordinator._async_update_data()
-        assert result is not None
+        coordinator.network_client.devices.get_all = working
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is True
+        assert coordinator.available is True
 
     def test_get_device_existing(self, coordinator: UnifiDeviceCoordinator):
         """Test getting existing device."""

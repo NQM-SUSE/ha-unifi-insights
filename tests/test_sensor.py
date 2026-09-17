@@ -13,6 +13,7 @@ from custom_components.unifi_insights.sensor import (
     NVR_SENSOR_TYPES,
     OUTLET_SENSOR_TYPES,
     PARALLEL_UPDATES,
+    PORT_RATE_SENSOR_TYPES,
     PORT_SENSOR_TYPES,
     PROTECT_SENSOR_TYPES,
     SENSOR_TYPES,
@@ -25,6 +26,7 @@ from custom_components.unifi_insights.sensor import (
     UnifiProtectSensor,
     UnifiProtectSensorEntityDescription,
     UnifiSiteClientSensor,
+    UnifiWifiClientCountSensor,
     _bytes_to_gb,
     _calculate_storage_available,
     _calculate_storage_percent,
@@ -1073,8 +1075,50 @@ class TestUnifiPortSensorEdgeCases:
             port_idx=1,
         )
 
-        # Set last_update_success to False
-        mock_coordinator.last_update_success = False
+        # Mark the device coordinator unavailable
+        mock_coordinator.device_available = False
+
+        assert sensor.available is False
+
+    @pytest.mark.parametrize(
+        ("key", "stat_key"),
+        [("port_tx_bytes", "port_bytes"), ("port_tx_rate", "port_rates")],
+    )
+    async def test_port_sensor_available_from_stats(
+        self, hass: HomeAssistant, mock_coordinator, key: str, stat_key: str
+    ):
+        """Byte and rate sensors are available when stats carry the port."""
+        mock_coordinator.device_available = True
+        mock_coordinator.data["stats"] = {
+            "site1": {"device1": {stat_key: {1: {"tx_bytes": 1, "tx_bytes_rate": 1.0}}}}
+        }
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=next(
+                s for s in (*PORT_SENSOR_TYPES, *PORT_RATE_SENSOR_TYPES) if s.key == key
+            ),
+            site_id="site1",
+            device_id="device1",
+            port_idx=1,
+        )
+
+        assert sensor.available is True
+
+    @pytest.mark.parametrize("key", ["port_tx_bytes", "port_tx_rate", "port_speed"])
+    async def test_port_sensor_unavailable_when_device_refresh_fails(
+        self, hass: HomeAssistant, mock_coordinator, key: str
+    ):
+        """Byte, rate and state port sensors follow device_available."""
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=next(
+                s for s in (*PORT_SENSOR_TYPES, *PORT_RATE_SENSOR_TYPES) if s.key == key
+            ),
+            site_id="site1",
+            device_id="device1",
+            port_idx=1,
+        )
+        mock_coordinator.device_available = False
 
         assert sensor.available is False
 
@@ -2508,7 +2552,7 @@ class TestUnifiSiteClientSensor:
         )
         assert sensor.available is True
 
-        mock_coordinator_with_clients.last_update_success = False
+        mock_coordinator_with_clients.device_available = False
         assert sensor.available is False
 
     async def test_device_info_attaches_to_gateway(
@@ -3129,3 +3173,23 @@ class TestUnifiAcPowerSensors:
         outlet = sensor._find_outlet_data()
         assert outlet is not None
         assert sensor.extra_state_attributes == {"index": 1}
+
+
+class TestUnifiWifiClientCountSensor:
+    """Tests for the per-SSID client count sensor."""
+
+    def test_available_follows_site_wifi_fetch(self) -> None:
+        """Unavailable when the WiFi fetch for its site failed."""
+        coordinator = MagicMock()
+        coordinator.data = {
+            "wifi": {"site1": {"wifi1": {"name": "Home", "num_connected_clients": 3}}}
+        }
+        coordinator.wifi_available = MagicMock(return_value=True)
+        sensor = UnifiWifiClientCountSensor(
+            coordinator=coordinator, site_id="site1", wifi_id="wifi1"
+        )
+        assert sensor.available is True
+
+        coordinator.wifi_available.return_value = False
+        assert sensor.available is False
+        coordinator.wifi_available.assert_called_with("site1")

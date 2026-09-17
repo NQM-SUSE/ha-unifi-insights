@@ -1787,7 +1787,7 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
         """Return if entity is available."""
         # PoE power availability based on coordinator stats
         if self.entity_description.key == "port_poe_power":
-            if not self.coordinator.last_update_success:
+            if not self.coordinator.device_available:
                 return False
             stats = (
                 self.coordinator.data.get("stats", {})
@@ -1806,7 +1806,7 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
 
         # TX/RX availability based on coordinator stats
         if self.entity_description.key in ("port_tx_bytes", "port_rx_bytes"):
-            if not self.coordinator.last_update_success:
+            if not self.coordinator.device_available:
                 return False
             stats = (
                 self.coordinator.data.get("stats", {})
@@ -1825,7 +1825,7 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
 
         # TX/RX rate availability based on computed port_rates
         if self.entity_description.key in ("port_tx_rate", "port_rx_rate"):
-            if not self.coordinator.last_update_success:
+            if not self.coordinator.device_available:
                 return False
             stats = (
                 self.coordinator.data.get("stats", {})
@@ -1843,7 +1843,7 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
             # Fall through to standard port-state availability logic
 
         # Port sensors are available if the device is available AND the port is UP
-        if not self.coordinator.last_update_success:
+        if not self.coordinator.device_available:
             return False
 
         # Get device data
@@ -2320,7 +2320,7 @@ class UnifiSiteClientSensor(CoordinatorEntity[UnifiFacadeCoordinator], SensorEnt
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return bool(self.coordinator.last_update_success)
+        return bool(self.coordinator.device_available)
 
     @property
     def native_value(self) -> StateType:
@@ -2375,7 +2375,9 @@ class UnifiWifiClientCountSensor(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return bool(self.coordinator.last_update_success and self._get_wifi_data())
+        return bool(
+            self.coordinator.wifi_available(self._site_id) and self._get_wifi_data()
+        )
 
     @property
     def native_value(self) -> StateType:

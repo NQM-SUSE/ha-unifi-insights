@@ -6,9 +6,11 @@ import asyncio
 import logging
 import time
 from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
@@ -34,6 +36,10 @@ if TYPE_CHECKING:
     from .config import UnifiConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# How many consecutive polls a device's last good statistics are reused for
+# when its statistics call keeps failing, before its stats are dropped.
+MAX_STATS_REUSE_POLLS = 3
 
 
 class UnifiDeviceCoordinator(UnifiBaseCoordinator):
@@ -72,8 +78,12 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         # Track previous device IDs for stale device cleanup (Gold requirement)
         self._previous_network_device_ids: set[str] = set()
         # Track previous port byte counts for rate computation
-        self._prev_port_bytes: dict[str, dict[int, dict[str, int]]] = {}
-        self._prev_port_bytes_time: float | None = None
+        # device_id -> (monotonic sample time, per-port byte counters)
+        self._prev_port_bytes: dict[str, tuple[float, dict[int, dict[str, int]]]] = {}
+        # Consecutive polls each device's statistics call has failed for, and
+        # the devices whose stats were reused (not refetched) this refresh.
+        self._stats_failures: dict[str, int] = {}
+        self._reused_stats: set[str] = set()
         self.data: dict[str, Any] = {
             "devices": {},
             "clients": {},
@@ -422,130 +432,154 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 ]
                 stats["id"] = device_id
 
+            self._stats_failures.pop(device_id, None)
             return device_id, device_dict, stats
 
         except Exception as err:
-            _LOGGER.debug(
-                "Error getting stats for device %s (%s): %s",
+            if self._is_unsupported_response(err):
+                self._stats_failures.pop(device_id, None)
+                _LOGGER.debug(
+                    "Statistics not available for device %s (%s): %s",
+                    device_name,
+                    device_id,
+                    err,
+                )
+                return device_id, device_dict, {}
+            if isinstance(err, UniFiAuthenticationError):
+                # Revoked credentials: fail the refresh so reauth starts.
+                raise
+            # One device's statistics timing out, erroring or being rate
+            # limited should not fail every entity on every site, and blanking
+            # them would make its sensors drop to unknown. Reuse its last good
+            # statistics for a few polls; a persistent failure then drops them
+            # so frozen values don't stay "available" indefinitely.
+            failures = self._stats_failures.get(device_id, 0) + 1
+            self._stats_failures[device_id] = failures
+            previous = self.data["stats"].get(site_id, {}).get(device_id)
+            if failures <= MAX_STATS_REUSE_POLLS and isinstance(previous, dict):
+                _LOGGER.debug(
+                    "Error getting stats for device %s (%s), keeping last known "
+                    "stats: %s",
+                    device_name,
+                    device_id,
+                    err,
+                )
+                self._reused_stats.add(device_id)
+                return device_id, device_dict, previous
+            log = (
+                _LOGGER.warning
+                if failures == MAX_STATS_REUSE_POLLS + 1
+                else _LOGGER.debug
+            )
+            log(
+                "Statistics for device %s (%s) failed %d times in a row: %s",
                 device_name,
                 device_id,
+                failures,
                 err,
             )
             return device_id, device_dict, {}
 
     async def _process_site(
         self, site_id: str, legacy_site_name: str | None = None
-    ) -> (
-        tuple[
-            dict[str, dict[str, Any]],
-            dict[str, dict[str, Any]],
-            dict[str, dict[str, Any]],
-        ]
-        | None
-    ):
-        """Process a single site's devices and clients."""
-        try:
-            # Get devices and clients in parallel using new API
-            devices_task = self.network_client.devices.get_all(site_id)
-            clients_task = self.network_client.clients.get_all(site_id)
-            devices_models, clients_models = await asyncio.gather(
-                devices_task, clients_task
-            )
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        dict[str, dict[str, Any]],
+        dict[str, dict[str, Any]],
+    ]:
+        """
+        Process a single site's devices and clients.
 
-            legacy_devices: list[dict[str, Any]] = []
-            if legacy_site_name is not None:
-                try:
-                    legacy_devices = (
-                        await self.network_client.devices.get_legacy_site_devices(
-                            legacy_site_name
-                        )
-                    )
-                except Exception as err:
-                    _LOGGER.debug(
-                        "Device coordinator: Failed to fetch legacy device data "
-                        "for site %s (%s): %s",
-                        site_id,
-                        legacy_site_name,
-                        err,
-                    )
+        Errors propagate: a site whose devices or clients cannot be fetched
+        fails the whole refresh (see ``_async_update_data``).
+        """
+        # Get devices and clients in parallel using new API
+        devices_task = self.network_client.devices.get_all(site_id)
+        clients_task = self.network_client.clients.get_all(site_id)
+        devices_models, clients_models = await asyncio.gather(
+            devices_task, clients_task
+        )
 
-            # Convert model objects to dictionaries
-            devices = [self._model_to_dict(d) for d in devices_models]
-            clients = [self._model_to_dict(c) for c in clients_models]
-
-            legacy_devices_by_mac = {
-                normalized_mac: legacy_device
-                for legacy_device in legacy_devices
-                if isinstance(legacy_device, dict)
-                and (
-                    normalized_mac := self._normalize_mac(
-                        legacy_device.get("mac") or legacy_device.get("macAddress")
+        legacy_devices: list[dict[str, Any]] = []
+        if legacy_site_name is not None:
+            try:
+                legacy_devices = (
+                    await self.network_client.devices.get_legacy_site_devices(
+                        legacy_site_name
                     )
                 )
-                is not None
-            }
-
-            if legacy_devices_by_mac:
-                for device in devices:
-                    self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
-                    self._merge_legacy_port_data(device, legacy_devices_by_mac)
-                    self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
-
-            _LOGGER.debug(
-                "Device coordinator: Site %s - Found %d devices and %d clients",
-                site_id,
-                len(devices),
-                len(clients),
-            )
-
-            # Log sample device keys for debugging data format issues
-            if devices:
-                sample_device = devices[0]
+            except Exception as err:
                 _LOGGER.debug(
-                    "Device coordinator: Sample device keys for site %s: %s",
+                    "Device coordinator: Failed to fetch legacy device data "
+                    "for site %s (%s): %s",
                     site_id,
-                    list(sample_device.keys()),
+                    legacy_site_name,
+                    err,
                 )
 
-            # Process devices in parallel (get stats)
-            tasks = [
-                self._process_device(
-                    site_id,
-                    device,
-                    clients,
-                    legacy_site_name=legacy_site_name,
+        # Convert model objects to dictionaries
+        devices = [self._model_to_dict(d) for d in devices_models]
+        clients = [self._model_to_dict(c) for c in clients_models]
+
+        legacy_devices_by_mac = {
+            normalized_mac: legacy_device
+            for legacy_device in legacy_devices
+            if isinstance(legacy_device, dict)
+            and (
+                normalized_mac := self._normalize_mac(
+                    legacy_device.get("mac") or legacy_device.get("macAddress")
                 )
-                for device in devices
-            ]
-            results = await asyncio.gather(*tasks)
-
-            # Organize results
-            devices_dict = {}
-            stats_dict = {}
-            for device_id, device, stats in results:
-                if device_id:
-                    devices_dict[device_id] = device
-                    stats_dict[device_id] = stats
-
-            clients_dict: dict[str, dict[str, Any]] = {
-                str(client.get("id")): client for client in clients if client.get("id")
-            }
-
-            return devices_dict, stats_dict, clients_dict
-
-        except (UniFiConnectionError, UniFiTimeoutError) as err:
-            # Transient controller connectivity issues are common (e.g. the
-            # console rebooting or a brief network blip). Log concisely without
-            # a full traceback to avoid flooding the log.
-            _LOGGER.warning(
-                "Device coordinator: Could not reach controller for site %s: %s",
-                site_id,
-                err,
             )
-            return None
-        except Exception:
-            _LOGGER.exception("Device coordinator: Error processing site %s", site_id)
-            return None
+            is not None
+        }
+
+        if legacy_devices_by_mac:
+            for device in devices:
+                self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
+                self._merge_legacy_port_data(device, legacy_devices_by_mac)
+                self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+
+        _LOGGER.debug(
+            "Device coordinator: Site %s - Found %d devices and %d clients",
+            site_id,
+            len(devices),
+            len(clients),
+        )
+
+        # Log sample device keys for debugging data format issues
+        if devices:
+            sample_device = devices[0]
+            _LOGGER.debug(
+                "Device coordinator: Sample device keys for site %s: %s",
+                site_id,
+                list(sample_device.keys()),
+            )
+
+        # Process devices in parallel (get stats)
+        tasks = [
+            self._process_device(
+                site_id,
+                device,
+                clients,
+                legacy_site_name=legacy_site_name,
+            )
+            for device in devices
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Organize results
+        devices_dict = {}
+        stats_dict = {}
+        for device_id, device, stats in results:
+            if device_id:
+                devices_dict[device_id] = device
+                stats_dict[device_id] = stats
+
+        clients_dict: dict[str, dict[str, Any]] = {
+            str(client.get("id")): client for client in clients if client.get("id")
+        }
+
+        return devices_dict, stats_dict, clients_dict
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch device data from API."""
@@ -579,6 +613,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 len(site_ids),
             )
 
+            self._reused_stats = set()
             legacy_site_names: dict[str, str] = {}
             try:
                 legacy_sites = await self.network_client.sites.get_legacy_all()
@@ -595,26 +630,81 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 self._process_site(site_id, legacy_site_names.get(site_id))
                 for site_id in site_ids
             ]
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # A site that could not be refreshed fails the whole update, and
+            # nothing is written until every site has succeeded. Reporting
+            # success here used to leave entities "available" on data that
+            # was silently going stale, and swallowed a revoked API key so
+            # reauth never started. DataUpdateCoordinator keeps the previous
+            # self.data when the update raises.
+            failures = [
+                (site_id, result)
+                for site_id, result in zip(site_ids, results, strict=True)
+                if isinstance(result, BaseException)
+            ]
+            if failures:
+                for failed_site_id, site_error in failures:
+                    _LOGGER.debug(
+                        "Device coordinator: Refresh failed for site %s: %r",
+                        failed_site_id,
+                        site_error,
+                    )
+                # Revoked credentials (401) on any site start reauth. A 403
+                # is not sent to reauth: the flow re-validates against the
+                # sites endpoint, which the same key passes, so it would loop.
+                auth_failure = next(
+                    (
+                        site_error
+                        for _, site_error in failures
+                        if isinstance(site_error, UniFiAuthenticationError)
+                        and site_error.status_code != HTTPStatus.FORBIDDEN
+                    ),
+                    None,
+                )
+                if auth_failure is not None:
+                    raise auth_failure
+                failed_site_id, first_error = failures[0]
+                if isinstance(first_error, UniFiAuthenticationError):
+                    self._available = False
+                    msg = f"Access forbidden for site {failed_site_id}: {first_error}"
+                    raise UpdateFailed(msg) from first_error
+                raise first_error
+
+            # Every site succeeded; the filter only narrows the type.
+            site_results = [
+                result for result in results if not isinstance(result, BaseException)
+            ]
 
             # Update data structure with results
-            for site_id, result in zip(site_ids, results, strict=False):
-                if result is not None:
-                    devices_dict, stats_dict, clients_dict = result
-                    self.data["devices"][site_id] = devices_dict
-                    self.data["stats"][site_id] = stats_dict
-                    self.data["clients"][site_id] = clients_dict
+            for site_id, (devices_dict, stats_dict, clients_dict) in zip(
+                site_ids, site_results, strict=True
+            ):
+                self.data["devices"][site_id] = devices_dict
+                self.data["stats"][site_id] = stats_dict
+                self.data["clients"][site_id] = clients_dict
 
-                    _LOGGER.debug(
-                        "Device coordinator: Processed site %s - "
-                        "%d devices, %d clients",
-                        site_id,
-                        len(devices_dict),
-                        len(clients_dict),
-                    )
+                _LOGGER.debug(
+                    "Device coordinator: Processed site %s - %d devices, %d clients",
+                    site_id,
+                    len(devices_dict),
+                    len(clients_dict),
+                )
 
             # Compute per-port byte rates from deltas
             self._compute_port_rates()
+
+            # Forget failure counts for devices that are no longer reported.
+            current_device_ids = {
+                device_id
+                for site_stats in self.data["stats"].values()
+                for device_id in site_stats
+            }
+            self._stats_failures = {
+                device_id: count
+                for device_id, count in self._stats_failures.items()
+                if device_id in current_device_ids
+            }
 
             self._available = True
             self.data["last_update"] = datetime.now(tz=UTC)
@@ -637,6 +727,10 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             self._handle_timeout_error(err)
         except UniFiResponseError as err:
             self._handle_response_error(err)
+        except UpdateFailed:
+            # Already classified above (a site 403); the generic handler would
+            # log it as an unexpected error with a traceback on every poll.
+            raise
         except Exception as err:
             self._handle_generic_error(err)
 
@@ -644,42 +738,40 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         return self.data  # pragma: no cover
 
     def _compute_port_rates(self) -> None:
-        """Compute per-port byte rates from consecutive poll deltas."""
+        """
+        Compute per-port byte rates from consecutive poll deltas.
+
+        Each device keeps its own last sample time. A device whose statistics
+        were reused this poll (see ``_process_device``) is skipped and its
+        previous sample carried forward: recomputing against the same
+        counters would report a rate of 0, and the next fresh poll would then
+        divide two polls' worth of bytes by one poll's elapsed time. Its
+        reused stats keep the port_rates from the last real sample.
+        """
         now = time.monotonic()
-        current_port_bytes: dict[str, dict[int, dict[str, int]]] = {}
+        previous = self._prev_port_bytes
+        current: dict[str, tuple[float, dict[int, dict[str, int]]]] = {}
 
-        # Collect current byte counts keyed by device_id
-        for stats_dict in self.data.get("stats", {}).values():
-            for device_id, stats in stats_dict.items():
-                if not isinstance(stats, dict):
-                    continue
-                pb = stats.get("port_bytes")
-                if isinstance(pb, dict):
-                    current_port_bytes[device_id] = pb
-
-        prev_time = self._prev_port_bytes_time
-        prev_bytes = self._prev_port_bytes
-
-        # Update stored state for next poll
-        self._prev_port_bytes = current_port_bytes
-        self._prev_port_bytes_time = now
-
-        if prev_time is None or not prev_bytes:
-            return
-
-        elapsed = now - prev_time
-        if elapsed <= 0:
-            return
-
-        # Compute rates and store in stats
         for stats_dict in self.data.get("stats", {}).values():
             for device_id, stats in stats_dict.items():
                 if not isinstance(stats, dict):
                     continue
 
-                prev_dev = prev_bytes.get(device_id)
-                curr_dev = current_port_bytes.get(device_id)
-                if not prev_dev or not curr_dev:
+                if device_id in self._reused_stats:
+                    if device_id in previous:
+                        current[device_id] = previous[device_id]
+                    continue
+
+                curr_dev = stats.get("port_bytes")
+                if not isinstance(curr_dev, dict):
+                    continue
+                current[device_id] = (now, curr_dev)
+
+                if device_id not in previous:
+                    continue
+                prev_time, prev_dev = previous[device_id]
+                elapsed = now - prev_time
+                if elapsed <= 0:
                     continue
 
                 port_rates: dict[int, dict[str, float]] = {}
@@ -702,6 +794,9 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
                 if port_rates:
                     stats["port_rates"] = port_rates
+
+        # Update stored state for next poll
+        self._prev_port_bytes = current
 
     def _cleanup_stale_devices(self) -> None:
         """Remove stale network devices from the device registry (Gold requirement)."""

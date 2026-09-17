@@ -24,6 +24,21 @@ class UniFiError(Exception):
 class UniFiAuthenticationError(UniFiError):
     """Raised when authentication fails."""
 
+    def __init__(
+        self, message: str, *args: Any, status_code: int | None = None
+    ) -> None:
+        """
+        Initialize the exception.
+
+        Args:
+            message: The error message.
+            *args: Additional arguments.
+            status_code: The HTTP status code (401 or 403) if known.
+
+        """
+        super().__init__(message, *args)
+        self.status_code = status_code
+
 
 class UniFiConnectionError(UniFiError):
     """Raised when connection to the UniFi API fails."""

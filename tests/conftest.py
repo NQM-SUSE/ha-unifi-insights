@@ -65,6 +65,10 @@ def _create_mock_network_client() -> MagicMock:
     client.clients.get_all = AsyncMock(return_value=[])
     client.clients.authorize_guest = AsyncMock(return_value=True)
 
+    # Setup WiFi namespace
+    client.wifi = MagicMock()
+    client.wifi.get_all = AsyncMock(return_value=[])
+
     # Setup firewall namespace
     client.firewall = MagicMock()
     client.firewall.list_rules = AsyncMock(return_value=[])

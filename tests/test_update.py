@@ -267,7 +267,7 @@ class TestUnifiNetworkDeviceUpdate:
 
     def test_unavailable_when_coordinator_fails(self, mock_coordinator) -> None:
         """Test availability when coordinator update fails."""
-        mock_coordinator.last_update_success = False
+        mock_coordinator.device_available = False
 
         entity = UnifiNetworkDeviceUpdate(
             coordinator=mock_coordinator,

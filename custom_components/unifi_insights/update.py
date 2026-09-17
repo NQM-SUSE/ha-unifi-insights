@@ -102,7 +102,7 @@ class UnifiNetworkDeviceUpdate(CoordinatorEntity[UnifiFacadeCoordinator], Update
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return bool(self.coordinator.last_update_success)
+        return bool(self.coordinator.device_available)
 
     @property
     def _device_data(self) -> dict[str, Any] | None:

@@ -252,11 +252,14 @@ class BaseUniFiClient(ABC):
             )
 
         if status == HTTPStatus.UNAUTHORIZED:
-            raise UniFiAuthenticationError("Authentication failed. Check your API key.")
+            raise UniFiAuthenticationError(
+                "Authentication failed. Check your API key.", status_code=status
+            )
 
         if status == HTTPStatus.FORBIDDEN:
             raise UniFiAuthenticationError(
-                "Access forbidden. Check your API key permissions."
+                "Access forbidden. Check your API key permissions.",
+                status_code=status,
             )
 
         if status == HTTPStatus.NOT_FOUND:

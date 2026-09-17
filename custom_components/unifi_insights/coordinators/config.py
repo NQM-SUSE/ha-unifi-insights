@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from functools import partial
 from http import HTTPStatus
 import logging
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,8 @@ from custom_components.unifi_insights.const import CONF_SITE_IDS, SCAN_INTERVAL_
 from .base import UnifiBaseCoordinator
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
@@ -68,6 +71,70 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
         # site filter is applied, so the options flow can offer all of them.
         self.available_sites: dict[str, str] = {}
         self._warned_no_selected_sites = False
+        # (section, site_id) pairs for optional sections (WiFi, firewall)
+        # whose last fetch failed. They keep their previous data but report
+        # unavailable, without failing the whole refresh.
+        self._failed_sections: set[tuple[str, str]] = set()
+
+    def wifi_available(self, site_id: str) -> bool:
+        """Return True if the last refresh fetched WiFi networks for a site."""
+        return self.last_update_success and ("wifi", site_id) not in (
+            self._failed_sections
+        )
+
+    def firewall_available(self, site_id: str) -> bool:
+        """Return True if the last refresh fetched firewall rules for a site."""
+        return self.last_update_success and ("firewall_rules", site_id) not in (
+            self._failed_sections
+        )
+
+    async def _fetch_optional_section(
+        self,
+        section: str,
+        site_id: str,
+        fetch: Callable[[], Awaitable[list[Any]]],
+    ) -> list[Any] | None:
+        """
+        Fetch an optional per-site section (WiFi networks, firewall rules).
+
+        Returns the models, an empty list when the console or API key does
+        not offer the feature, or None when the fetch failed. A failure used
+        to be reported as an empty section with a successful refresh, which
+        blanked those entities; the caller now keeps the previous data and
+        marks the section unavailable instead. It deliberately does not fail
+        the whole refresh: at setup that would block every other platform
+        (including Protect) on one optional endpoint. A 401 still raises so
+        reauth starts.
+        """
+        try:
+            return await fetch()
+        except UniFiAuthenticationError as err:
+            if not self._is_unsupported_response(err):
+                raise
+            unsupported: Exception = err
+        except Exception as err:
+            if not self._is_unsupported_response(err):
+                log = (
+                    _LOGGER.debug
+                    if (section, site_id) in self._failed_sections
+                    else _LOGGER.warning
+                )
+                log(
+                    "Config coordinator: Unable to fetch %s for site %s, keeping "
+                    "the last known data: %s",
+                    section,
+                    site_id,
+                    err,
+                )
+                return None
+            unsupported = err
+        _LOGGER.debug(
+            "Config coordinator: %s not available for site %s: %s",
+            section,
+            site_id,
+            unsupported,
+        )
+        return []
 
     @staticmethod
     def _map_legacy_site_names(
@@ -240,9 +307,9 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                     err.status_code,
                 )
 
-            sites = [self._model_to_dict(s) for s in sites_models]
+            site_list = [self._model_to_dict(s) for s in sites_models]
             all_sites: dict[str, dict[str, Any]] = {
-                site_id: site for site in sites if (site_id := site.get("id"))
+                site["id"]: site for site in site_list if site.get("id")
             }
             self.available_sites = {
                 site_id: str(
@@ -250,14 +317,16 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 )
                 for site_id, site in all_sites.items()
             }
-            self.data["sites"] = self._filter_selected_sites(all_sites)
+            sites = self._filter_selected_sites(all_sites)
+            self.data["sites"] = sites
 
             _LOGGER.debug(
                 "Config coordinator: Found %d sites",
-                len(self.data["sites"]),
+                len(sites),
             )
 
-            if not self.data["sites"]:
+            if not sites:
+                self.data["sites"] = sites
                 self.data["wifi"] = {}
                 self.data["firewall_rules"] = {}
                 self.data["policy_based_routes"] = {}
@@ -282,98 +351,100 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             legacy_site_names: dict[str, str] = {}
             try:
                 legacy_sites = await self.network_client.sites.get_legacy_all()
-                legacy_site_names = self._map_legacy_site_names(
-                    self.data["sites"], legacy_sites
-                )
+                legacy_site_names = self._map_legacy_site_names(sites, legacy_sites)
             except Exception as err:
                 _LOGGER.debug(
                     "Config coordinator: Unable to fetch legacy site mapping: %s",
                     err,
                 )
 
-            # Fetch WiFi networks for each site
-            # Note: site_id cannot be None here due to dict comprehension filter above
-            for site_id in self.data["sites"]:
-                try:
-                    _LOGGER.debug(
-                        "Config coordinator: Fetching WiFi networks for site %s",
-                        site_id,
-                    )
-                    wifi_models = await self.network_client.wifi.get_all(site_id)
-                    wifi_dict = {}
-                    for wifi_model in wifi_models:
-                        wifi = self._model_to_dict(wifi_model)
-                        wifi_id = wifi.get("id")
-                        if wifi_id:
-                            wifi_dict[wifi_id] = wifi
-                    # Enrich with classic data (secrets, per-SSID counts, QR).
-                    legacy_name = legacy_site_names.get(site_id)
-                    if legacy_name:
-                        try:
-                            legacy_configs = (
-                                await self.network_client.wifi.get_legacy_configs(
-                                    legacy_name
-                                )
-                            )
-                            active_clients = (
-                                await self.network_client.clients.get_active_legacy(
-                                    legacy_name
-                                )
-                            )
-                            self._enrich_wifi(wifi_dict, legacy_configs, active_clients)
-                        except Exception as err:
-                            _LOGGER.debug(
-                                "Config coordinator: Unable to enrich WiFi data "
-                                "for site %s: %s",
-                                site_id,
-                                err,
-                            )
+            # Everything below is collected into fresh dicts and only
+            # published once every site has refreshed. An error that fails
+            # the refresh (e.g. a 401) part-way through therefore leaves the
+            # previous snapshot intact rather than a half-updated one.
+            wifi_by_site: dict[str, dict[str, Any]] = {}
+            firewall_by_site: dict[str, dict[str, Any]] = {}
+            failed_sections: set[tuple[str, str]] = set()
+            routes_by_site: dict[str, dict[str, Any]] = {}
+            vpn_clients_by_site: dict[str, dict[str, Any]] = {}
 
-                    self.data["wifi"][site_id] = wifi_dict
+            for site_id in sites:
+                _LOGGER.debug(
+                    "Config coordinator: Fetching WiFi networks for site %s",
+                    site_id,
+                )
+                wifi_models = await self._fetch_optional_section(
+                    "wifi", site_id, partial(self.network_client.wifi.get_all, site_id)
+                )
+                if wifi_models is None:
+                    failed_sections.add(("wifi", site_id))
+                    wifi_by_site[site_id] = self.data["wifi"].get(site_id, {})
+                wifi_dict = {}
+                for wifi_model in wifi_models or []:
+                    wifi = self._model_to_dict(wifi_model)
+                    wifi_id = wifi.get("id")
+                    if wifi_id:
+                        wifi_dict[wifi_id] = wifi
+                # Enrich with classic data (secrets, per-SSID counts, QR).
+                legacy_name = legacy_site_names.get(site_id)
+                if wifi_models is not None and legacy_name:
+                    try:
+                        legacy_configs = (
+                            await self.network_client.wifi.get_legacy_configs(
+                                legacy_name
+                            )
+                        )
+                        active_clients = (
+                            await self.network_client.clients.get_active_legacy(
+                                legacy_name
+                            )
+                        )
+                        self._enrich_wifi(wifi_dict, legacy_configs, active_clients)
+                    except Exception as err:
+                        _LOGGER.debug(
+                            "Config coordinator: Unable to enrich WiFi data "
+                            "for site %s: %s",
+                            site_id,
+                            err,
+                        )
+
+                if wifi_models is not None:
+                    wifi_by_site[site_id] = wifi_dict
                     _LOGGER.debug(
                         "Config coordinator: Successfully fetched %d WiFi networks "
                         "for site %s",
                         len(wifi_dict),
                         site_id,
                     )
-                except Exception as err:
-                    _LOGGER.warning(
-                        "Config coordinator: Error fetching WiFi networks "
-                        "for site %s: %s",
-                        site_id,
-                        err,
-                    )
-                    self.data["wifi"][site_id] = {}
 
-                try:
-                    _LOGGER.debug(
-                        "Config coordinator: Fetching firewall rules for site %s",
-                        site_id,
+                _LOGGER.debug(
+                    "Config coordinator: Fetching firewall rules for site %s",
+                    site_id,
+                )
+                firewall_models = await self._fetch_optional_section(
+                    "firewall_rules",
+                    site_id,
+                    partial(self.network_client.firewall.list_rules, site_id),
+                )
+                firewall_rules_dict = {}
+                for firewall_model in firewall_models or []:
+                    firewall_rule = self._model_to_dict(firewall_model)
+                    firewall_rule_id = firewall_rule.get("id")
+                    if firewall_rule_id:
+                        firewall_rules_dict[firewall_rule_id] = firewall_rule
+                if firewall_models is None:
+                    failed_sections.add(("firewall_rules", site_id))
+                    firewall_by_site[site_id] = self.data["firewall_rules"].get(
+                        site_id, {}
                     )
-                    firewall_models = await self.network_client.firewall.list_rules(
-                        site_id
-                    )
-                    firewall_rules_dict = {}
-                    for firewall_model in firewall_models:
-                        firewall_rule = self._model_to_dict(firewall_model)
-                        firewall_rule_id = firewall_rule.get("id")
-                        if firewall_rule_id:
-                            firewall_rules_dict[firewall_rule_id] = firewall_rule
-                    self.data["firewall_rules"][site_id] = firewall_rules_dict
+                else:
+                    firewall_by_site[site_id] = firewall_rules_dict
                     _LOGGER.debug(
                         "Config coordinator: Successfully fetched %d firewall rules "
                         "for site %s",
                         len(firewall_rules_dict),
                         site_id,
                     )
-                except Exception as err:
-                    _LOGGER.debug(
-                        "Config coordinator: Firewall rules unavailable for site %s: "
-                        "%s",
-                        site_id,
-                        err,
-                    )
-                    self.data["firewall_rules"][site_id] = {}
 
                 # Fetch policy-based routes (traffic routes) via legacy v2 endpoint
                 legacy_name = legacy_site_names.get(site_id)
@@ -394,7 +465,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                             route_id = route.get("id") or route.get("_id")
                             if route_id:
                                 routes_dict[route_id] = route
-                        self.data["policy_based_routes"][site_id] = routes_dict
+                        routes_by_site[site_id] = routes_dict
                         _LOGGER.debug(
                             "Config coordinator: Successfully fetched %d "
                             "policy-based routes for site %s",
@@ -410,9 +481,9 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                             site_id,
                             err,
                         )
-                        self.data["policy_based_routes"][site_id] = {}
+                        routes_by_site[site_id] = {}
                 else:
-                    self.data["policy_based_routes"][site_id] = {}
+                    routes_by_site[site_id] = {}
 
                 # Fetch VPN clients via classic networkconf endpoint
                 if legacy_name:
@@ -435,7 +506,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                             )
                             if vpn_client_id:
                                 vpn_clients_dict[vpn_client_id] = vpn_client
-                        self.data["vpn_clients"][site_id] = vpn_clients_dict
+                        vpn_clients_by_site[site_id] = vpn_clients_dict
                         _LOGGER.debug(
                             "Config coordinator: Successfully fetched %d "
                             "VPN clients for site %s",
@@ -451,10 +522,22 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                             site_id,
                             err,
                         )
-                        self.data["vpn_clients"][site_id] = {}
+                        vpn_clients_by_site[site_id] = {}
                 else:
-                    self.data["vpn_clients"][site_id] = {}
+                    vpn_clients_by_site[site_id] = {}
 
+            self.data["sites"] = sites
+            self.data["wifi"] = wifi_by_site
+            self.data["firewall_rules"] = firewall_by_site
+            self.data["policy_based_routes"] = routes_by_site
+            self.data["vpn_clients"] = vpn_clients_by_site
+            for section, site_id in self._failed_sections - failed_sections:
+                _LOGGER.info(
+                    "Config coordinator: %s fetch for site %s recovered",
+                    section,
+                    site_id,
+                )
+            self._failed_sections = failed_sections
             self._available = True
             _LOGGER.debug(
                 "Config coordinator: Update complete - %d sites, %d WiFi configs, "

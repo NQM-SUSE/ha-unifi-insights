@@ -212,6 +212,14 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return True if the config coordinator is available."""
         return self._config_coordinator.last_update_success
 
+    def wifi_available(self, site_id: str) -> bool:
+        """Return True if a site's WiFi networks were fetched on the last refresh."""
+        return self._config_coordinator.wifi_available(site_id)
+
+    def firewall_available(self, site_id: str) -> bool:
+        """Return True if a site's firewall rules were fetched on the last refresh."""
+        return self._config_coordinator.firewall_available(site_id)
+
     @property
     def protect_available(self) -> bool:
         """Return True if the protect coordinator is available or not configured."""

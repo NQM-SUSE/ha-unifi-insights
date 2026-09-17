@@ -269,6 +269,19 @@ class TestUnifiClientReconnectButton:
 
         assert button.available is False
 
+    async def test_reconnect_button_unavailable_when_device_refresh_fails(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """Test button unavailable while the device refresh is failing."""
+        button = UnifiClientReconnectButton(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            client_id="client1",
+        )
+        mock_coordinator.device_available = False
+
+        assert button.available is False
+
     async def test_reconnect_button_press(self, hass: HomeAssistant, mock_coordinator):
         """Test client reconnect button press."""
         button = UnifiClientReconnectButton(
