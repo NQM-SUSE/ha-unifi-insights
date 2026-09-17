@@ -1401,31 +1401,58 @@ class TestUnifiProtectCoordinator:
     """Tests for UnifiProtectCoordinator."""
 
     @pytest.fixture
-    def coordinator(
+    async def coordinator(
         self, hass: HomeAssistant, mock_config_entry: MockConfigEntry
-    ) -> UnifiProtectCoordinator:
-        """Create a protect coordinator for testing."""
+    ) -> AsyncGenerator[UnifiProtectCoordinator]:
+        """Create a protect coordinator for testing, shut down on teardown.
+
+        Was a plain (non-yield) fixture with no teardown at all - this
+        class constructs `UnifiProtectCoordinator` directly rather than
+        going through config-entry setup/unload, so nothing ever cancelled
+        the sensor-reconcile timer, the three tracked sensor background
+        tasks (`_sensor_refresh_task`/`_sensor_reconcile_task`/
+        `_sensor_reconnect_task`), or shut down the
+        `_sensor_reconnect_debouncer`'s trailing-edge timer that a test
+        left pending. `async_shutdown()` (see coordinators/protect.py)
+        cancels exactly those per-test - it is hygiene for this test file's
+        own per-test coordinator instances, not a fix for a leak or a
+        regression guard: measured via a real
+        `entry._async_process_on_unload(hass)` reload-cycle probe, the
+        `EVENT_HOMEASSISTANT_STOP` listener wrapped in
+        `entry.async_on_unload` releases its coordinator on unload
+        regardless of whether this fixture calls `async_shutdown()`, and
+        the full 286-test file passes unmodified even with this fixture
+        reverted to a plain non-yield fixture.
+        """
         network_client = _create_mock_network_client()
         protect_client = _create_mock_protect_client()
-        return UnifiProtectCoordinator(
+        coord = UnifiProtectCoordinator(
             hass=hass,
             network_client=network_client,
             protect_client=protect_client,
             entry=mock_config_entry,
         )
+        yield coord
+        await coord.async_shutdown()
 
     @pytest.fixture
-    def coordinator_no_protect(
+    async def coordinator_no_protect(
         self, hass: HomeAssistant, mock_config_entry: MockConfigEntry
-    ) -> UnifiProtectCoordinator:
-        """Create a protect coordinator without protect client."""
+    ) -> AsyncGenerator[UnifiProtectCoordinator]:
+        """Create a protect coordinator without protect client, shut down on teardown.
+
+        See `coordinator` above - same per-test cleanup, this fixture just
+        omits the `protect_client`.
+        """
         network_client = _create_mock_network_client()
-        return UnifiProtectCoordinator(
+        coord = UnifiProtectCoordinator(
             hass=hass,
             network_client=network_client,
             protect_client=None,
             entry=mock_config_entry,
         )
+        yield coord
+        await coord.async_shutdown()
 
     def test_initialization(self, coordinator: UnifiProtectCoordinator):
         """Test coordinator initialization."""
