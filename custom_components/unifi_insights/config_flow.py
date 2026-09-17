@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
+import voluptuous as vol
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -13,6 +15,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -20,7 +23,6 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 from pydantic import ValidationError
-import voluptuous as vol
 
 from .api import (
     ApiKeyAuth,
@@ -38,6 +40,7 @@ from .const import (
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
+    CONF_CONSOLE_NAME,
     CONF_SITE_IDS,
     CONF_TRACK_CLIENTS,
     CONF_TRACK_WIFI_CLIENTS,
@@ -65,6 +68,7 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for UniFi Insights."""
 
     VERSION = 1
+    MINOR_VERSION = 2
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -191,9 +195,45 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         api_key: str,
         *,
         verify_ssl: bool = False,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, str | None, dict[str, str]]:
         """Validate local connection against Network and/or Protect APIs."""
         auth = LocalAuth(api_key=api_key, verify_ssl=verify_ssl)
+        console_info: dict[str, str] = {}
+
+        # 1. Probe Network API
+        async def _probe_network_and_extract(network_client: UniFiNetworkClient) -> ProbeResult:
+            res = await async_probe_network(network_client)
+            if res.status is ProbeStatus.AVAILABLE and res.sites:
+                try:
+                    first_site_id = getattr(res.sites[0], "id", "default")
+                    devices = await network_client.devices.get_all(site_id=first_site_id)
+                    for dev in devices:
+                        dev_type = getattr(dev, "type", "")
+                        if type(dev_type) is str and any(
+                            x in dev_type.lower()
+                            for x in ("udm", "ucg", "uxg", "ugw", "gateway", "uck")
+                        ):
+                            mac = getattr(dev, "mac", None)
+                            if type(mac) is str:
+                                console_info["id"] = mac.lower().replace("-", ":")
+                                console_info["mac"] = console_info["id"]
+                            name = getattr(dev, "name", None)
+                            if type(name) is str:
+                                console_info["name"] = name
+                            break
+                except Exception:
+                    _LOGGER.debug("Could not inspect local network devices", exc_info=True)
+
+                if "id" not in console_info:
+                    site_id = getattr(res.sites[0], "id", None)
+                    if type(site_id) is str and site_id != "default":
+                        console_info["id"] = site_id
+                    else:
+                        console_info["id"] = host.lower()
+                    site_name = getattr(res.sites[0], "name", None)
+                    if type(site_name) is str:
+                        console_info["name"] = site_name
+            return res
 
         network = await async_probe_with_client(
             UniFiNetworkClient(
@@ -202,13 +242,35 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                 connection_type=ConnectionType.LOCAL,
                 timeout=30,
             ),
-            async_probe_network,
+            _probe_network_and_extract,
         )
         if network.status is ProbeStatus.AVAILABLE:
-            return True, None
+            return True, None, console_info
 
-        # Protect-only consoles (e.g. UNVR / UNVR-Instant), including an NVR
-        # with no cameras adopted yet.
+        # 2. Probe Protect API
+        async def _probe_protect_and_extract(protect_client: UniFiProtectClient) -> ProbeResult:
+            res = await async_probe_protect(protect_client)
+            if res.status is ProbeStatus.AVAILABLE:
+                console_info["id"] = host.lower()
+                console_info["name"] = "UniFi Protect"
+                if hasattr(protect_client, "nvr") and hasattr(protect_client.nvr, "get"):
+                    import inspect
+                    nvr_call = protect_client.nvr.get()
+                    if inspect.isawaitable(nvr_call):
+                        try:
+                            nvr = await nvr_call
+                            if nvr:
+                                nvr_mac = getattr(nvr, "mac", None)
+                                if type(nvr_mac) is str:
+                                    console_info["id"] = nvr_mac.lower().replace("-", ":")
+                                    console_info["mac"] = console_info["id"]
+                                nvr_name = getattr(nvr, "name", None) or getattr(nvr, "display_name", None)
+                                if type(nvr_name) is str:
+                                    console_info["name"] = nvr_name
+                        except Exception:
+                            _LOGGER.debug("Could not inspect protect NVR", exc_info=True)
+            return res
+
         protect = await async_probe_with_client(
             UniFiProtectClient(
                 auth=auth,
@@ -216,12 +278,12 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                 connection_type=ConnectionType.LOCAL,
                 timeout=30,
             ),
-            async_probe_protect,
+            _probe_protect_and_extract,
         )
         if protect.status is ProbeStatus.AVAILABLE:
-            return True, None
+            return True, None, console_info
 
-        return False, self._flow_error_for_probes(network, protect)
+        return False, self._flow_error_for_probes(network, protect), console_info
 
     async def _async_validate_remote_console(
         self,
@@ -311,23 +373,34 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                is_valid, error_code = await self._async_validate_local_connection(
+                (
+                    is_valid,
+                    error_code,
+                    console_info,
+                ) = await self._async_validate_local_connection(
                     host=user_input[CONF_HOST],
                     api_key=user_input[CONF_API_KEY],
                     verify_ssl=user_input.get(CONF_VERIFY_SSL, False),
                 )
                 if is_valid:
-                    await self.async_set_unique_id(user_input[CONF_API_KEY])
+                    console_id = console_info.get("id") or user_input[CONF_HOST].lower()
+                    await self.async_set_unique_id(console_id)
                     self._abort_if_unique_id_configured()
+
+                    entry_data: dict[str, Any] = {
+                        CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+                        CONF_HOST: user_input[CONF_HOST],
+                        CONF_API_KEY: user_input[CONF_API_KEY],
+                        CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL, False),
+                    }
+                    if console_info.get("mac"):
+                        entry_data[CONF_CONSOLE_ID] = console_info["mac"]
+                    if console_info.get("name") and console_info.get("mac"):
+                        entry_data[CONF_CONSOLE_NAME] = console_info["name"]
 
                     return self.async_create_entry(
                         title="UniFi Insights (Local)",
-                        data={
-                            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
-                            CONF_HOST: user_input[CONF_HOST],
-                            CONF_API_KEY: user_input[CONF_API_KEY],
-                            CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL, False),
-                        },
+                        data=entry_data,
                     )
 
                 if error_code == "invalid_auth":
@@ -335,6 +408,8 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                 else:
                     errors["base"] = error_code or "cannot_connect"
 
+            except AbortFlow:
+                raise
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
@@ -423,11 +498,19 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     console_id,
                 )
                 if sites_found:
-                    await self.async_set_unique_id(self._remote_api_key)
+                    await self.async_set_unique_id(console_id)
                     self._abort_if_unique_id_configured()
 
+                    label = self._discovered_remote_consoles.get(console_id, "")
+                    console_name = label.rsplit(" (", 1)[0] if " (" in label else label
+                    title = (
+                        f"UniFi - {console_name}"
+                        if console_name and console_name != "Cloud"
+                        else "UniFi Insights (Cloud)"
+                    )
+
                     return self.async_create_entry(
-                        title="UniFi Insights (Cloud)",
+                        title=title,
                         data={
                             CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
                             CONF_CONSOLE_ID: console_id,
@@ -436,6 +519,8 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
 
                 errors[CONF_CONSOLE_ID] = "invalid_console_id"
+            except AbortFlow:
+                raise
             except UniFiAuthenticationError:
                 errors[CONF_CONSOLE_ID] = "invalid_console_id"
             except UniFiConnectionError:
@@ -494,7 +579,11 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 if connection_type == CONNECTION_TYPE_LOCAL:
-                    is_valid, error_code = await self._async_validate_local_connection(
+                    (
+                        is_valid,
+                        error_code,
+                        _,
+                    ) = await self._async_validate_local_connection(
                         host=reauth_entry.data.get(CONF_HOST, DEFAULT_API_HOST),
                         api_key=user_input[CONF_API_KEY],
                         verify_ssl=reauth_entry.data.get(CONF_VERIFY_SSL, False),
@@ -586,23 +675,41 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 if connection_type == CONNECTION_TYPE_LOCAL:
-                    is_valid, error_code = await self._async_validate_local_connection(
+                    (
+                        is_valid,
+                        error_code,
+                        console_info,
+                    ) = await self._async_validate_local_connection(
                         host=user_input[CONF_HOST],
                         api_key=user_input[CONF_API_KEY],
                         verify_ssl=user_input.get(CONF_VERIFY_SSL, False),
                     )
                     if is_valid:
-                        await self.async_set_unique_id(user_input[CONF_API_KEY])
-                        self._abort_if_unique_id_mismatch(reason="account_mismatch")
+                        new_id = console_info.get("id")
+                        current_id = entry.data.get(CONF_CONSOLE_ID) or entry.unique_id
+                        if (
+                            new_id
+                            and current_id
+                            and ":" in new_id
+                            and ":" in current_id
+                            and new_id != current_id
+                        ):
+                            return self.async_abort(reason="account_mismatch")
+
+                        new_data = {
+                            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+                            CONF_HOST: user_input[CONF_HOST],
+                            CONF_API_KEY: user_input[CONF_API_KEY],
+                            CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL, False),
+                        }
+                        if new_id:
+                            new_data[CONF_CONSOLE_ID] = new_id
 
                         return self.async_update_reload_and_abort(
                             entry,
-                            data={
-                                CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
-                                CONF_HOST: user_input[CONF_HOST],
-                                CONF_API_KEY: user_input[CONF_API_KEY],
-                                CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL, False),
-                            },
+                            data=new_data,
+                            unique_id=new_id or entry.unique_id,
+                            reason="reconfigure_successful",
                         )
                     if error_code == "invalid_auth":
                         errors[CONF_API_KEY] = "invalid_auth"
@@ -629,10 +736,15 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                                     console_id,
                                 )
                                 if sites_found:
-                                    await self.async_set_unique_id(api_key)
-                                    self._abort_if_unique_id_mismatch(
-                                        reason="account_mismatch"
-                                    )
+                                    if (
+                                        console_id != entry.data.get(CONF_CONSOLE_ID)
+                                        and entry.unique_id
+                                        != entry.data.get(CONF_API_KEY)
+                                        and entry.unique_id != console_id
+                                    ):
+                                        return self.async_abort(
+                                            reason="account_mismatch"
+                                        )
 
                                     new_data = {
                                         CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
@@ -642,11 +754,15 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                                     return self.async_update_reload_and_abort(
                                         entry,
                                         data=new_data,
+                                        unique_id=console_id,
+                                        reason="reconfigure_successful",
                                     )
                                 errors[CONF_CONSOLE_ID] = "invalid_console_id"
                             except UniFiAuthenticationError:
                                 errors[CONF_CONSOLE_ID] = "invalid_console_id"
 
+            except AbortFlow:
+                raise
             except UniFiAuthenticationError:
                 errors[CONF_API_KEY] = "invalid_auth"
             except UniFiConnectionError:

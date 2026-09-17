@@ -10,6 +10,7 @@ MANUFACTURER: Final = "Ubiquiti Inc."
 # Connection types
 CONF_CONNECTION_TYPE: Final = "connection_type"
 CONF_CONSOLE_ID: Final = "console_id"
+CONF_CONSOLE_NAME: Final = "console_name"
 CONNECTION_TYPE_LOCAL: Final = "local"
 CONNECTION_TYPE_REMOTE: Final = "remote"
 
