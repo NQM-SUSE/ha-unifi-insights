@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - When a site's devices or clients cannot be fetched, the device refresh now fails: entities fed by it (devices, ports, client controls, firmware updates) show as unavailable and keep their last known values until the next successful refresh, instead of silently going stale. A 403 on those endpoints no longer sends the entry into a re-authentication loop.
 - A WiFi or firewall fetch failure no longer blanks those entities while reporting success. Only that site's WiFi or firewall entities become unavailable, keeping their last known values, and the rest of the integration (including Protect, and setup itself) keeps working.
 - One device's statistics timing out or erroring now keeps that device's last known statistics for up to three polls instead of dropping its sensors to unknown, without distorting its port throughput rates.
+- Setup no longer asks you to re-authenticate when the console is only temporarily unavailable, for example while it is still starting after a power cut. If the Network or Protect API times out, drops the connection or answers with a server error (5xx) or rate limit, setup is retried automatically. If one application works while the other keeps failing, setup retries a few times and then loads with the working one instead of silently dropping the other or keeping both offline. A Protect console whose NVR has no cameras yet no longer fails setup when the NVR check itself errors.
+- The configuration flow now reports "Failed to connect" instead of "Unknown error" or "Invalid authentication" when the console answers with a server error or is temporarily unavailable, including while discovering and validating cloud consoles.
 
 ### Changed
 

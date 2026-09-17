@@ -14,6 +14,7 @@ from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiNotFoundError,
+    UniFiResponseError,
     UniFiTimeoutError,
 )
 from custom_components.unifi_insights.api.network.models.site import Site
@@ -1966,3 +1967,244 @@ async def test_async_get_options_flow(
     """Test async_get_options_flow returns options handler."""
     options_flow = UnifiInsightsConfigFlow.async_get_options_flow(mock_config_entry)
     assert isinstance(options_flow, UnifiInsightsOptionsFlow)
+
+
+def _protect_context(*, cameras: object = None, nvr: object = None) -> MagicMock:
+    """Create an async context manager mock for UniFiProtectClient."""
+    client = MagicMock()
+    if isinstance(cameras, Exception):
+        client.cameras.get_all = AsyncMock(side_effect=cameras)
+    else:
+        client.cameras.get_all = AsyncMock(return_value=cameras or [])
+    if isinstance(nvr, Exception):
+        client.nvr.get = AsyncMock(side_effect=nvr)
+    else:
+        client.nvr.get = AsyncMock(return_value=nvr)
+    async_cm = MagicMock()
+    async_cm.__aenter__ = AsyncMock(return_value=client)
+    async_cm.__aexit__ = AsyncMock(return_value=None)
+    return async_cm
+
+
+async def _submit_local_flow(hass: HomeAssistant) -> dict:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL},
+    )
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "test_api_key",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("network", "protect", "expected_errors"),
+    [
+        # A 5xx is temporary, not an unknown error.
+        (
+            {"sites_side_effect": UniFiResponseError("Bad gateway", status_code=502)},
+            {"cameras": UniFiNotFoundError("Not found", status_code=404)},
+            {"base": "cannot_connect"},
+        ),
+        # A temporary Protect failure outranks a Network 401: the key may be
+        # fine on a Protect-only console.
+        (
+            {"sites_side_effect": UniFiAuthenticationError("No", status_code=401)},
+            {"cameras": UniFiTimeoutError("Timed out")},
+            {"base": "cannot_connect"},
+        ),
+        # The empty-camera NVR probe's own server error.
+        (
+            {"sites": []},
+            {"nvr": UniFiResponseError("Unavailable", status_code=503)},
+            {"base": "cannot_connect"},
+        ),
+        # No sites and "NVR not found": api_unsupported, as before.
+        (
+            {"sites": []},
+            {"nvr": ValueError("NVR not found")},
+            {"base": "api_unsupported"},
+        ),
+        # No sites and no NVR record at all: the invalid_auth fallback.
+        (
+            {"sites": []},
+            {"nvr": None},
+            {CONF_API_KEY: "invalid_auth"},
+        ),
+    ],
+    ids=[
+        "network-502",
+        "network-401-protect-timeout",
+        "nvr-503",
+        "nvr-not-found",
+        "no-nvr-record",
+    ],
+)
+async def test_local_flow_classifies_probe_errors(
+    hass: HomeAssistant,
+    network: dict[str, object],
+    protect: dict[str, object],
+    expected_errors: dict[str, str],
+) -> None:
+    """Local validation maps probe results to the right form error."""
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=_make_client_context(**network),
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=_protect_context(**protect),
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+    ):
+        result = await _submit_local_flow(hass)
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == expected_errors
+
+
+async def test_local_flow_camera_free_nvr_creates_entry(hass: HomeAssistant) -> None:
+    """A Protect-only console with an NVR and no cameras can be added."""
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=_make_client_context(
+                sites_side_effect=UniFiResponseError("HTML page", status_code=200)
+            ),
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=_protect_context(nvr=MagicMock(id="nvr1")),
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await _submit_local_flow(hass)
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+
+async def _submit_remote_flow(hass: HomeAssistant) -> dict:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE},
+    )
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={CONF_API_KEY: "test_api_key"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (UniFiResponseError("Bad gateway", status_code=502), "cannot_connect"),
+        (UniFiResponseError("Bad request", status_code=400), "unknown"),
+    ],
+    ids=["502", "400"],
+)
+async def test_remote_discovery_response_error(
+    hass: HomeAssistant, error: Exception, expected: str
+) -> None:
+    """Console discovery reports 5xx as temporary and other errors as unknown."""
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=_make_client_context(get_hosts_side_effect=error),
+        ),
+        patch("custom_components.unifi_insights.config_flow.ApiKeyAuth"),
+    ):
+        result = await _submit_remote_flow(hass)
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": expected}
+
+
+async def test_remote_console_server_error_is_temporary(hass: HomeAssistant) -> None:
+    """A 5xx while validating the selected console is cannot_connect."""
+    discovery_cm = _make_client_context(get_hosts=[_remote_host()])
+    validation_cm = _make_client_context(
+        sites_side_effect=UniFiResponseError("Unavailable", status_code=503)
+    )
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            side_effect=[discovery_cm, validation_cm],
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=_protect_context(
+                cameras=UniFiNotFoundError("Not found", status_code=404)
+            ),
+        ),
+        patch("custom_components.unifi_insights.config_flow.ApiKeyAuth"),
+    ):
+        result = await _submit_remote_flow(hass)
+        assert result["step_id"] == "select_console"
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONSOLE_ID: "console123"},
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+@pytest.mark.parametrize("step", ["reauth", "reconfigure"])
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (UniFiResponseError("Bad gateway", status_code=502), "cannot_connect"),
+        (UniFiResponseError("Bad request", status_code=400), "unknown"),
+    ],
+    ids=["502", "400"],
+)
+async def test_remote_entry_discovery_response_error(
+    hass: HomeAssistant, step: str, error: Exception, expected: str
+) -> None:
+    """Reauth and reconfigure report discovery 5xx as temporary."""
+    remote_entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Cloud)",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
+            CONF_CONSOLE_ID: "console123",
+            CONF_API_KEY: "old_api_key",
+        },
+        unique_id="old_api_key",
+    )
+    remote_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=_make_client_context(get_hosts_side_effect=error),
+        ),
+        patch("custom_components.unifi_insights.config_flow.ApiKeyAuth"),
+    ):
+        if step == "reauth":
+            result = await remote_entry.start_reauth_flow(hass)
+            user_input = {CONF_API_KEY: "new_api_key"}
+        else:
+            result = await remote_entry.start_reconfigure_flow(hass)
+            user_input = {CONF_API_KEY: "old_api_key", CONF_CONSOLE_ID: "console123"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=user_input
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": expected}

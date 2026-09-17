@@ -29,6 +29,7 @@ from .api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiNotFoundError,
+    UniFiResponseError,
     UniFiTimeoutError,
 )
 from .api.network import UniFiNetworkClient
@@ -47,6 +48,14 @@ from .const import (
     DEFAULT_CLIENT_CONTROL,
     DEFAULT_TRACK_CLIENTS,
     DOMAIN,
+)
+from .probe import (
+    ProbeResult,
+    ProbeStatus,
+    async_probe_network,
+    async_probe_protect,
+    async_probe_with_client,
+    is_transient_error,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -143,6 +152,39 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self._extract_remote_console_options(hosts)
 
+    @staticmethod
+    def _flow_error_for_probes(*probes: ProbeResult) -> str:
+        """
+        Pick the form error for a console where no application was usable.
+
+        A temporary failure wins, so a correct key is never reported as
+        invalid while the console is restarting or answering 5xx. Then a
+        rejected key, a response that failed to parse, other unexpected
+        errors, and a 404 or "NVR not found" (api_unsupported). Anything
+        else - no sites, or a web-UI page in place of the API - keeps the
+        historical "invalid_auth": the console commonly answers that way for
+        a key it does not accept.
+        """
+        statuses = {probe.status for probe in probes}
+        if ProbeStatus.UNREACHABLE in statuses:
+            return "cannot_connect"
+        if ProbeStatus.AUTH_FAILED in statuses:
+            return "invalid_auth"
+        errors = [probe.error for probe in probes if probe.status is ProbeStatus.ERROR]
+        if any(isinstance(error, ValidationError) for error in errors):
+            return "site_parse_error"
+        if errors:
+            return "unknown"
+        # 404 from the integration API, or Protect answering without an NVR
+        # record ("NVR not found"), as before this probe refactor.
+        if any(
+            isinstance(probe.error, UniFiNotFoundError)
+            or type(probe.error) is ValueError
+            for probe in probes
+        ):
+            return "api_unsupported"
+        return "invalid_auth"
+
     async def _async_validate_local_connection(
         self,
         host: str,
@@ -152,121 +194,78 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> tuple[bool, str | None]:
         """Validate local connection against Network and/or Protect APIs."""
         auth = LocalAuth(api_key=api_key, verify_ssl=verify_ssl)
-        last_auth_error = False
-        last_conn_error = False
-        last_not_found = False
-        last_parse_error = False
-        last_unknown_error = False
 
-        # Try Network API
-        try:
-            async with UniFiNetworkClient(
+        network = await async_probe_with_client(
+            UniFiNetworkClient(
                 auth=auth,
                 base_url=host,
                 connection_type=ConnectionType.LOCAL,
                 timeout=30,
-            ) as network_client:
-                sites = await network_client.sites.get_all()
-                if sites:
-                    return True, None
-        except UniFiAuthenticationError:
-            last_auth_error = True
-        except UniFiConnectionError, UniFiTimeoutError:
-            last_conn_error = True
-        except UniFiNotFoundError:
-            last_not_found = True
-        except ValidationError:
-            last_parse_error = True
-        except Exception:
-            last_unknown_error = True
-            _LOGGER.debug("Network API validation encountered error", exc_info=True)
+            ),
+            async_probe_network,
+        )
+        if network.status is ProbeStatus.AVAILABLE:
+            return True, None
 
-        # Try Protect API (e.g. UNVR / UNVR-Instant / Protect-only console)
-        try:
-            async with UniFiProtectClient(
+        # Protect-only consoles (e.g. UNVR / UNVR-Instant), including an NVR
+        # with no cameras adopted yet.
+        protect = await async_probe_with_client(
+            UniFiProtectClient(
                 auth=auth,
                 base_url=host,
                 connection_type=ConnectionType.LOCAL,
                 timeout=30,
-            ) as protect_client:
-                cameras = await protect_client.cameras.get_all()
-                if cameras:
-                    return True, None
-                nvr = await protect_client.nvr.get()
-                if nvr:
-                    return True, None
-        except UniFiAuthenticationError:
-            last_auth_error = True
-        except UniFiConnectionError, UniFiTimeoutError:
-            last_conn_error = True
-        except ValidationError:
-            last_parse_error = True
-        except UniFiNotFoundError, ValueError:
-            last_not_found = True
-        except Exception:
-            last_unknown_error = True
-            _LOGGER.debug("Protect API validation encountered error", exc_info=True)
+            ),
+            async_probe_protect,
+        )
+        if protect.status is ProbeStatus.AVAILABLE:
+            return True, None
 
-        # If neither succeeded, determine best error code
-        if last_auth_error:
-            return False, "invalid_auth"
-        if last_parse_error:
-            return False, "site_parse_error"
-        if last_conn_error:
-            return False, "cannot_connect"
-        if last_not_found:
-            return False, "api_unsupported"
-        if last_unknown_error:
-            return False, "unknown"
-        return False, "invalid_auth"
+        return False, self._flow_error_for_probes(network, protect)
 
     async def _async_validate_remote_console(
         self,
         api_key: str,
         console_id: str,
     ) -> bool:
-        """Validate remote connectivity for a specific console host ID."""
+        """
+        Validate remote connectivity for a specific console host ID.
+
+        Returns False when neither application is usable with this key and
+        console. A temporary failure (connection, timeout, 5xx, rate limit)
+        raises UniFiConnectionError so the step reports cannot_connect
+        rather than an invalid console.
+        """
         auth = ApiKeyAuth(api_key=api_key)
 
-        # Try Network API first
-        try:
-            async with UniFiNetworkClient(
+        network = await async_probe_with_client(
+            UniFiNetworkClient(
                 auth=auth,
                 connection_type=ConnectionType.REMOTE,
                 console_id=console_id,
                 timeout=30,
-            ) as network_client:
-                sites = await network_client.sites.get_all()
-                if sites:
-                    return True
-        except UniFiConnectionError, UniFiTimeoutError:
-            raise
-        except Exception:
-            _LOGGER.debug(
-                "Remote Network validation failed, checking Protect API",
-                exc_info=True,
-            )
+            ),
+            async_probe_network,
+        )
+        if network.status is ProbeStatus.AVAILABLE:
+            return True
 
-        # Try Protect API (e.g. UNVR / UNVR-Instant)
-        try:
-            async with UniFiProtectClient(
+        protect = await async_probe_with_client(
+            UniFiProtectClient(
                 auth=auth,
                 connection_type=ConnectionType.REMOTE,
                 console_id=console_id,
                 timeout=30,
-            ) as protect_client:
-                cameras = await protect_client.cameras.get_all()
-                if cameras:
-                    return True
-                nvr = await protect_client.nvr.get()
-                if nvr:
-                    return True
+            ),
+            async_probe_protect,
+        )
+        if protect.status is ProbeStatus.AVAILABLE:
+            return True
 
-        except UniFiConnectionError, UniFiTimeoutError:
-            raise
-        except Exception:
-            _LOGGER.debug("Remote Protect validation failed", exc_info=True)
-
+        for probe in (network, protect):
+            if probe.status is ProbeStatus.UNREACHABLE:
+                msg = f"Remote console temporarily unavailable: {probe.error}"
+                raise UniFiConnectionError(msg) from probe.error
         return False
 
     async def async_step_user(
@@ -385,6 +384,13 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     "The Site Manager API may be unavailable for this account."
                 )
                 errors["base"] = "api_unsupported"
+            except UniFiResponseError as err:
+                if is_transient_error(err):
+                    _LOGGER.warning("UniFi API temporarily unavailable: %s", err)
+                    errors["base"] = "cannot_connect"
+                else:
+                    _LOGGER.exception("Unexpected UniFi API response")
+                    errors["base"] = "unknown"
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
@@ -550,6 +556,13 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     "controller may not expose the Network Integration API."
                 )
                 errors["base"] = "api_unsupported"
+            except UniFiResponseError as err:
+                if is_transient_error(err):
+                    _LOGGER.warning("UniFi API temporarily unavailable: %s", err)
+                    errors["base"] = "cannot_connect"
+                else:
+                    _LOGGER.exception("Unexpected UniFi API response")
+                    errors["base"] = "unknown"
             except ValidationError:
                 _LOGGER.exception("Failed to parse site data during reauth")
                 errors["base"] = "site_parse_error"
@@ -647,6 +660,13 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     "API."
                 )
                 errors["base"] = "api_unsupported"
+            except UniFiResponseError as err:
+                if is_transient_error(err):
+                    _LOGGER.warning("UniFi API temporarily unavailable: %s", err)
+                    errors["base"] = "cannot_connect"
+                else:
+                    _LOGGER.exception("Unexpected UniFi API response")
+                    errors["base"] = "unknown"
             except ValidationError:
                 _LOGGER.exception("Failed to parse site data during reconfiguration")
                 errors["base"] = "site_parse_error"
