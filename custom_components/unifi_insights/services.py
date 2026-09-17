@@ -329,21 +329,38 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             f" (ID: {site_id})" if site_id else "s",
         )
 
-        for coordinator in coordinators:
-            try:
-                # If site_id is specified, only refresh that site
-                if site_id and site_id not in coordinator.data["sites"]:
-                    _LOGGER.debug("Skipping coordinator - site %s not found", site_id)
-                    continue
+        refreshed = 0
+        failures: list[str] = []
 
-                _LOGGER.debug("Requesting coordinator refresh")
-                await coordinator.async_refresh()
+        for coordinator in coordinators:
+            # If site_id is specified, only refresh the console owning it.
+            if site_id and site_id not in coordinator.data["sites"]:
+                _LOGGER.debug("Skipping coordinator - site %s not found", site_id)
+                continue
+
+            refreshed += 1
+            try:
+                # A site is a Network concept, so a site-scoped call has no
+                # reason to spend a Protect round trip.
+                await coordinator.async_refresh_or_raise(
+                    include_protect=site_id is None
+                )
+            except HomeAssistantError as err:
+                # Keep going: one unreachable console must not stop the others
+                # from being refreshed.
+                _LOGGER.error("Error refreshing coordinator data: %s", err)
+                failures.append(str(err))
+            else:
                 _LOGGER.info("Successfully refreshed coordinator data")
 
-            except Exception as err:
-                _LOGGER.exception("Error refreshing coordinator data")
-                msg = f"Error refreshing data: {err}"
-                raise HomeAssistantError(msg) from err
+        if site_id and not refreshed:
+            msg = f"No UniFi Insights console is configured for site '{site_id}'"
+            raise ServiceValidationError(msg)
+
+        if failures:
+            joined = "; ".join(failures)
+            msg = f"Error refreshing data: {joined}"
+            raise HomeAssistantError(msg)
 
     async def async_handle_restart_device(call: ServiceCall) -> None:
         """Handle the restart device service call."""

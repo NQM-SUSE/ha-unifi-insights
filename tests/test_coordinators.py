@@ -4599,6 +4599,140 @@ class TestUnifiFacadeCoordinator:
         facade_coordinator._protect_coordinator.async_refresh.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_async_refresh_or_raise_is_quiet_when_children_succeed(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """A clean refresh raises nothing and still notifies listeners."""
+        listener_calls = 0
+
+        def listener() -> None:
+            nonlocal listener_calls
+            listener_calls += 1
+
+        facade_coordinator.async_add_listener(listener)
+        for child in (
+            facade_coordinator._config_coordinator,
+            facade_coordinator._device_coordinator,
+            facade_coordinator._protect_coordinator,
+        ):
+            child.async_refresh = AsyncMock()
+            child.last_update_success = True
+
+        await facade_coordinator.async_refresh_or_raise()
+
+        assert listener_calls >= 1
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_or_raise_reports_recorded_failure(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """
+        A child that failed is reported even though nothing was raised.
+
+        ``DataUpdateCoordinator.async_refresh()`` swallows the error and only
+        records ``last_update_success`` / ``last_exception``, so awaiting it
+        tells the caller nothing. Without this the service reported success.
+        """
+        for child in (
+            facade_coordinator._config_coordinator,
+            facade_coordinator._device_coordinator,
+            facade_coordinator._protect_coordinator,
+        ):
+            child.async_refresh = AsyncMock()
+            child.last_update_success = True
+
+        facade_coordinator._device_coordinator.last_update_success = False
+        facade_coordinator._device_coordinator.last_exception = OSError("console down")
+
+        with pytest.raises(HomeAssistantError) as err:
+            await facade_coordinator.async_refresh_or_raise()
+
+        assert "devices coordinator" in str(err.value)
+        assert "console down" in str(err.value)
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_or_raise_reports_escaped_exception(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """An exception that escapes a child refresh is reported, not lost."""
+        for child in (
+            facade_coordinator._config_coordinator,
+            facade_coordinator._device_coordinator,
+            facade_coordinator._protect_coordinator,
+        ):
+            child.async_refresh = AsyncMock()
+            child.last_update_success = True
+
+        facade_coordinator._protect_coordinator.async_refresh = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+
+        with pytest.raises(HomeAssistantError) as err:
+            await facade_coordinator.async_refresh_or_raise()
+
+        assert "protect coordinator" in str(err.value)
+        assert "boom" in str(err.value)
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_or_raise_propagates_cancellation(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Cancellation is teardown, not a console failure - it must propagate.
+
+        ``CancelledError`` is a ``BaseException``; an ``isinstance(x, Exception)``
+        check would miss it and report the refresh as a success.
+        """
+        for child in (
+            facade_coordinator._config_coordinator,
+            facade_coordinator._device_coordinator,
+            facade_coordinator._protect_coordinator,
+        ):
+            child.async_refresh = AsyncMock()
+            child.last_update_success = True
+
+        facade_coordinator._device_coordinator.async_refresh = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await facade_coordinator.async_refresh_or_raise()
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_or_raise_can_skip_protect(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """A site-scoped refresh is a Network concern and skips Protect."""
+        for child in (
+            facade_coordinator._config_coordinator,
+            facade_coordinator._device_coordinator,
+            facade_coordinator._protect_coordinator,
+        ):
+            child.async_refresh = AsyncMock()
+            child.last_update_success = True
+
+        await facade_coordinator.async_refresh_or_raise(include_protect=False)
+
+        facade_coordinator._config_coordinator.async_refresh.assert_called_once()
+        facade_coordinator._device_coordinator.async_refresh.assert_called_once()
+        facade_coordinator._protect_coordinator.async_refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_or_raise_without_protect_console(
+        self, facade_coordinator_no_protect: UnifiFacadeCoordinator
+    ):
+        """A Network-only console refreshes cleanly with no Protect child."""
+        for child in (
+            facade_coordinator_no_protect._config_coordinator,
+            facade_coordinator_no_protect._device_coordinator,
+        ):
+            child.async_refresh = AsyncMock()
+            child.last_update_success = True
+
+        await facade_coordinator_no_protect.async_refresh_or_raise()
+
+        facade_coordinator_no_protect._config_coordinator.async_refresh.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_async_request_refresh_no_protect(
         self, facade_coordinator_no_protect: UnifiFacadeCoordinator
     ):
