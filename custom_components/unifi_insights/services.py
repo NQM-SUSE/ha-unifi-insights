@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
-import voluptuous as vol
 
 from .const import (
     CHIME_RINGTONE_CHRISTMAS,
@@ -57,8 +57,20 @@ _LOGGER = logging.getLogger(__name__)
 
 def _get_coordinators(hass: HomeAssistant) -> list[Any]:
     """Get all UniFi Insights coordinators from config entries."""
+    return [coordinator for _, coordinator in _get_titled_coordinators(hass)]
+
+
+def _get_titled_coordinators(hass: HomeAssistant) -> list[tuple[str, Any]]:
+    """
+    Get every coordinator paired with its console's config entry title.
+
+    ``refresh_data`` attempts every configured console and reports the
+    failures together, so the message has to name the console that failed -
+    with two consoles configured, "devices coordinator: timeout" on its own
+    does not tell the user which one to go and look at.
+    """
     return [
-        entry.runtime_data.coordinator
+        (entry.title, entry.runtime_data.coordinator)
         for entry in hass.config_entries.async_entries(DOMAIN)
         if hasattr(entry, "runtime_data") and entry.runtime_data
     ]
@@ -329,21 +341,41 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             f" (ID: {site_id})" if site_id else "s",
         )
 
-        for coordinator in coordinators:
-            try:
-                # If site_id is specified, only refresh that site
-                if site_id and site_id not in coordinator.data["sites"]:
-                    _LOGGER.debug("Skipping coordinator - site %s not found", site_id)
-                    continue
+        refreshed = 0
+        failures: list[str] = []
 
-                _LOGGER.debug("Requesting coordinator refresh")
-                await coordinator.async_refresh()
+        for title, coordinator in _get_titled_coordinators(hass):
+            # If site_id is specified, only refresh the console owning it.
+            sites = (coordinator.data or {}).get("sites") or {}
+            if site_id and site_id not in sites:
+                _LOGGER.debug("Skipping coordinator - site %s not found", site_id)
+                continue
+
+            refreshed += 1
+            try:
+                # A site is a Network concept, so a site-scoped call has no
+                # reason to spend a Protect round trip.
+                await coordinator.async_refresh_or_raise(
+                    include_protect=site_id is None
+                )
+            except HomeAssistantError as err:
+                # Keep going: one unreachable console must not stop the others
+                # from being refreshed. Logged at debug because every failure
+                # is re-raised to the caller below, which Home Assistant
+                # already logs - an error line here would just duplicate it.
+                _LOGGER.debug("Error refreshing %s: %s", title, err)
+                failures.append(f"{title}: {err}")
+            else:
                 _LOGGER.info("Successfully refreshed coordinator data")
 
-            except Exception as err:
-                _LOGGER.exception("Error refreshing coordinator data")
-                msg = f"Error refreshing data: {err}"
-                raise HomeAssistantError(msg) from err
+        if site_id and not refreshed:
+            msg = f"No UniFi Insights console is configured for site '{site_id}'"
+            raise ServiceValidationError(msg)
+
+        if failures:
+            # Each failure already carries its own "Error refreshing ..."
+            # sentence from the facade, so do not prefix a second one.
+            raise HomeAssistantError("; ".join(failures))
 
     async def async_handle_restart_device(call: ServiceCall) -> None:
         """Handle the restart device service call."""

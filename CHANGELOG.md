@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - One device's statistics timing out or erroring now keeps that device's last known statistics for up to three polls instead of dropping its sensors to unknown, without distorting its port throughput rates.
 - Setup no longer asks you to re-authenticate when the console is only temporarily unavailable, for example while it is still starting after a power cut. If the Network or Protect API times out, drops the connection or answers with a server error (5xx) or rate limit, setup is retried automatically. If one application works while the other keeps failing, setup retries a few times and then loads with the working one instead of silently dropping the other or keeping both offline. A Protect console whose NVR has no cameras yet no longer fails setup when the NVR check itself errors.
 - The configuration flow now reports "Failed to connect" instead of "Unknown error" or "Invalid authentication" when the console answers with a server error or is temporarily unavailable, including while discovering and validating cloud consoles.
+- The `refresh_data` action now actually fetches from the consoles. It called the facade coordinator's own `async_refresh()`, which only re-aggregates data already in memory, so the action re-published the same values and reported success without a single API request.
+- `refresh_data` reports failures instead of swallowing them. A coordinator refresh records the problem as `last_update_success` and returns normally rather than raising, so a refresh against an unreachable console was logged and reported as a success.
+- One unreachable console no longer stops the others from being refreshed; every console is attempted and the failures are reported together.
+- A `site_id` that no configured console owns is now reported as a validation error instead of quietly answering "refreshed".
 
 ### Changed
 

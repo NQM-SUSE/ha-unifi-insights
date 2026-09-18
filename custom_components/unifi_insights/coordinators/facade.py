@@ -275,17 +275,59 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         never called ``async_update_listeners()`` at all, which was the
         second half of the original defect.
         """
-        refresh_tasks = [
-            self._config_coordinator.async_refresh(),
-            self._device_coordinator.async_refresh(),
+        await self._async_refresh_children()
+
+    async def _async_refresh_children(
+        self, *, include_protect: bool = True
+    ) -> list[str]:
+        """
+        Refresh the sub-coordinators concurrently and report what failed.
+
+        ``DataUpdateCoordinator.async_refresh()`` does not raise: it records
+        the problem as ``last_update_success = False`` plus ``last_exception``
+        and returns normally. A caller that only awaits it therefore cannot
+        tell a successful refresh from a failed one, so both that recorded
+        state and any exception that escaped ``gather`` are collected here and
+        returned as human-readable strings, newest data aggregated either way.
+        """
+        targets: list[tuple[str, DataUpdateCoordinator[Any]]] = [
+            ("config", self._config_coordinator),
+            ("devices", self._device_coordinator),
         ]
-        if self._protect_coordinator:
-            refresh_tasks.append(self._protect_coordinator.async_refresh())
-        await asyncio.gather(*refresh_tasks)
+        if include_protect and self._protect_coordinator:
+            targets.append(("protect", self._protect_coordinator))
+
+        results = await asyncio.gather(
+            *(coordinator.async_refresh() for _, coordinator in targets),
+            return_exceptions=True,
+        )
+
+        failures: list[str] = []
+        for (name, coordinator), result in zip(targets, results, strict=True):
+            if isinstance(result, BaseException):
+                # CancelledError is a BaseException and means this task is
+                # being torn down, not that the console misbehaved.
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                failures.append(f"{name} coordinator: {result}")
+            elif not coordinator.last_update_success:
+                error = coordinator.last_exception
+                failures.append(
+                    f"{name} coordinator: {error}" if error else f"{name} coordinator"
+                )
 
         # Aggregate the updated data and notify this facade's own listeners.
         self._aggregate_data()
         self.async_update_listeners()
+        return failures
+
+    async def async_refresh_or_raise(self, *, include_protect: bool = True) -> None:
+        """Refresh the sub-coordinators, raising if any of them failed."""
+        failures = await self._async_refresh_children(include_protect=include_protect)
+        if failures:
+            joined = ", ".join(failures)
+            msg = f"Error refreshing UniFi Insights data: {joined}"
+            raise HomeAssistantError(msg)
 
     def _require_protect_client(self) -> UniFiProtectClient:
         """Return the Protect client or raise a user-facing error."""
