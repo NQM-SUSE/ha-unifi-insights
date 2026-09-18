@@ -18,8 +18,6 @@ restart_device:
   name: Restart Device
   description: Restart a UniFi device.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
@@ -41,8 +39,6 @@ set_recording_mode:
   name: Set Recording Mode
   description: Set the recording mode for a UniFi Protect camera.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: camera
@@ -68,8 +64,6 @@ set_hdr_mode:
   name: Set HDR Mode
   description: Set the HDR mode for a UniFi Protect camera.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: camera
@@ -95,8 +89,6 @@ set_video_mode:
   name: Set Video Mode
   description: Set the video mode (FPS) for a UniFi Protect camera.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: camera
@@ -122,8 +114,6 @@ set_mic_volume:
   name: Set Microphone Volume
   description: Set the microphone volume level for a UniFi Protect camera.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: camera
@@ -148,8 +138,6 @@ ptz_move:
   name: PTZ Move
   description: Move a PTZ camera in a given direction.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: camera
@@ -177,8 +165,6 @@ ptz_patrol:
   name: PTZ Patrol
   description: Control the patrol function on a PTZ camera.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: camera
@@ -213,8 +199,6 @@ set_light_mode:
   name: Set Light Mode
   description: Set the lighting mode for a UniFi Protect light.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: light
@@ -240,8 +224,6 @@ set_light_level:
   name: Set Light Level
   description: Set the brightness level for a UniFi Protect light.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
       domain: light
@@ -267,8 +249,6 @@ set_chime_volume:
   name: Set Chime Volume
   description: Set the volume level for a UniFi Protect chime.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
@@ -305,8 +285,6 @@ play_chime_ringtone:
   name: Play Chime Ringtone
   description: Play a ringtone on a UniFi Protect chime.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
@@ -338,8 +316,6 @@ set_chime_ringtone:
   name: Set Chime Ringtone
   description: Set the ringtone for a UniFi Protect chime.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
@@ -381,8 +357,6 @@ set_chime_repeat_times:
   name: Set Chime Repeat Times
   description: Set the number of times a chime repeats when triggered.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
@@ -420,8 +394,6 @@ authorize_guest:
   name: Authorize Guest
   description: Authorize guest access for a client on the UniFi Network.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
@@ -603,8 +575,6 @@ set_liveview:
   name: Set Live View
   description: Set the active live view for a viewer.
   target:
-    device:
-      integration: unifi_insights
     entity:
       integration: unifi_insights
   fields:
