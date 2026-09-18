@@ -299,6 +299,61 @@ class TestRefreshDataService:
 
         await async_unload_services(hass)
 
+    async def test_refresh_data_one_console_down_still_refreshes_the_others(
+        self, hass: HomeAssistant
+    ):
+        """One unreachable console must not stop the others being refreshed."""
+        broken = MagicMock()
+        broken.data = {"sites": {"site1": {}}}
+        broken.async_refresh_or_raise = AsyncMock(
+            side_effect=HomeAssistantError(
+                "Error refreshing UniFi Insights data: devices coordinator: timeout"
+            )
+        )
+        broken_entry = MagicMock()
+        broken_entry.title = "Upstairs console"
+        broken_entry.runtime_data = MagicMock()
+        broken_entry.runtime_data.coordinator = broken
+
+        healthy = MagicMock()
+        healthy.data = {"sites": {"site2": {}}}
+        healthy.async_refresh_or_raise = AsyncMock()
+        healthy_entry = MagicMock()
+        healthy_entry.title = "Garage console"
+        healthy_entry.runtime_data = MagicMock()
+        healthy_entry.runtime_data.coordinator = healthy
+
+        await async_setup_services(hass)
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[broken_entry, healthy_entry],
+            ),
+            pytest.raises(HomeAssistantError) as raised,
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_REFRESH_DATA,
+                {},
+                blocking=True,
+            )
+
+        # The healthy console was still attempted after the broken one failed.
+        broken.async_refresh_or_raise.assert_called_once_with(include_protect=True)
+        healthy.async_refresh_or_raise.assert_called_once_with(include_protect=True)
+
+        message = str(raised.value)
+        # The message names the console that failed, and does not double up
+        # the "Error refreshing ..." prefix the facade already supplies.
+        assert "Upstairs console" in message
+        assert "timeout" in message
+        assert "Garage console" not in message
+        assert message.count("Error refreshing") == 1
+
+        await async_unload_services(hass)
+
 
 class TestRestartDeviceService:
     """Tests for restart_device service handler."""
@@ -834,10 +889,15 @@ class TestServiceErrorHandling:
         """Test refresh_data with coordinator error."""
         mock_coordinator = MagicMock()
         mock_coordinator.data = {"sites": {"default": {}}}
+        # The facade always supplies its own "Error refreshing ..." sentence,
+        # so mirror that here rather than a bare message the code never sees.
         mock_coordinator.async_refresh_or_raise = AsyncMock(
-            side_effect=HomeAssistantError("Refresh failed")
+            side_effect=HomeAssistantError(
+                "Error refreshing UniFi Insights data: devices coordinator: boom"
+            )
         )
         mock_entry = MagicMock()
+        mock_entry.title = "UniFi Insights"
         mock_entry.runtime_data = MagicMock()
         mock_entry.runtime_data.coordinator = mock_coordinator
 
@@ -849,7 +909,7 @@ class TestServiceErrorHandling:
                 "async_entries",
                 return_value=[mock_entry],
             ),
-            pytest.raises(HomeAssistantError, match="Error refreshing"),
+            pytest.raises(HomeAssistantError, match="UniFi Insights: Error refreshing"),
         ):
             await hass.services.async_call(
                 DOMAIN,

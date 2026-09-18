@@ -57,8 +57,20 @@ _LOGGER = logging.getLogger(__name__)
 
 def _get_coordinators(hass: HomeAssistant) -> list[Any]:
     """Get all UniFi Insights coordinators from config entries."""
+    return [coordinator for _, coordinator in _get_titled_coordinators(hass)]
+
+
+def _get_titled_coordinators(hass: HomeAssistant) -> list[tuple[str, Any]]:
+    """
+    Get every coordinator paired with its console's config entry title.
+
+    ``refresh_data`` attempts every configured console and reports the
+    failures together, so the message has to name the console that failed -
+    with two consoles configured, "devices coordinator: timeout" on its own
+    does not tell the user which one to go and look at.
+    """
     return [
-        entry.runtime_data.coordinator
+        (entry.title, entry.runtime_data.coordinator)
         for entry in hass.config_entries.async_entries(DOMAIN)
         if hasattr(entry, "runtime_data") and entry.runtime_data
     ]
@@ -332,9 +344,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         refreshed = 0
         failures: list[str] = []
 
-        for coordinator in coordinators:
+        for title, coordinator in _get_titled_coordinators(hass):
             # If site_id is specified, only refresh the console owning it.
-            if site_id and site_id not in coordinator.data["sites"]:
+            sites = (coordinator.data or {}).get("sites", {})
+            if site_id and site_id not in sites:
                 _LOGGER.debug("Skipping coordinator - site %s not found", site_id)
                 continue
 
@@ -347,9 +360,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 )
             except HomeAssistantError as err:
                 # Keep going: one unreachable console must not stop the others
-                # from being refreshed.
-                _LOGGER.error("Error refreshing coordinator data: %s", err)
-                failures.append(str(err))
+                # from being refreshed. Logged at debug because every failure
+                # is re-raised to the caller below, which Home Assistant
+                # already logs - an error line here would just duplicate it.
+                _LOGGER.debug("Error refreshing %s: %s", title, err)
+                failures.append(f"{title}: {err}")
             else:
                 _LOGGER.info("Successfully refreshed coordinator data")
 
@@ -358,9 +373,9 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(msg)
 
         if failures:
-            joined = "; ".join(failures)
-            msg = f"Error refreshing data: {joined}"
-            raise HomeAssistantError(msg)
+            # Each failure already carries its own "Error refreshing ..."
+            # sentence from the facade, so do not prefix a second one.
+            raise HomeAssistantError("; ".join(failures))
 
     async def async_handle_restart_device(call: ServiceCall) -> None:
         """Handle the restart device service call."""
