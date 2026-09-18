@@ -1126,6 +1126,193 @@ class TestUnifiDeviceCoordinator:
         assert coordinator._available is True
 
     @pytest.mark.asyncio
+    async def test_process_site_5xx_fallback_with_client_retry(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """v1 devices 5xx falls back to legacy devices and retries clients.
+
+        Regression test: the v1 devices endpoint returns 500 (USW Pro XG
+        family), the site has a legacy name, and the first clients.get_all()
+        call fails. The legacy device becomes the primary device, the retried
+        client appears, and clients.get_all is awaited twice.
+        """
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Switch",
+                    "model": "USW-24",
+                    "type": "usw",
+                    "ip": "192.168.1.10",
+                    "up": True,
+                    "port_table": [
+                        {
+                            "port_idx": 1,
+                            "up": True,
+                            "speed": 1000,
+                            "name": "Port 1",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        clients_call_count = 0
+
+        async def clients_side_effect(site_id):
+            nonlocal clients_call_count
+            clients_call_count += 1
+            if clients_call_count == 1:
+                raise UniFiResponseError("Service Unavailable", status_code=503)
+            return [
+                _create_mock_model(
+                    {"id": "client1", "name": "Retried Client", "type": "WIRED"}
+                )
+            ]
+
+        coordinator.network_client.clients.get_all = AsyncMock(
+            side_effect=clients_side_effect
+        )
+
+        devices_dict, stats_dict, clients_dict = await coordinator._process_site(
+            "default", legacy_site_name="default"
+        )
+
+        # The legacy device is keyed by its controller id (mapped from _id),
+        # consistent with the v1 keying: devices without an id fall back to
+        # their MAC, but this legacy device has an _id.
+        assert "60a1b2c3d4e5f67890123456" in devices_dict
+        assert "AA:BB:CC:DD:EE:FF" not in devices_dict
+        legacy_device = devices_dict["60a1b2c3d4e5f67890123456"]
+        assert legacy_device["name"] == "Legacy Switch"
+        assert legacy_device["macAddress"] == "AA:BB:CC:DD:EE:FF"
+        # port_table is normalized into the v1-shaped ports list
+        assert legacy_device["ports"][0]["idx"] == 1
+
+        # The retried client appears, keyed by client id
+        assert "client1" in clients_dict
+        assert clients_dict["client1"]["name"] == "Retried Client"
+
+        assert clients_call_count == 2
+        assert coordinator.network_client.clients.get_all.await_count == 2
+
+        # The per-device statistics endpoint still works in fallback mode:
+        # the 5xx was on the v1 devices list endpoint only.
+        assert stats_dict["60a1b2c3d4e5f67890123456"]["id"] == (
+            "60a1b2c3d4e5f67890123456"
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_site_5xx_fallback_legacy_failure_raises(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """When v1 5xx and the legacy fetch both fail, the v1 error propagates."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            side_effect=UniFiConnectionError("Connection refused")
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+    @pytest.mark.asyncio
+    async def test_process_site_5xx_with_empty_legacy_raises(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A v1 5xx with an empty legacy response fails instead of wiping devices."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[]
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+        # The refresh keeps the previous snapshot instead of writing an
+        # empty device map (same contract as any other site failure).
+        previous = copy.deepcopy(coordinator.data["devices"])
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        assert coordinator.data["devices"] == previous
+
+    @pytest.mark.asyncio
+    async def test_process_site_5xx_without_legacy_site_raises(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A v1 5xx without a legacy site name cannot fall back and raises."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default")
+
+    @pytest.mark.asyncio
+    async def test_process_site_4xx_does_not_fall_back(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Only 5xx triggers the legacy fallback; a 4xx error propagates."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Forbidden", status_code=403)
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+        coordinator.network_client.devices.get_legacy_site_devices.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_site_clients_4xx_raises_without_fallback(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A clients failure with healthy v1 devices propagates (no fallback)."""
+        coordinator.network_client.clients.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Service Unavailable", status_code=503)
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+        coordinator.network_client.clients.get_all.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_uses_legacy_devices_on_v1_5xx(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """End-to-end: a v1 devices 5xx refresh succeeds via legacy devices."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Switch",
+                    "model": "USW-24",
+                    "type": "usw",
+                    "up": True,
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert "60a1b2c3d4e5f67890123456" in result["devices"]["default"]
+        assert result["devices"]["default"]["60a1b2c3d4e5f67890123456"]["name"] == (
+            "Legacy Switch"
+        )
+        assert coordinator._available is True
+
+    @pytest.mark.asyncio
     async def test_async_update_data_merges_legacy_temperature(
         self, coordinator: UnifiDeviceCoordinator
     ):

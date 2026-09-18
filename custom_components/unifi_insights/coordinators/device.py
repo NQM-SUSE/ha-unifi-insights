@@ -100,6 +100,141 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         return value.strip().lower()
 
     @staticmethod
+    def _normalize_legacy_port(port: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        Normalize a single legacy port_table entry into a v1-shaped port dict.
+
+        Shared by ``_legacy_device_to_v1_dict()`` and
+        ``_merge_legacy_port_data()`` so the legacy-primary fallback and the
+        merge path produce identical port data, including network_name, SFP
+        fields, PoE and byte stats.
+        """
+        port_idx = port.get("port_idx")
+        if port_idx is None:
+            return None
+
+        normalized: dict[str, Any] = {
+            "idx": port_idx,
+            "port_idx": port_idx,
+            "state": "UP" if port.get("up") else "DOWN",
+            "enabled": port.get("enable", True),
+            "speedMbps": port.get("speed"),
+            "speed": port.get("speed"),
+        }
+
+        # Port type identification fields
+        media = port.get("media")
+        if media:
+            normalized["media"] = media
+
+        is_uplink = port.get("is_uplink")
+        if is_uplink is not None:
+            normalized["is_uplink"] = is_uplink
+
+        port_name = port.get("name")
+        if port_name:
+            normalized["name"] = port_name
+
+        ifname = port.get("ifname")
+        if ifname:
+            normalized["ifname"] = ifname
+
+        network_name = port.get("network_name")
+        if network_name:
+            normalized["network_name"] = network_name
+
+        # SFP module data
+        sfp_found = port.get("sfp_found")
+        if sfp_found is not None:
+            normalized["sfp_found"] = sfp_found
+
+        for sfp_key in (
+            "sfp_part",
+            "sfp_vendor",
+            "sfp_serial",
+            "sfp_compliance",
+        ):
+            sfp_val = port.get(sfp_key)
+            if sfp_val is not None:
+                normalized[sfp_key] = sfp_val
+
+        # PoE data — only for ports with PoE hardware (port_poe flag)
+        poe_capable = port.get("port_poe", False)
+        if poe_capable:
+            poe_enabled = port.get("poe_enable", False)
+            poe_power = port.get("poe_power") or port.get("poePower")
+            poe_good = port.get("poe_good", False)
+            normalized["poe"] = {
+                "enabled": bool(poe_enabled),
+                "power": poe_power,
+                "good": bool(poe_good),
+            }
+
+        # TX/RX bytes
+        normalized["stats"] = {
+            "txBytes": port.get("tx_bytes", 0),
+            "rxBytes": port.get("rx_bytes", 0),
+        }
+
+        return normalized
+
+    @classmethod
+    def _legacy_device_to_v1_dict(cls, legacy: dict[str, Any]) -> dict[str, Any]:
+        """
+        Map a legacy ``/stat/device`` dict to a v1-shaped device dict.
+
+        The v1 Device model uses ``id`` and camelCase aliases; the legacy
+        endpoint returns ``_id`` and snake_case. Only the fields the
+        downstream pipeline actually reads are mapped; everything else is
+        preserved as-is. A legacy device without an ``_id`` follows the same
+        fallback as the v1 model and is keyed on its MAC, so
+        ``device_id_is_mac()`` correctly skips id-addressed endpoints for it.
+        """
+        mapped: dict[str, Any] = dict(legacy)
+
+        # Ensure macAddress is populated from mac for the merge helpers
+        mac = legacy.get("mac")
+        if mac and "macAddress" not in mapped:
+            mapped["macAddress"] = mac
+
+        # _id → id (the Device model requires ``id``); fall back to MAC
+        legacy_id = legacy.get("_id")
+        if legacy_id and "id" not in mapped:
+            mapped["id"] = legacy_id
+        if "id" not in mapped and mac:
+            mapped["id"] = mac
+
+        # Map common snake_case legacy fields to camelCase v1 aliases
+        field_map = {
+            "fw_version": "firmwareVersion",
+            "last_seen": "lastSeen",
+            "site_id": "siteId",
+            "tx_bytes": "txBytes",
+            "rx_bytes": "rxBytes",
+            "uplink_table": "uplinkTable",
+        }
+        for legacy_key, v1_key in field_map.items():
+            if legacy_key in legacy and v1_key not in mapped:
+                mapped[v1_key] = legacy[legacy_key]
+
+        # Normalize port_table into ports for the sensor pipeline.
+        # The sensor pipeline reads device_data["ports"] and falls back to
+        # interfaces["ports"]; it does not consume port_table directly.
+        port_table = legacy.get("port_table")
+        if isinstance(port_table, list) and port_table and "ports" not in mapped:
+            ports: list[dict[str, Any]] = []
+            for port in port_table:
+                if not isinstance(port, dict):
+                    continue
+                normalized = cls._normalize_legacy_port(port)
+                if normalized is not None:
+                    ports.append(normalized)
+            if ports:
+                mapped["ports"] = ports
+
+        return mapped
+
+    @staticmethod
     def _has_legacy_temperature_data(legacy_device: dict[str, Any]) -> bool:
         """Return True when legacy device data contains usable temperature info."""
         general_temperature = legacy_device.get("general_temperature")
@@ -179,74 +314,11 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         for port in port_table:
             if not isinstance(port, dict):
                 continue
-            port_idx = port.get("port_idx")
-            if port_idx is None:
-                continue
-
-            normalized: dict[str, Any] = {
-                "idx": port_idx,
-                "port_idx": port_idx,
-                "state": "UP" if port.get("up") else "DOWN",
-                "enabled": port.get("enable", True),
-                "speedMbps": port.get("speed"),
-                "speed": port.get("speed"),
-            }
-
-            # Port type identification fields
-            media = port.get("media")
-            if media:
-                normalized["media"] = media
-
-            is_uplink = port.get("is_uplink")
-            if is_uplink is not None:
-                normalized["is_uplink"] = is_uplink
-
-            port_name = port.get("name")
-            if port_name:
-                normalized["name"] = port_name
-
-            ifname = port.get("ifname")
-            if ifname:
-                normalized["ifname"] = ifname
-
-            network_name = port.get("network_name")
-            if network_name:
-                normalized["network_name"] = network_name
-
-            # SFP module data
-            sfp_found = port.get("sfp_found")
-            if sfp_found is not None:
-                normalized["sfp_found"] = sfp_found
-
-            for sfp_key in (
-                "sfp_part",
-                "sfp_vendor",
-                "sfp_serial",
-                "sfp_compliance",
-            ):
-                sfp_val = port.get(sfp_key)
-                if sfp_val is not None:
-                    normalized[sfp_key] = sfp_val
-
-            # PoE data — only for ports with PoE hardware (port_poe flag)
-            poe_capable = port.get("port_poe", False)
-            if poe_capable:
-                poe_enabled = port.get("poe_enable", False)
-                poe_power = port.get("poe_power") or port.get("poePower")
-                poe_good = port.get("poe_good", False)
-                normalized["poe"] = {
-                    "enabled": bool(poe_enabled),
-                    "power": poe_power,
-                    "good": bool(poe_good),
-                }
-
-            # TX/RX bytes
-            normalized["stats"] = {
-                "txBytes": port.get("tx_bytes", 0),
-                "rxBytes": port.get("rx_bytes", 0),
-            }
-
-            ports.append(normalized)
+            # Reuse the shared normalizer so the merge path produces
+            # identical port data to the legacy-primary fallback path.
+            normalized = cls._normalize_legacy_port(port)
+            if normalized is not None:
+                ports.append(normalized)
 
         if ports:
             device_dict["ports"] = ports
@@ -492,15 +564,63 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
         Errors propagate: a site whose devices or clients cannot be fetched
         fails the whole refresh (see ``_async_update_data``).
+
+        The v1 devices endpoint can return HTTP 500 on controllers with device
+        models the API cannot serialize (e.g. USW Pro XG family). When that
+        happens and the site's legacy (classic) name is known, fall back to
+        the legacy ``/stat/device`` endpoint, which serves every device, and
+        map its payload into v1-shaped dicts so downstream code is unchanged.
         """
-        # Get devices and clients in parallel using new API
+        # Get devices and clients in parallel using new API. Results are
+        # inspected individually so a clients.get_all() failure cannot trigger
+        # the device fallback when devices.get_all() succeeded.
         devices_task = self.network_client.devices.get_all(site_id)
         clients_task = self.network_client.clients.get_all(site_id)
-        devices_models, clients_models = await asyncio.gather(
-            devices_task, clients_task
+
+        devices_result, clients_result = await asyncio.gather(
+            devices_task, clients_task, return_exceptions=True
         )
 
+        v1_devices_error: UniFiResponseError | None = None
+        devices_models: list[Any] = []
+        clients_models: list[Any] = []
+
+        if isinstance(devices_result, BaseException):
+            if (
+                isinstance(devices_result, UniFiResponseError)
+                and devices_result.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
+                and legacy_site_name is not None
+            ):
+                _LOGGER.warning(
+                    "Device coordinator: v1 devices endpoint returned %s for "
+                    "site %s; falling back to legacy /stat/device",
+                    devices_result.status_code,
+                    site_id,
+                )
+                v1_devices_error = devices_result
+            else:
+                raise devices_result
+        else:
+            devices_models = devices_result
+
+        if isinstance(clients_result, BaseException):
+            if v1_devices_error is None:
+                raise clients_result
+            # The clients endpoint is independent of the devices endpoint, so
+            # its 5xx is likely transient: retry once. A failed retry
+            # propagates and fails the whole refresh, keeping the previous
+            # site data instead of writing empty client data.
+            _LOGGER.debug(
+                "Device coordinator: Clients fetch also failed for site %s "
+                "after v1 devices failure; retrying clients",
+                site_id,
+            )
+            clients_models = await self.network_client.clients.get_all(site_id)
+        else:
+            clients_models = clients_result
+
         legacy_devices: list[dict[str, Any]] = []
+        legacy_as_primary = False
         if legacy_site_name is not None:
             try:
                 legacy_devices = (
@@ -516,9 +636,36 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                     legacy_site_name,
                     err,
                 )
+                if v1_devices_error is not None:
+                    # Both v1 and legacy failed. Re-raise the v1 error so the
+                    # refresh fails and the previous device state is kept,
+                    # rather than wiping the device registry with empty data.
+                    raise v1_devices_error from err
 
-        # Convert model objects to dictionaries
-        devices = [self._model_to_dict(d) for d in devices_models]
+        # When v1 devices failed with 5xx, use legacy devices as the primary
+        # device list, mapped to v1-shaped dicts.
+        if v1_devices_error is not None:
+            if not legacy_devices:
+                # The legacy endpoint served nothing useful. It cannot be
+                # distinguished from an empty site, so fail the refresh and
+                # keep the previous device state rather than wiping it.
+                raise v1_devices_error
+            devices = [
+                self._legacy_device_to_v1_dict(legacy_device)
+                for legacy_device in legacy_devices
+                if isinstance(legacy_device, dict)
+            ]
+            legacy_as_primary = True
+            _LOGGER.info(
+                "Device coordinator: Using %d legacy devices as primary "
+                "source for site %s (v1 endpoint unavailable)",
+                len(devices),
+                site_id,
+            )
+        else:
+            # Convert model objects to dictionaries
+            devices = [self._model_to_dict(d) for d in devices_models]
+
         clients = [self._model_to_dict(c) for c in clients_models]
 
         legacy_devices_by_mac = {
@@ -533,7 +680,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             is not None
         }
 
-        if legacy_devices_by_mac:
+        if legacy_devices_by_mac and not legacy_as_primary:
             for device in devices:
                 self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
                 self._merge_legacy_port_data(device, legacy_devices_by_mac)
