@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
-import voluptuous as vol
 
 from .const import (
     CHIME_RINGTONE_CHRISTMAS,
@@ -346,7 +346,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         for title, coordinator in _get_titled_coordinators(hass):
             # If site_id is specified, only refresh the console owning it.
-            sites = (coordinator.data or {}).get("sites", {})
+            sites = (coordinator.data or {}).get("sites") or {}
             if site_id and site_id not in sites:
                 _LOGGER.debug("Skipping coordinator - site %s not found", site_id)
                 continue

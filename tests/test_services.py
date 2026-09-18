@@ -3,8 +3,8 @@
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 import pytest
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -296,6 +296,45 @@ class TestRefreshDataService:
 
         # Coordinator should NOT be refreshed since site2 wasn't found
         mock_coordinator.async_refresh_or_raise.assert_not_called()
+
+        await async_unload_services(hass)
+
+    async def test_refresh_data_skips_none_sites_and_refreshes_matching_console(
+        self, hass: HomeAssistant
+    ):
+        """A console with no sites must not block a later matching console."""
+        unavailable = MagicMock()
+        unavailable.data = {"sites": None}
+        unavailable.async_refresh_or_raise = AsyncMock()
+        unavailable_entry = MagicMock()
+        unavailable_entry.title = "Unavailable console"
+        unavailable_entry.runtime_data = MagicMock()
+        unavailable_entry.runtime_data.coordinator = unavailable
+
+        matching = MagicMock()
+        matching.data = {"sites": {"site2": {}}}
+        matching.async_refresh_or_raise = AsyncMock()
+        matching_entry = MagicMock()
+        matching_entry.title = "Matching console"
+        matching_entry.runtime_data = MagicMock()
+        matching_entry.runtime_data.coordinator = matching
+
+        await async_setup_services(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_entries",
+            return_value=[unavailable_entry, matching_entry],
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_REFRESH_DATA,
+                {"site_id": "site2"},
+                blocking=True,
+            )
+
+        unavailable.async_refresh_or_raise.assert_not_called()
+        matching.async_refresh_or_raise.assert_called_once_with(include_protect=False)
 
         await async_unload_services(hass)
 
