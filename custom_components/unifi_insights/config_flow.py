@@ -36,6 +36,12 @@ from .api import (
 )
 from .api.network import UniFiNetworkClient
 from .api.protect import UniFiProtectClient
+from .console_identity import (
+    DEFAULT_SITE_ID,
+    device_fields,
+    first_non_default_site_id,
+    resolve_console_identity,
+)
 from .const import (
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
@@ -47,7 +53,6 @@ from .const import (
     CONF_TRACK_WIRED_CLIENTS,
     CONNECTION_TYPE_LOCAL,
     CONNECTION_TYPE_REMOTE,
-    CONSOLE_DEVICE_TOKENS,
     DEFAULT_API_HOST,
     DEFAULT_CLIENT_CONTROL,
     DEFAULT_TRACK_CLIENTS,
@@ -207,33 +212,26 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         ) -> ProbeResult:
             res = await async_probe_network(network_client)
             if res.status is ProbeStatus.AVAILABLE and res.sites:
+                site_ids = [getattr(site, "id", None) for site in res.sites]
                 try:
-                    first_site_id = getattr(res.sites[0], "id", "default")
-                    devices = await network_client.devices.get_all(
-                        site_id=first_site_id
-                    )
-                    for dev in devices:
-                        # `type` is unset on every device this API returns, so
-                        # `model` is what actually identifies the hardware.
-                        haystack = " ".join(
-                            value
-                            for key in ("type", "model")
-                            if type(value := getattr(dev, key, "")) is str
-                        ).lower()
-                        # Mirror _is_console_device(): a gateway is the console
-                        # even when its model string matches no known token.
-                        if getattr(dev, "is_gateway", None) is True or any(
-                            x in haystack for x in CONSOLE_DEVICE_TOKENS
-                        ):
-                            mac = getattr(dev, "mac", None) or getattr(
-                                dev, "macAddress", None
-                            )
-                            if type(mac) is str:
-                                console_info["id"] = mac.lower().replace("-", ":")
-                                console_info["mac"] = console_info["id"]
-                            name = getattr(dev, "name", None)
-                            if type(name) is str:
-                                console_info["name"] = name
+                    # Sites are scanned in API order and the scan stops at the
+                    # first console found, so the ordinary single-site console
+                    # still costs one request. Only a controller whose gateway
+                    # lives outside the first site pays for more - and that is
+                    # exactly the case that used to leave the flow with no MAC
+                    # while setup found one, producing a duplicate entry.
+                    for site_id in site_ids:
+                        devices = await network_client.devices.get_all(
+                            site_id=site_id or DEFAULT_SITE_ID
+                        )
+                        mac, name = resolve_console_identity(
+                            device_fields(dev) for dev in devices
+                        )
+                        if name and "name" not in console_info:
+                            console_info["name"] = name
+                        if mac:
+                            console_info["id"] = mac
+                            console_info["mac"] = mac
                             break
                 except Exception:
                     _LOGGER.debug(
@@ -241,11 +239,11 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
 
                 if "id" not in console_info:
-                    site_id = getattr(res.sites[0], "id", None)
-                    if type(site_id) is str and site_id != "default":
-                        console_info["id"] = site_id
-                    else:
-                        console_info["id"] = host.lower()
+                    # Same ordering rule setup applies, so both derive the
+                    # same identity instead of drifting apart.
+                    console_info["id"] = (
+                        first_non_default_site_id(site_ids) or host.lower()
+                    )
                     site_name = getattr(res.sites[0], "name", None)
                     if type(site_name) is str:
                         console_info["name"] = site_name

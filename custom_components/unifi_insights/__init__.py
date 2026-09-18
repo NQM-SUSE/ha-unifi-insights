@@ -22,12 +22,16 @@ from .api import (
 )
 from .api.network import UniFiNetworkClient
 from .api.protect import UniFiProtectClient
+from .console_identity import (
+    first_non_default_site_id,
+    is_console_device,
+    resolve_console_identity,
+)
 from .const import (
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
     CONNECTION_TYPE_LOCAL,
-    CONSOLE_DEVICE_TOKENS,
     DEFAULT_API_HOST,
     DOMAIN,
 )
@@ -228,14 +232,9 @@ def _raise_for_setup_probes(
     raise ConfigEntryAuthFailed(msg)
 
 
-def _is_console_device(dev_data: dict[str, Any]) -> bool:
-    """Whether a Network device is the console itself (a gateway or Cloud Key)."""
-    if dev_data.get("is_gateway"):
-        return True
-    haystack = " ".join(
-        str(dev_data.get(key) or "") for key in ("type", "model")
-    ).lower()
-    return any(token in haystack for token in CONSOLE_DEVICE_TOKENS)
+# Re-exported under its original private name: the config flow and this module
+# must agree on what a console is, so the definition lives in one place now.
+_is_console_device = is_console_device
 
 
 def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
@@ -246,10 +245,8 @@ def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
     sites = data.get("sites")
     if not isinstance(sites, dict):
         return None
-    for site_id in sites:
-        if isinstance(site_id, str) and site_id and site_id != "default":
-            return site_id
-    return None
+    # dict order is the API's site order, which is what the flow sees too.
+    return first_non_default_site_id(sites)
 
 
 async def async_setup_entry(
@@ -422,23 +419,18 @@ async def async_setup_entry(
     if not console_mac and device_coordinator and device_coordinator.data:
         devices_by_site = device_coordinator.data.get("devices", {})
         if isinstance(devices_by_site, dict):
-            for site_devices in devices_by_site.values():
-                if not isinstance(site_devices, dict):
-                    continue
-                for dev_data in site_devices.values():
-                    if not isinstance(dev_data, dict):
-                        continue
-                    if _is_console_device(dev_data):
-                        console_mac = dev_data.get("macAddress") or dev_data.get("mac")
-                        if not console_name:
-                            console_name = dev_data.get("name") or dev_data.get("model")
-                        break
-                if console_mac:
-                    break
+            console_mac, found_name = resolve_console_identity(
+                dev_data
+                for site_devices in devices_by_site.values()
+                if isinstance(site_devices, dict)
+                for dev_data in site_devices.values()
+            )
+            if not console_name:
+                console_name = found_name
 
     if is_local and (not console_id or console_id == entry.data.get(CONF_API_KEY)):
         if console_mac:
-            console_id = console_mac.lower().replace("-", ":")
+            console_id = console_mac
         elif not console_id:
             # The host is an address, not an identity: it changes on a DHCP
             # renew, which is the problem this separation exists to fix. Fall
