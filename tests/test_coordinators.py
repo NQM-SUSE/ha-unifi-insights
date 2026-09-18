@@ -1240,6 +1240,98 @@ class TestUnifiDeviceCoordinator:
         assert int_state["state"] == "ONLINE"
         assert is_device_online(int_state)
 
+    def test_legacy_device_to_v1_dict_falls_back_to_mac_id(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """No ``_id`` maps id from mac; field_map keys are copied when absent."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "fw_version": "6.6.55",
+                "port_table": [
+                    {"port_idx": 1, "up": True},
+                    {"name": "no port_idx, dropped"},
+                    "not-a-dict-entry",
+                ],
+            }
+        )
+
+        # No "_id" present, so id falls back to the device's mac.
+        assert mapped["id"] == "AA:BB:CC:DD:EE:FF"
+        # A field_map key present in legacy and absent from mapped is copied
+        # to its v1 camelCase alias.
+        assert mapped["firmwareVersion"] == "6.6.55"
+        # port_table entries are filtered: the dict without port_idx and the
+        # non-dict entry are both dropped, leaving only the valid port.
+        assert len(mapped["ports"]) == 1
+        assert mapped["ports"][0]["port_idx"] == 1
+
+    def test_legacy_device_to_v1_dict_preserves_existing_id_and_mapped_field(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """An existing ``id``/mapped alias is not clobbered by the fallbacks."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "_id": "60a1b2c3d4e5f67890123456",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "id": "already-set",
+                "fw_version": "6.6.55",
+                "firmwareVersion": "already-mapped",
+            }
+        )
+        # legacy_id is truthy but "id" is already present, so it is untouched.
+        assert mapped["id"] == "already-set"
+        # firmwareVersion is already present, so fw_version is not copied over.
+        assert mapped["firmwareVersion"] == "already-mapped"
+
+    def test_legacy_device_to_v1_dict_no_valid_ports_omits_ports_key(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A port_table with no valid entries leaves ``ports`` unset."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "port_table": [
+                    {"name": "missing port_idx"},
+                    "not-a-dict-entry",
+                ],
+            }
+        )
+        assert "ports" not in mapped
+
+    def test_normalize_legacy_port_missing_port_idx_returns_none(self):
+        """A port_table entry without port_idx cannot be normalized."""
+        assert UnifiDeviceCoordinator._normalize_legacy_port({"name": "no idx"}) is None
+
+    def test_normalize_legacy_port_maps_all_optional_fields(self):
+        """Optional identification/SFP fields are copied through when present."""
+        normalized = UnifiDeviceCoordinator._normalize_legacy_port(
+            {
+                "port_idx": 5,
+                "up": True,
+                "media": "GE",
+                "is_uplink": True,
+                "name": "Uplink",
+                "ifname": "eth5",
+                "network_name": "Corporate LAN",
+                "sfp_found": True,
+                "sfp_part": "SFP-10G-SR",
+                "sfp_vendor": "Ubiquiti",
+                "sfp_serial": "SN12345",
+                "sfp_compliance": "10GBASE-SR",
+            }
+        )
+        assert normalized is not None
+        assert normalized["media"] == "GE"
+        assert normalized["is_uplink"] is True
+        assert normalized["ifname"] == "eth5"
+        assert normalized["network_name"] == "Corporate LAN"
+        assert normalized["sfp_found"] is True
+        assert normalized["sfp_part"] == "SFP-10G-SR"
+        assert normalized["sfp_vendor"] == "Ubiquiti"
+        assert normalized["sfp_serial"] == "SN12345"
+        assert normalized["sfp_compliance"] == "10GBASE-SR"
+
     @pytest.mark.asyncio
     async def test_process_site_5xx_fallback_legacy_failure_raises(
         self, coordinator: UnifiDeviceCoordinator
@@ -2113,6 +2205,28 @@ class TestUnifiDeviceCoordinator:
 
         port3 = next(p for p in ports if p["port_idx"] == 3)
         assert "poe" not in port3
+
+    def test_merge_legacy_port_data_skips_port_without_port_idx(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A port_table entry without port_idx is dropped, not appended."""
+        device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {
+                "port_table": [
+                    {"port_idx": 1, "up": True},
+                    {"up": True, "name": "no port_idx"},
+                ]
+            }
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_port_data(
+            device_dict, legacy_devices_by_mac
+        )
+
+        ports = device_dict.get("ports", [])
+        assert len(ports) == 1
+        assert ports[0]["port_idx"] == 1
 
 
 # ============================================================================
