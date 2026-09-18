@@ -3,11 +3,11 @@
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant import config_entries
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.data_entry_flow import FlowResultType
 from pydantic import ValidationError
-import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.unifi_insights.api import (
@@ -604,7 +604,7 @@ async def test_remote_flow_success(hass: HomeAssistant) -> None:
         )
 
         assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["title"] == "UniFi Insights (Cloud)"
+        assert result["title"] == "UniFi - Dream Router 7"
         assert result["data"] == {
             CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
             CONF_CONSOLE_ID: "console123",
@@ -656,7 +656,7 @@ async def test_remote_flow_success_protect_only_console(
         )
 
         assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["title"] == "UniFi Insights (Cloud)"
+        assert result["title"] == "UniFi - Dream Router 7"
 
 
 async def test_remote_flow_connection_error_on_protect(
@@ -899,7 +899,7 @@ async def test_remote_flow_success_protect_nvr(
         )
 
         assert result["type"] == FlowResultType.CREATE_ENTRY
-        assert result["title"] == "UniFi Insights (Cloud)"
+        assert result["title"] == "UniFi - Dream Router 7"
 
 
 async def test_remote_flow_protect_timeout_error(

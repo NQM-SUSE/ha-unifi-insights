@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import logging
-from typing import TYPE_CHECKING, TypeAlias
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypeAlias
 
+import homeassistant.helpers.config_validation as cv
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL, Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 
 from .api import (
     ApiKeyAuth,
@@ -25,10 +25,14 @@ from .api.protect import UniFiProtectClient
 from .const import (
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
+    CONF_CONSOLE_NAME,
     CONNECTION_TYPE_LOCAL,
-    CONNECTION_TYPE_REMOTE as CONNECTION_TYPE_REMOTE,
+    CONSOLE_DEVICE_TOKENS,
     DEFAULT_API_HOST,
     DOMAIN,
+)
+from .const import (
+    CONNECTION_TYPE_REMOTE as CONNECTION_TYPE_REMOTE,
 )
 from .coordinators import (
     UnifiConfigCoordinator,
@@ -224,6 +228,30 @@ def _raise_for_setup_probes(
     raise ConfigEntryAuthFailed(msg)
 
 
+def _is_console_device(dev_data: dict[str, Any]) -> bool:
+    """Whether a Network device is the console itself (a gateway or Cloud Key)."""
+    if dev_data.get("is_gateway"):
+        return True
+    haystack = " ".join(
+        str(dev_data.get(key) or "") for key in ("type", "model")
+    ).lower()
+    return any(token in haystack for token in CONSOLE_DEVICE_TOKENS)
+
+
+def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
+    """Return a stable site id to identify a console that exposes no gateway."""
+    data = getattr(config_coordinator, "data", None)
+    if not isinstance(data, dict):
+        return None
+    sites = data.get("sites")
+    if not isinstance(sites, dict):
+        return None
+    for site_id in sites:
+        if isinstance(site_id, str) and site_id and site_id != "default":
+            return site_id
+    return None
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: UnifiInsightsConfigEntry
 ) -> bool:
@@ -377,6 +405,76 @@ async def async_setup_entry(
         refresh_tasks.append(protect_coordinator.async_config_entry_first_refresh())
     await asyncio.gather(*refresh_tasks)
 
+    # Discover and update console identity if needed (backward compatibility)
+    console_id = entry.data.get(CONF_CONSOLE_ID)
+    console_name = entry.data.get(CONF_CONSOLE_NAME)
+    console_mac: str | None = None
+
+    if protect_coordinator and protect_coordinator.data:
+        nvrs = protect_coordinator.data.get("nvrs", {})
+        if isinstance(nvrs, dict) and nvrs:
+            first_nvr = next(iter(nvrs.values()), None)
+            if isinstance(first_nvr, dict):
+                console_mac = first_nvr.get("mac")
+                if not console_name:
+                    console_name = first_nvr.get("name")
+
+    if not console_mac and device_coordinator and device_coordinator.data:
+        devices_by_site = device_coordinator.data.get("devices", {})
+        if isinstance(devices_by_site, dict):
+            for site_devices in devices_by_site.values():
+                if not isinstance(site_devices, dict):
+                    continue
+                for dev_data in site_devices.values():
+                    if not isinstance(dev_data, dict):
+                        continue
+                    if _is_console_device(dev_data):
+                        console_mac = dev_data.get("macAddress") or dev_data.get("mac")
+                        if not console_name:
+                            console_name = dev_data.get("name") or dev_data.get("model")
+                        break
+                if console_mac:
+                    break
+
+    if is_local and (not console_id or console_id == entry.data.get(CONF_API_KEY)):
+        if console_mac:
+            console_id = console_mac.lower().replace("-", ":")
+        elif not console_id:
+            # The host is an address, not an identity: it changes on a DHCP
+            # renew, which is the problem this separation exists to fix. Fall
+            # back to the site id first and keep the host as a last resort,
+            # matching the order the config flow already uses.
+            console_id = (
+                _first_site_id(config_coordinator)
+                or entry.data.get(CONF_HOST, "local").lower()
+            )
+
+    updates: dict[str, Any] = {}
+    new_data = dict(entry.data)
+    if console_id and new_data.get(CONF_CONSOLE_ID) != console_id:
+        new_data[CONF_CONSOLE_ID] = console_id
+        updates["data"] = new_data
+    if console_name and new_data.get(CONF_CONSOLE_NAME) != console_name:
+        new_data[CONF_CONSOLE_NAME] = console_name
+        updates["data"] = new_data
+
+    target_unique_id = console_id or entry.unique_id
+    if target_unique_id and target_unique_id != entry.unique_id:
+        existing_entry = hass.config_entries.async_entry_for_domain_unique_id(
+            DOMAIN, target_unique_id
+        )
+        if not existing_entry or existing_entry.entry_id == entry.entry_id:
+            updates["unique_id"] = target_unique_id
+
+    if console_name and entry.title in (
+        "UniFi Insights (Local)",
+        "UniFi Insights (Cloud)",
+    ):
+        updates["title"] = f"UniFi - {console_name}"
+
+    if updates:
+        hass.config_entries.async_update_entry(entry, **updates)
+
     # Start the real-time Protect WebSocket subscription (additive to the
     # 30s poll above, which stays as the fallback - see
     # UnifiProtectCoordinator.async_start_websocket). Registered for
@@ -524,3 +622,50 @@ async def async_reload_entry(
 ) -> None:
     """Reload config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Migrate old entry to separate console identity from transport credentials."""
+    _LOGGER.debug(
+        "Migrating entry %s from version %s.%s",
+        config_entry.entry_id,
+        config_entry.version,
+        config_entry.minor_version,
+    )
+
+    if config_entry.version > 1:
+        # Cannot downgrade from higher major version
+        return False
+
+    if config_entry.version == 1:
+        new_data = dict(config_entry.data)
+        new_unique_id = config_entry.unique_id
+
+        # Remote migration: ensure unique_id is the console_id
+        if (
+            new_data.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_REMOTE
+            or new_data.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_LOCAL
+        ):
+            console_id = new_data.get(CONF_CONSOLE_ID)
+            if console_id and new_unique_id != console_id:
+                existing = hass.config_entries.async_entry_for_domain_unique_id(
+                    DOMAIN, console_id
+                )
+                if not existing or existing.entry_id == config_entry.entry_id:
+                    new_unique_id = console_id
+
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data=new_data,
+            unique_id=new_unique_id,
+            version=1,
+            minor_version=2,
+        )
+
+    _LOGGER.info(
+        "Migration of entry %s to version %s.%s successful",
+        config_entry.entry_id,
+        config_entry.version,
+        config_entry.minor_version,
+    )
+    return True
