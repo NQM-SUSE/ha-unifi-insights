@@ -25,8 +25,19 @@ All service actions are implemented in `services.py` (1,166 lines).
 
 ## Helper Functions
 
-- `_get_protect_coordinator` — Get Protect coordinator from config entry
-- `_get_first_coordinator` — Get first available coordinator
+Service actions must run against the console that owns the target, never
+against whichever entry happens to be first. Two resolvers do that:
+
+- `_get_coordinator_for_network_resource(hass, *, site_id=, device_id=, client_id=)`
+  — the coordinator owning a Network site/device/client
+- `_get_coordinator_for_protect_resource(hass, *, resource_type=, resource_id=,
+  secondary_resource_type=, secondary_resource_id=, console_id=)` — the
+  coordinator owning a Protect camera/light/chime/viewer
+
+Both raise `ServiceValidationError` when the target is unknown or ambiguous
+across consoles. An action carrying no routable target (`trigger_alarm`,
+`create_liveview`) takes an optional `console_id` field — the entry title or
+entry ID — which is only required when more than one console is configured.
 
 ## Error Handling
 

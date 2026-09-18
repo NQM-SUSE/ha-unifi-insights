@@ -35,7 +35,9 @@ action_name:
 
 **File:** `custom_components/unifi_insights/services.py`
 
-- Use `_get_protect_coordinator` or `_get_first_coordinator` helpers
+- Route to the owning console with `_get_coordinator_for_network_resource`
+  or `_get_coordinator_for_protect_resource`; never pick the first entry
+- If the action has no routable target, accept an optional `console_id`
 - Raise `HomeAssistantError` for device/API failures
 - Raise `ServiceValidationError` for invalid user input
 
