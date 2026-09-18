@@ -220,7 +220,11 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                             for key in ("type", "model")
                             if type(value := getattr(dev, key, "")) is str
                         ).lower()
-                        if any(x in haystack for x in CONSOLE_DEVICE_TOKENS):
+                        # Mirror _is_console_device(): a gateway is the console
+                        # even when its model string matches no known token.
+                        if getattr(dev, "is_gateway", None) is True or any(
+                            x in haystack for x in CONSOLE_DEVICE_TOKENS
+                        ):
                             mac = getattr(dev, "mac", None) or getattr(
                                 dev, "macAddress", None
                             )
@@ -706,8 +710,19 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                         verify_ssl=user_input.get(CONF_VERIFY_SSL, False),
                     )
                     if is_valid:
-                        new_id = console_info.get("id")
                         current_id = entry.data.get(CONF_CONSOLE_ID) or entry.unique_id
+                        # Only a discovered hardware MAC may replace the stored
+                        # identity. Device inspection swallows transient errors
+                        # and then falls back to a site id or the host, and
+                        # that fallback would otherwise overwrite a real MAC
+                        # permanently: setup only backfills when console_id is
+                        # falsy, and the ":"-based mismatch guard below can
+                        # never fire again once the id stops looking like a MAC.
+                        new_id = (
+                            console_info.get("mac")
+                            or current_id
+                            or console_info.get("id")
+                        )
                         if (
                             new_id
                             and current_id

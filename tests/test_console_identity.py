@@ -595,6 +595,137 @@ async def test_reconfigure_local_account_mismatch(
         assert result["reason"] == "account_mismatch"
 
 
+async def test_reconfigure_transient_device_error_preserves_console_mac(
+    hass: HomeAssistant,
+) -> None:
+    """A flaky device fetch during reconfigure must not erase the stored MAC.
+
+    Device inspection swallows every exception, after which the console id
+    falls back to a site id or the host. Letting that fallback overwrite a
+    hardware MAC is permanent: setup only backfills when console_id is falsy,
+    and the ":"-based mismatch guard stops firing once the id is not a MAC,
+    so a later reconfigure aimed at a different console would be accepted.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="11:22:33:44:55:66",
+        title="UniFi - UDM Pro",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "initial_key",
+            CONF_CONSOLE_ID: "11:22:33:44:55:66",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    net_cm, net_client = _make_mock_client(
+        sites=[MagicMock(id="site-a", name="Default")],
+    )
+    # The console is reachable, but this one call fails the way a busy or
+    # rebooting controller fails mid-reconfigure.
+    net_client.devices.get_all = AsyncMock(side_effect=TimeoutError())
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://10.0.0.1",
+                CONF_API_KEY: "initial_key",
+            },
+        )
+        await hass.async_block_till_done()
+
+        assert result["type"] == FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        # The new host is stored, but the hardware identity survives untouched.
+        assert entry.data[CONF_HOST] == "https://10.0.0.1"
+        assert entry.data[CONF_CONSOLE_ID] == "11:22:33:44:55:66"
+        assert entry.unique_id == "11:22:33:44:55:66"
+
+
+async def test_reconfigure_detects_gateway_with_unknown_model(
+    hass: HomeAssistant,
+) -> None:
+    """A device flagged is_gateway is the console even if its model is unknown.
+
+    ``_is_console_device`` honours ``is_gateway``; the config flow's own
+    matcher only looked at the type/model tokens, so a console whose model
+    string is not in CONSOLE_DEVICE_TOKENS was invisible to the flow while
+    setup adopted its MAC - which is how one console ends up with two entries.
+
+    Reaching account_mismatch proves the MAC was discovered: had the gateway
+    gone unrecognised, no MAC would be found and the reconfigure would have
+    kept the stored id and succeeded.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="11:22:33:44:55:66",
+        title="UniFi - Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "initial_key",
+            CONF_CONSOLE_ID: "11:22:33:44:55:66",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    unknown_gateway = MagicMock(
+        type=None,
+        model="Mystery Box 9000",
+        mac="99:88:77:66:55:44",
+        name="Unreleased Console",
+        is_gateway=True,
+    )
+    net_cm, _ = _make_mock_client(
+        sites=[MagicMock(id="site-a", name="Default")],
+        devices=[unknown_gateway],
+    )
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://10.0.0.1",
+                CONF_API_KEY: "initial_key",
+            },
+        )
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "account_mismatch"
+
+
 class TestConsoleDeviceDetection:
     """Identify the console among the Network devices.
 
@@ -1682,14 +1813,14 @@ async def test_local_flow_protect_probe_nvr_returns_none(
         assert result["data"].get(CONF_CONSOLE_ID) is None
 
 
-async def test_local_reconfigure_with_blank_host_yields_no_console_id(
+async def test_local_reconfigure_with_blank_host_preserves_console_id(
     hass: HomeAssistant,
 ) -> None:
-    """Reconfiguring to a host that normalizes to "" stores no console_id key.
+    """Reconfiguring to a host that normalizes to "" keeps the stored console_id.
 
     A host that resolves to a falsy id means `_async_validate_local_connection`
-    never populated `console_info["id"]` with anything usable; the reconfigure
-    step must not write an empty CONF_CONSOLE_ID into the entry.
+    never populated `console_info["id"]` with anything usable, so there is
+    nothing better to store than what the entry already had.
     """
     from custom_components.unifi_insights.api import UniFiResponseError
 
@@ -1750,6 +1881,7 @@ async def test_local_reconfigure_with_blank_host_yields_no_console_id(
         assert result["type"] == FlowResultType.ABORT
         assert result["reason"] == "reconfigure_successful"
         # The unique_id (the real dedup identity) is preserved even though
-        # the id could not be re-derived from this host.
+        # the id could not be re-derived from this host, and so is the stored
+        # console id: a host that yields no usable id must not erase it.
         assert entry.unique_id == "existing_console_id_777"
-        assert entry.data.get(CONF_CONSOLE_ID) is None
+        assert entry.data[CONF_CONSOLE_ID] == "existing_console_id_777"
