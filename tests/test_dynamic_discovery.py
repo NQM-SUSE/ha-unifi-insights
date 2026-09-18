@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -63,6 +63,7 @@ def mock_coordinator() -> MagicMock:
             "nvrs": {},
             "viewers": {},
             "chimes": {},
+            "liveviews": {},
         },
         "wifi": {
             "site1": {},
@@ -71,13 +72,13 @@ def mock_coordinator() -> MagicMock:
             "site1": {},
         },
         "firewall_rules": {
-            "site1": [],
+            "site1": {},
         },
-        "policy_routes": {
-            "site1": [],
+        "policy_based_routes": {
+            "site1": {},
         },
         "vpn_clients": {
-            "site1": [],
+            "site1": {},
         },
     }
     return coordinator
@@ -511,7 +512,7 @@ class TestDynamicDiscoveryResilience:
                 "clients": {"site1": "not-a-dict"},
                 "wifi": {"site1": "not-a-dict"},
                 "firewall_rules": {"site1": "not-a-dict"},
-                "policy_routes": {"site1": "not-a-dict"},
+                "policy_based_routes": {"site1": "not-a-dict"},
                 "vpn_clients": {"site1": "not-a-dict"},
                 "protect": {
                     "cameras": "not-a-dict",
@@ -558,7 +559,7 @@ class TestDynamicDiscoveryResilience:
                     }
                 },
                 "firewall_rules": {"site1": {"r_str": "not-a-dict"}},
-                "policy_routes": {"site1": {"pr_str": "not-a-dict"}},
+                "policy_based_routes": {"site1": {"pr_str": "not-a-dict"}},
                 "vpn_clients": {"site1": {"vpn_str": "not-a-dict"}},
                 "protect": {
                     "cameras": {"cam_str": "not-a-dict"},
@@ -604,3 +605,125 @@ class TestDynamicDiscoveryResilience:
         add_entities = MagicMock()
         await setup_fn(hass, mock_config_entry, add_entities)
         add_entities.assert_not_called()
+
+
+class TestDiscoveryRegressions:
+    """Regressions for payload shapes discovery used to mishandle."""
+
+    @pytest.mark.asyncio
+    async def test_light_retried_after_a_failed_construction(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """A light that fails to construct is retried on the next update."""
+        add_entities = MagicMock()
+        await async_setup_light(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["protect"]["lights"] = {
+            "light1": {"id": "light1", "name": "Porch"}
+        }
+
+        with patch(
+            "custom_components.unifi_insights.light.UnifiProtectLight",
+            side_effect=ValueError("bad ledLevel"),
+        ):
+            listener()
+        add_entities.assert_not_called()
+
+        # Payload is fine now; the light must not stay hidden.
+        listener()
+        add_entities.assert_called_once()
+        assert len(add_entities.call_args[0][0]) == 1
+
+    @pytest.mark.asyncio
+    async def test_wan_status_skipped_when_model_is_none(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """A device reporting model=None does not crash WAN status discovery."""
+        add_entities = MagicMock()
+        await async_setup_binary_sensor(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["devices"]["site1"] = {
+            "dev1": {"id": "dev1", "name": "Mesh AP", "model": None}
+        }
+
+        listener()
+
+        added = [e for call in add_entities.call_args_list for e in call[0][0]]
+        assert not any(
+            getattr(e, "entity_description", None) is not None
+            and e.entity_description.key == "wan_status"
+            for e in added
+        )
+
+    @pytest.mark.asyncio
+    async def test_mapping_shaped_features_still_create_sensors(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Devices reporting features as a mapping get feature-gated sensors."""
+        add_entities = MagicMock()
+        await async_setup_sensor(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["devices"]["site1"] = {
+            "dev1": {
+                "id": "dev1",
+                "name": "Switch",
+                "model": "USW-24",
+                "features": {"switching": True},
+            }
+        }
+        mock_coordinator.data["stats"] = {"site1": {"dev1": {"poe_total_w": 12.0}}}
+
+        listener()
+
+        added = [e for call in add_entities.call_args_list for e in call[0][0]]
+        keys = {
+            e.entity_description.key
+            for e in added
+            if getattr(e, "entity_description", None) is not None
+        }
+        assert "poe_total_power" in keys
+
+    @pytest.mark.asyncio
+    async def test_string_port_index_does_not_duplicate_a_port_sensor(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """A string port index dedupes against the int-keyed stats fallback."""
+        add_entities = MagicMock()
+        await async_setup_sensor(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["devices"]["site1"] = {
+            "dev1": {
+                "id": "dev1",
+                "name": "Switch",
+                "model": "USW-24",
+                "features": {"switching": True},
+                "interfaces": {
+                    "ports": [
+                        {"idx": "1", "state": "UP", "poe": {"good": True}},
+                    ]
+                },
+            }
+        }
+        mock_coordinator.data["stats"] = {"site1": {"dev1": {"poe_ports": {"1": 5.0}}}}
+
+        listener()
+
+        added = [e for call in add_entities.call_args_list for e in call[0][0]]
+        unique_ids = [e.unique_id for e in added if getattr(e, "unique_id", None)]
+        assert len(unique_ids) == len(set(unique_ids))

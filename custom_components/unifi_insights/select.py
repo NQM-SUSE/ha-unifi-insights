@@ -458,7 +458,7 @@ class UnifiProtectViewerLiveviewSelect(UnifiProtectEntity, SelectEntity):
         viewer_data = self.coordinator.data["protect"]["viewers"].get(
             self._device_id, {}
         )
-        liveviews = self.coordinator.data["protect"]["liveviews"]
+        liveviews = self.coordinator.data["protect"].get("liveviews", {})
 
         # Set options from available liveviews
         self._attr_options = [lv.get("name", lv_id) for lv_id, lv in liveviews.items()]
@@ -481,7 +481,7 @@ class UnifiProtectViewerLiveviewSelect(UnifiProtectEntity, SelectEntity):
         """Change the selected option."""
         _LOGGER.debug("Setting liveview to %s for viewer %s", option, self._device_id)
 
-        liveviews = self.coordinator.data["protect"]["liveviews"]
+        liveviews = self.coordinator.data["protect"].get("liveviews", {})
         liveview_id = None
         for lv_id, lv in liveviews.items():
             if lv.get("name") == option:

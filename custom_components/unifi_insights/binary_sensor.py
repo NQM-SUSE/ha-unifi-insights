@@ -361,9 +361,10 @@ async def async_setup_entry(
                     for description in BINARY_SENSOR_TYPES:
                         if description.entity_type == "device":
                             # Skip WAN status sensor for non-gateway devices
-                            if description.key == "wan_status" and not device_data.get(
-                                "model", ""
-                            ).startswith("UDM"):
+                            model = device_data.get("model")
+                            if description.key == "wan_status" and not (
+                                isinstance(model, str) and model.startswith("UDM")
+                            ):
                                 _LOGGER.debug(
                                     "Skipping WAN status sensor for non-gateway device "
                                     "%s (%s)",

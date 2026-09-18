@@ -30,6 +30,7 @@ from .const import (
 from .entity import (
     UnifiProtectEntity,
     async_call_coordinator_action,
+    device_has_feature as _device_has_feature,
     get_field,
     is_device_online,
 )
@@ -45,18 +46,6 @@ _LOGGER = logging.getLogger(__name__)
 
 # Switch entities are action-based, allow parallel execution
 PARALLEL_UPDATES = 1
-
-
-def _device_has_feature(device_data: dict[str, Any], *features_to_match: str) -> bool:
-    """Return True when a device advertises any of the requested features."""
-    features = device_data.get("features", [])
-    if isinstance(features, dict):
-        return any(
-            bool(features.get(feature_name)) for feature_name in features_to_match
-        )
-    if isinstance(features, list):
-        return any(feature_name in features for feature_name in features_to_match)
-    return False
 
 
 def _get_firewall_rule_action(rule_data: dict[str, Any]) -> str | None:
@@ -1464,7 +1453,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except TypeError, ValueError:
+                except (TypeError, ValueError):
                     continue
         return None
 
@@ -1495,7 +1484,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                                 if cycle_enabled is not None:
                                     outlet["cycle_enabled"] = cycle_enabled
                                 break
-                        except TypeError, ValueError:
+                        except (TypeError, ValueError):
                             continue
 
     @property
@@ -1674,7 +1663,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except TypeError, ValueError:
+                except (TypeError, ValueError):
                     continue
         return None
 
@@ -1701,7 +1690,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                             if int(idx) == self._outlet_index:
                                 outlet["cycle_enabled"] = cycle_enabled
                                 break
-                        except TypeError, ValueError:
+                        except (TypeError, ValueError):
                             continue
 
     @property

@@ -52,6 +52,7 @@ from .coordinators import UnifiFacadeCoordinator
 from .entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
+    device_has_feature,
     get_field,
 )
 from .entity import (
@@ -637,7 +638,7 @@ def _outlet_has_metering(outlet: dict[str, Any]) -> bool:
         try:
             if int(caps) & 2:
                 return True
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             pass
     for key in (
         "outlet_power",
@@ -951,14 +952,9 @@ def _discover_device_sensors(
     entities: list[SensorEntity],
 ) -> None:
     """Discover standard network device sensors."""
-    device_features = device_data.get("features", [])
-    if not isinstance(device_features, list):
-        device_features = []
-
     for description in SENSOR_TYPES:
-        if (
-            description.required_feature is not None
-            and description.required_feature not in device_features
+        if description.required_feature is not None and not device_has_feature(
+            device_data, description.required_feature
         ):
             continue
 
@@ -1081,6 +1077,12 @@ def _discover_port_sensors(
         port_idx = get_field(port, "idx", "index", "port_idx")
         if port_idx is None:
             continue
+        # The legacy device path copies the raw index straight from the
+        # payload, so it can still be a string here. _create_port_stats_fallback
+        # keys its ports on int, and both paths feed the same UnifiPortSensor
+        # unique ID, so normalise before the dedupe keys are built.
+        with contextlib.suppress(ValueError, TypeError):
+            port_idx = int(port_idx)
 
         port_state = get_field(port, "state", "status", default="DOWN")
         if str(port_state).upper() != "UP":
@@ -1168,8 +1170,7 @@ def _discover_port_sensors(
                     )
 
     # Fallback: create per-port sensors from stats
-    device_features = device_data.get("features", [])
-    if isinstance(device_features, list) and "switching" in device_features:
+    if device_has_feature(device_data, "switching"):
         stats = ((coordinator.data.get("stats") or {}).get(site_id) or {}).get(
             device_id, {}
         )
@@ -1987,7 +1988,7 @@ class UnifiOutletSensor(UnifiInsightsEntity, SensorEntity):
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except TypeError, ValueError:
+                except (TypeError, ValueError):
                     continue
         return None
 

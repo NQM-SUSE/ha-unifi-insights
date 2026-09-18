@@ -84,16 +84,19 @@ async def async_setup_entry(
                 _LOGGER.debug(
                     "Adding light entity for %s", light_data.get("name", light_id)
                 )
-                known_light_ids.add(light_id)
-                new_entities.append(
-                    UnifiProtectLight(
-                        coordinator=coordinator,
-                        light_id=light_id,
-                    )
+                light = UnifiProtectLight(
+                    coordinator=coordinator,
+                    light_id=light_id,
                 )
             except (KeyError, TypeError, ValueError) as err:
                 _LOGGER.warning("Skipping light %s due to error: %s", light_id, err)
                 continue
+            else:
+                # Only after construction succeeds, so a light that failed on a
+                # malformed payload is retried on the next coordinator update
+                # instead of being hidden until the entry is reloaded.
+                known_light_ids.add(light_id)
+                new_entities.append(light)
 
         if new_entities:
             _LOGGER.info("Adding %d UniFi Protect lights", len(new_entities))
