@@ -30,6 +30,7 @@ from custom_components.unifi_insights.const import (
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
+    CONF_CONSOLE_NAME,
     CONF_TRACK_CLIENTS,
     CONF_TRACK_WIFI_CLIENTS,
     CONF_TRACK_WIRED_CLIENTS,
@@ -643,3 +644,148 @@ class TestConsoleDeviceDetection:
         coordinator.data = None
 
         assert _first_site_id(coordinator) is None
+
+
+async def test_migration_version_guard_and_unique_id_collision(hass: HomeAssistant) -> None:
+    """Migration aborts on higher major version and avoids duplicate unique_id collision."""
+    # Higher major version returns False
+    entry_future = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        minor_version=0,
+        data={},
+    )
+    entry_future.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry_future) is False
+
+    # Unique id collision during migration keeps original unique_id
+    existing_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="target_console_123",
+        version=1,
+        minor_version=2,
+        data={CONF_CONSOLE_ID: "target_console_123"},
+    )
+    existing_entry.add_to_hass(hass)
+
+    v1_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="old_unique_id",
+        version=1,
+        minor_version=1,
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
+            CONF_CONSOLE_ID: "target_console_123",
+        },
+    )
+    v1_entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, v1_entry) is True
+    # Should not overwrite existing entry's unique_id
+    assert v1_entry.unique_id == "old_unique_id"
+
+
+async def test_async_setup_entry_discovers_console_identity_from_nvr(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """async_setup_entry updates local entry with console MAC, name and title from NVR."""
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Local)",
+        unique_id="local_api_key_123",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.1",
+            CONF_API_KEY: "local_api_key_123",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_protect_refresh(coord_self):
+        coord_self.data = {
+            "nvrs": {
+                "nvr_1": {
+                    "mac": "aa:bb:cc:dd:ee:11",
+                    "name": "Home UDM",
+                }
+            }
+        }
+
+    with (
+        patch("custom_components.unifi_insights.async_probe_network", new_callable=AsyncMock) as mock_probe_net,
+        patch("custom_components.unifi_insights.async_probe_protect", new_callable=AsyncMock) as mock_probe_prot,
+        patch("custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh", new_callable=AsyncMock),
+        patch("custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh", new_callable=AsyncMock),
+        patch("custom_components.unifi_insights.UnifiProtectCoordinator.async_config_entry_first_refresh", autospec=True, side_effect=fake_protect_refresh),
+        patch("custom_components.unifi_insights.UnifiProtectCoordinator.async_start_websocket", new_callable=AsyncMock),
+        patch("homeassistant.config_entries.ConfigEntries.async_forward_entry_setups", new_callable=AsyncMock),
+    ):
+        mock_probe_net.return_value = ProbeResult(ProbeStatus.AVAILABLE, [MagicMock(id="default")])
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.AVAILABLE)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        assert entry.data.get(CONF_CONSOLE_ID) == "aa:bb:cc:dd:ee:11"
+        assert entry.data.get(CONF_CONSOLE_NAME) == "Home UDM"
+        assert entry.unique_id == "aa:bb:cc:dd:ee:11"
+        assert entry.title == "UniFi - Home UDM"
+        await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_async_setup_entry_discovers_console_identity_from_device_gateway(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """async_setup_entry updates local entry with console MAC and name from Gateway device."""
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Local)",
+        unique_id="local_api_key_456",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.1",
+            CONF_API_KEY: "local_api_key_456",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_device_refresh(coord_self):
+        coord_self.data = {
+            "devices": {
+                "site_alpha": {
+                    "gw_1": {
+                        "is_gateway": True,
+                        "macAddress": "22-33-44-55-66-77",
+                        "name": "Dream Router",
+                    }
+                }
+            }
+        }
+
+    with (
+        patch("custom_components.unifi_insights.async_probe_network", new_callable=AsyncMock) as mock_probe_net,
+        patch("custom_components.unifi_insights.async_probe_protect", new_callable=AsyncMock) as mock_probe_prot,
+        patch("custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh", new_callable=AsyncMock),
+        patch("custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh", autospec=True, side_effect=fake_device_refresh),
+        patch("homeassistant.config_entries.ConfigEntries.async_forward_entry_setups", new_callable=AsyncMock),
+    ):
+        mock_probe_net.return_value = ProbeResult(ProbeStatus.AVAILABLE, [MagicMock(id="site_alpha")])
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        assert entry.data.get(CONF_CONSOLE_ID) == "22:33:44:55:66:77"
+        assert entry.data.get(CONF_CONSOLE_NAME) == "Dream Router"
+        assert entry.unique_id == "22:33:44:55:66:77"
+        assert entry.title == "UniFi - Dream Router"
+        await hass.config_entries.async_unload(entry.entry_id)
