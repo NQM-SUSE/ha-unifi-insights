@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.diagnostics import async_redact_data
+from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 
 from .api import __version__ as api_version
@@ -33,21 +35,37 @@ TO_REDACT = {
     "secret",
     "voucher",
     "fingerprint",
+    # Classic-API secrets that ride along with legacy device and WiFi payloads
+    "x_passphrase",
+    "x_authkey",
+    "x_fingerprint",
+    "x_iapp_key",
+    "x_ssh_hostkey_fingerprint",
+    "x_vwirekey",
     # Network identifiers
     CONF_HOST,
     "ip",
     "ipAddress",
     "ip_address",
+    "ipAddresses",
+    "ip_addresses",
     "host",
     "hostname",
     "wan_ip",
     "wanIp",
     "lan_ip",
     "lanIp",
+    "sourceAddress",
+    "source_address",
+    "destinationAddress",
+    "destination_address",
+    "domainName",
+    "domain_name",
+    # WiFi network identity: an SSID names a household and locates it in
+    # public wardriving databases, so it is redacted like any other identifier.
+    "ssid",
+    "essid",
     # Device identifiers
-    "mac",
-    "mac_address",
-    "macAddress",
     "serial",
     "serialNumber",
     "hardwareId",
@@ -63,7 +81,178 @@ TO_REDACT = {
     # Location data
     "latitude",
     "longitude",
+    # Smart detections that name a person or their vehicle
+    "licensePlate",
+    "license_plate",
 }
+
+# Labels that name a person rather than a piece of hardware. These are only
+# redacted inside the records where they carry personal data - a client is
+# usually named after its owner ("Sarah's iPhone"), while the name of a switch,
+# a site or a camera is what makes a diagnostics download readable at all.
+PERSONAL_NAMES = {
+    "name",
+    "displayName",
+    "display_name",
+    "deviceName",
+    "device_name",
+    "note",
+    "userId",
+    "user_id",
+}
+
+# Client records: everything above, plus the owner-supplied names.
+CLIENT_TO_REDACT = TO_REDACT | PERSONAL_NAMES
+
+# WiFi records: the SSID is also carried in the record's "name" field.
+WIFI_TO_REDACT = TO_REDACT | {"name"}
+
+# Keys whose value is a MAC address even when it arrives unpunctuated. Values
+# are replaced with a per-report placeholder rather than dropped; see
+# _anonymize_macs.
+MAC_KEYS = frozenset(
+    {
+        "mac",
+        "macAddress",
+        "mac_address",
+        "macAddresses",
+        "mac_addresses",
+        "macFilterList",
+        "mac_filter_list",
+        "bssid",
+        "apMac",
+        "ap_mac",
+        "swMac",
+        "sw_mac",
+        "uplinkMac",
+        "uplink_mac",
+        "gatewayMac",
+        "gateway_mac",
+        "wanMac",
+        "wan_mac",
+        "lanMac",
+        "lan_mac",
+    }
+)
+
+# A punctuated MAC anywhere in a string, whatever key it arrived under.
+_MAC_PATTERN = re.compile(r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b")
+# A whole value that is a MAC. Unlike the pattern above this also accepts the
+# unpunctuated form, which is only safe to assume when it is the entire value:
+# twelve hex characters in the middle of a sentence are not an address.
+_MAC_VALUE_PATTERN = re.compile(
+    r"[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{12}"
+)
+
+
+def _mac_placeholder(mac: str, seen: dict[str, str]) -> str:
+    """Return a stable placeholder for a MAC address within one report."""
+    # Punctuation and case vary by endpoint, so real addresses canonicalize to
+    # one key. Anything else keeps its own value as the key: stripping it down
+    # to its hex characters would make "not-a-mac" and "aac" collide, and the
+    # placeholders are only useful while distinct values stay distinct.
+    lowered = mac.lower()
+    normalized = (
+        re.sub(r"[:-]", "", lowered)
+        if _MAC_VALUE_PATTERN.fullmatch(lowered)
+        else f"raw:{lowered}"
+    )
+    placeholder = seen.get(normalized)
+    if placeholder is None:
+        placeholder = f"**REDACTED-MAC-{len(seen) + 1}**"
+        seen[normalized] = placeholder
+    return placeholder
+
+
+def _anonymize_macs(
+    value: Any, seen: dict[str, str], *, is_mac_field: bool = False
+) -> Any:
+    """
+    Replace every MAC address with a placeholder that is stable per report.
+
+    Key-based redaction cannot keep up here: the API spells MAC addresses
+    `macAddress`, `bssid`, `apMac`, `swMac` and more, and a client record
+    accepts unknown extra fields, so any future MAC field would be published
+    the moment the controller starts sending it. Every MAC-shaped value is
+    therefore rewritten regardless of the key that carried it, punctuated or
+    not, whether it appears as a value or as a mapping key.
+
+    The same MAC always maps to the same placeholder, so a report still shows
+    which access point or switch port a client sits behind, and devices keyed
+    by MAC (those the API lists without an id) cannot collide into one entry.
+
+    Args:
+        value: The diagnostics payload, or any part of it.
+        seen: Placeholders already handed out, keyed by normalized MAC.
+        is_mac_field: Whether the value arrived under a known MAC key, in
+            which case it is a MAC even if it is not punctuated like one.
+
+    Returns:
+        A copy of the value with MAC addresses replaced.
+
+    """
+    if isinstance(value, str):
+        if not value or value == REDACTED:
+            return value
+        if is_mac_field or _MAC_VALUE_PATTERN.fullmatch(value):
+            return _mac_placeholder(value, seen)
+        return _MAC_PATTERN.sub(
+            lambda match: _mac_placeholder(match.group(), seen), value
+        )
+    if isinstance(value, Mapping):
+        return {
+            (
+                _mac_placeholder(key, seen)
+                if isinstance(key, str) and _MAC_VALUE_PATTERN.fullmatch(key)
+                else key
+            ): _anonymize_macs(
+                item, seen, is_mac_field=isinstance(key, str) and key in MAC_KEYS
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _anonymize_macs(item, seen, is_mac_field=is_mac_field) for item in value
+        ]
+    return value
+
+
+def _redact_coordinator_data(data: Any) -> Any:
+    """
+    Redact a coordinator data snapshot.
+
+    Client and WiFi records get the personal-name treatment on top of the
+    shared key list; devices, sites and Protect records keep their names so
+    the report stays readable.
+    """
+    redacted = async_redact_data(data, TO_REDACT)
+    if not isinstance(data, Mapping) or not isinstance(redacted, dict):
+        return redacted
+
+    for section, to_redact in (
+        ("clients", CLIENT_TO_REDACT),
+        ("wifi", WIFI_TO_REDACT),
+    ):
+        records = data.get(section)
+        if isinstance(records, Mapping):
+            redacted[section] = {
+                site_id: async_redact_data(site_records, to_redact)
+                for site_id, site_records in records.items()
+            }
+
+    # Per-device statistics carry a copy of that device's client records.
+    stats = redacted.get("stats")
+    if isinstance(stats, dict):
+        for site_stats in stats.values():
+            if not isinstance(site_stats, dict):
+                continue
+            for device_stats in site_stats.values():
+                if isinstance(device_stats, dict) and "clients" in device_stats:
+                    device_stats["clients"] = async_redact_data(
+                        device_stats["clients"], CLIENT_TO_REDACT
+                    )
+
+    return redacted
 
 
 async def async_get_config_entry_diagnostics(
@@ -81,7 +270,7 @@ async def async_get_config_entry_diagnostics(
 
     # Get sanitized connection info
     connection_info = {
-        "host": "**REDACTED**",
+        "host": REDACTED,
         "network_client_connected": coordinator.network_client is not None,
         "protect_client_connected": coordinator.protect_client is not None,
     }
@@ -95,13 +284,17 @@ async def async_get_config_entry_diagnostics(
     )
 
     # Get the raw data but remove sensitive information
-    diagnostics_data = {
+    diagnostics_data: dict[str, Any] = {
         "library_version": library_version,
         "connection": connection_info,
         "websocket": websocket_info,
         "entry": async_redact_data(entry.as_dict(), TO_REDACT),
-        "data": async_redact_data(coordinator.data, TO_REDACT),
+        "data": _redact_coordinator_data(coordinator.data),
     }
 
+    # Last pass over the assembled payload: no MAC address leaves this
+    # integration, whatever key the controller sent it under.
+    anonymized: dict[str, Any] = _anonymize_macs(diagnostics_data, {})
+
     _LOGGER.debug("Diagnostics data collected successfully")
-    return diagnostics_data
+    return anonymized

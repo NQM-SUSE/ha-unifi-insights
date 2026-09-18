@@ -11,10 +11,12 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.unifi_insights.api.network.models.client import Client
 from custom_components.unifi_insights.coordinators.config import (
     UnifiConfigCoordinator,
 )
 from custom_components.unifi_insights.diagnostics import (
+    _redact_coordinator_data,
     async_get_config_entry_diagnostics,
 )
 
@@ -128,3 +130,298 @@ async def test_diagnostics_redacts_wifi_qr_code(
     for text in _strings(diagnostics):
         assert passphrase not in text
         assert escaped not in text
+
+
+CLIENT_PAYLOAD = {
+    "id": "client-1",
+    "macAddress": "AA:BB:CC:11:22:33",
+    "name": "Sarah's iPhone",
+    "hostname": "sarahs-iphone",
+    "ipAddress": "192.168.1.55",
+    "type": "WIRELESS",
+    "essid": "Sarah and Tom 5G",
+    "bssid": "AA:BB:CC:44:55:66",
+    "apMac": "AA:BB:CC:44:55:60",
+    "swMac": "AA:BB:CC:77:88:99",
+    "deviceName": "Sarah's iPhone 15",
+    "osName": "iOS",
+    "signal": -52,
+    # Client accepts unknown extra fields, so anything the controller starts
+    # sending lands in the diagnostics payload untouched by a key list.
+    "note": "Sarah - bedroom",
+    "gwMac": "AA:BB:CC:AB:CD:EF",
+}
+
+PERSONAL_STRINGS = (
+    "Sarah's iPhone",
+    "sarahs-iphone",
+    "Sarah and Tom 5G",
+    "Sarah's iPhone 15",
+    "Sarah - bedroom",
+    "192.168.1.55",
+    "AA:BB:CC:11:22:33",
+    "AA:BB:CC:44:55:66",
+    "AA:BB:CC:44:55:60",
+    "AA:BB:CC:77:88:99",
+    "AA:BB:CC:AB:CD:EF",
+)
+
+
+def _client_record() -> dict[str, Any]:
+    """Return a client record shaped exactly like the coordinator stores one."""
+    return Client.model_validate(CLIENT_PAYLOAD).model_dump(by_alias=True)
+
+
+def _seed_client_data(coordinator: Any) -> dict[str, Any]:
+    """Put a synthetic client into every place the coordinator keeps one."""
+    record = _client_record()
+    coordinator.data["clients"] = {"site-1": {"client-1": record}}
+    coordinator.data["stats"] = {
+        "site-1": {"device-1": {"id": "device-1", "clients": [record]}}
+    }
+    return record
+
+
+async def test_diagnostics_redacts_client_identity(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test diagnostics does not disclose who is on the network.
+
+    Redacting passwords is not enough: a client record names its owner
+    ("Sarah's iPhone"), the SSID they connect to, and the MAC addresses of
+    both the client and the access point or switch it sits behind.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    record = _seed_client_data(coordinator)
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    client = diagnostics["data"]["clients"]["site-1"]["client-1"]
+
+    assert client["name"] == REDACTED
+    assert client["hostname"] == REDACTED
+    assert client["deviceName"] == REDACTED
+    assert client["note"] == REDACTED
+    assert client["essid"] == REDACTED
+    assert client["ipAddress"] == REDACTED
+    for key in ("macAddress", "bssid", "apMac", "swMac", "gwMac"):
+        assert client[key].startswith("**REDACTED-MAC-")
+
+    # Non-identifying telemetry is what makes the report useful - keep it.
+    assert client["osName"] == "iOS"
+    assert client["signal"] == -52
+    assert client["type"] == "WIRELESS"
+
+    # The same record is copied into per-device statistics; it has to be
+    # redacted there too, not just in the clients collection.
+    stats_client = diagnostics["data"]["stats"]["site-1"]["device-1"]["clients"][0]
+    assert stats_client["name"] == REDACTED
+    assert stats_client["essid"] == REDACTED
+
+    texts = _strings(diagnostics)
+    for personal in PERSONAL_STRINGS:
+        assert personal not in texts
+
+    # The coordinator's own data is untouched; entities still need it.
+    assert record["name"] == "Sarah's iPhone"
+    assert coordinator.data["clients"]["site-1"]["client-1"]["apMac"] == (
+        "AA:BB:CC:44:55:60"
+    )
+
+
+async def test_diagnostics_keeps_hardware_names_readable(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test device and site names survive redaction.
+
+    A report where every name is **REDACTED** cannot be read: the names of
+    switches, access points and sites are what tell an operator which record
+    is which, and none of them name a person.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["sites"] = {"site-1": {"id": "site-1", "name": "Home"}}
+    coordinator.data["devices"] = {
+        "site-1": {
+            "device-1": {
+                "id": "device-1",
+                "name": "Garage Switch",
+                "model": "USW-24",
+                "macAddress": "AA:BB:CC:77:88:99",
+            }
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    assert diagnostics["data"]["sites"]["site-1"]["name"] == "Home"
+    device = diagnostics["data"]["devices"]["site-1"]["device-1"]
+    assert device["name"] == "Garage Switch"
+    assert device["model"] == "USW-24"
+    assert device["macAddress"].startswith("**REDACTED-MAC-")
+
+
+async def test_diagnostics_mac_placeholders_are_stable_and_distinct(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test MAC placeholders keep a report correlatable without exposing MACs.
+
+    A blanket **REDACTED** would lose which access point a client is on, and
+    would collapse the devices the API lists without an id - those are keyed
+    by MAC - into a single colliding entry.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    _seed_client_data(coordinator)
+    coordinator.data["devices"] = {
+        "site-1": {
+            # Devices reported without an id are keyed by MAC (#128).
+            "aa:bb:cc:44:55:60": {"name": "Hallway AP", "mac": "AA:BB:CC:44:55:60"},
+            # Unpunctuated under a known MAC key is still the same MAC.
+            "aa:bb:cc:77:88:99": {"name": "Garage Switch", "mac": "aabbcc778899"},
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    devices = diagnostics["data"]["devices"]["site-1"]
+    client = diagnostics["data"]["clients"]["site-1"]["client-1"]
+
+    # Two MAC-keyed devices stay two entries.
+    assert len(devices) == 2
+    access_point, switch = devices.values()
+    assert access_point["name"] == "Hallway AP"
+    assert switch["name"] == "Garage Switch"
+
+    # The client's uplinks still point at the right hardware.
+    assert client["apMac"] == access_point["mac"]
+    assert client["swMac"] == switch["mac"]
+    assert client["apMac"] != client["swMac"]
+    assert client["macAddress"] not in (client["apMac"], client["swMac"])
+
+    # Differences in case, separator or punctuation are the same MAC, so the
+    # entry keys and the records inside them still agree.
+    assert list(devices) == [access_point["mac"], switch["mac"]]
+
+
+async def test_diagnostics_redacts_wifi_ssid(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test the SSID is redacted wherever the WiFi record carries it."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["wifi"] = {
+        "site-1": {
+            "wifi-1": {
+                "id": "wifi-1",
+                "name": "Sarah and Tom 5G",
+                "ssid": "Sarah and Tom 5G",
+                "enabled": True,
+                "security": "wpa2",
+                "num_connected_clients": 4,
+            }
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    wifi = diagnostics["data"]["wifi"]["site-1"]["wifi-1"]
+
+    assert wifi["name"] == REDACTED
+    assert wifi["ssid"] == REDACTED
+    assert wifi["enabled"] is True
+    assert wifi["num_connected_clients"] == 4
+    assert "Sarah and Tom 5G" not in _strings(diagnostics)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        [],
+        {"clients": "not-a-mapping", "wifi": None},
+        {"stats": {"site-1": None}},
+        {"stats": {"site-1": {"device-1": {"uptime": 42}}}},
+    ],
+)
+def test_redact_coordinator_data_tolerates_unexpected_shapes(data: Any) -> None:
+    """Test redaction never raises on a snapshot that is not fully populated.
+
+    A diagnostics download must still produce a report when the coordinator
+    has not loaded yet, or when a section is missing or shaped unexpectedly.
+    """
+    assert _redact_coordinator_data(data) == data
+
+
+async def test_diagnostics_redacts_unpunctuated_macs_anywhere(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test an unpunctuated MAC is redacted under an unknown key or as a key.
+
+    The controller is not consistent about punctuation, and the key list only
+    knows the MAC fields that exist today. A bare twelve-hex value is an
+    address wherever it turns up, and it is the same address as its punctuated
+    form, so both have to reach the same placeholder.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["clients"] = {
+        "site-1": {
+            "client-1": {
+                "macAddress": "AA:BB:CC:44:55:60",
+                # A field no model declares, holding the unpunctuated form.
+                "wiredUplinkMacAddress": "aabbcc445560",
+            }
+        }
+    }
+    coordinator.data["devices"] = {
+        # Devices reported without an id are keyed by MAC, and nothing
+        # guarantees the controller punctuates it.
+        "site-1": {"aabbcc445560": {"name": "Hallway AP", "model": "U7-Pro"}}
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    client = diagnostics["data"]["clients"]["site-1"]["client-1"]
+    (device_key,) = diagnostics["data"]["devices"]["site-1"]
+
+    assert client["wiredUplinkMacAddress"].startswith("**REDACTED-MAC-")
+    assert device_key.startswith("**REDACTED-MAC-")
+    # One address, one placeholder, whichever way it was written.
+    assert client["wiredUplinkMacAddress"] == client["macAddress"] == device_key
+    assert "aabbcc445560" not in _strings(diagnostics)
+
+
+async def test_diagnostics_keeps_malformed_mac_values_distinct(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test two unparsable values under MAC keys do not share a placeholder.
+
+    The models accept any string for a MAC field. Canonicalizing by discarding
+    everything that is not a hex character would make `not-a-mac` and `aac`
+    the same value, which quietly rewrites the client-to-device relationships
+    the placeholders exist to preserve.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["clients"] = {
+        "site-1": {
+            "client-1": {"macAddress": "not-a-mac", "apMac": "aac"},
+            "client-2": {"macAddress": "aac"},
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    clients = diagnostics["data"]["clients"]["site-1"]
+    first = clients["client-1"]
+    second = clients["client-2"]
+
+    assert first["macAddress"] != first["apMac"]
+    # The same unparsable value is still the same value.
+    assert first["apMac"] == second["macAddress"]
+    for value in (first["macAddress"], first["apMac"]):
+        assert value.startswith("**REDACTED-MAC-")
+    assert "not-a-mac" not in _strings(diagnostics)
