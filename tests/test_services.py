@@ -1,5 +1,8 @@
 """Tests for UniFi Insights services."""
 
+import ast
+import inspect
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,12 +13,27 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.coordinators.facade import (
+    UnifiFacadeCoordinator,
+)
 from custom_components.unifi_insights.services import (
     SERVICE_REFRESH_DATA,
     SERVICE_RESTART_DEVICE,
+    _client_records_match,
+    _coord_data,
+    _coord_section,
+    _entry_has_client,
+    _entry_has_device,
+    _entry_has_site,
+    _entry_owns_client,
+    _entry_owns_device,
+    _get_coordinator_for_network_resource,
+    _get_coordinator_for_protect_resource,
     _get_coordinators,
-    _get_first_coordinator,
-    _get_protect_coordinator,
+    _mac_key,
+    _protect_entry_has_resource,
+    _protect_owns_resource,
+    _select_console,
     async_setup_services,
     async_unload_services,
 )
@@ -62,81 +80,6 @@ class TestGetCoordinators:
         ):
             coordinators = _get_coordinators(hass)
             assert len(coordinators) == 0
-
-
-class TestGetFirstCoordinator:
-    """Tests for _get_first_coordinator helper."""
-
-    def test_get_first_coordinator_found(self, hass: HomeAssistant):
-        """Test getting first coordinator when available."""
-        mock_coordinator = MagicMock()
-        mock_entry = MagicMock()
-        mock_entry.runtime_data = MagicMock()
-        mock_entry.runtime_data.coordinator = mock_coordinator
-
-        with patch.object(
-            hass.config_entries,
-            "async_entries",
-            return_value=[mock_entry],
-        ):
-            coordinator = _get_first_coordinator(hass)
-            assert coordinator == mock_coordinator
-
-    def test_get_first_coordinator_not_found(self, hass: HomeAssistant):
-        """Test getting first coordinator when none available."""
-        with patch.object(
-            hass.config_entries,
-            "async_entries",
-            return_value=[],
-        ):
-            coordinator = _get_first_coordinator(hass)
-            assert coordinator is None
-
-
-class TestGetProtectCoordinator:
-    """Tests for _get_protect_coordinator helper."""
-
-    def test_get_protect_coordinator_found(self, hass: HomeAssistant):
-        """Test getting protect coordinator when available."""
-        mock_coordinator = MagicMock()
-        mock_coordinator.protect_client = MagicMock()  # Has protect client
-        mock_entry = MagicMock()
-        mock_entry.runtime_data = MagicMock()
-        mock_entry.runtime_data.coordinator = mock_coordinator
-
-        with patch.object(
-            hass.config_entries,
-            "async_entries",
-            return_value=[mock_entry],
-        ):
-            coordinator = _get_protect_coordinator(hass)
-            assert coordinator == mock_coordinator
-
-    def test_get_protect_coordinator_no_protect_client(self, hass: HomeAssistant):
-        """Test getting protect coordinator when no protect client."""
-        mock_coordinator = MagicMock()
-        mock_coordinator.protect_client = None  # No protect client
-        mock_entry = MagicMock()
-        mock_entry.runtime_data = MagicMock()
-        mock_entry.runtime_data.coordinator = mock_coordinator
-
-        with patch.object(
-            hass.config_entries,
-            "async_entries",
-            return_value=[mock_entry],
-        ):
-            coordinator = _get_protect_coordinator(hass)
-            assert coordinator is None
-
-    def test_get_protect_coordinator_not_found(self, hass: HomeAssistant):
-        """Test getting protect coordinator when none available."""
-        with patch.object(
-            hass.config_entries,
-            "async_entries",
-            return_value=[],
-        ):
-            coordinator = _get_protect_coordinator(hass)
-            assert coordinator is None
 
 
 class TestAsyncSetupServices:
@@ -2285,3 +2228,1279 @@ class TestSetLiveviewService:
             )
 
         await async_unload_services(hass)
+
+
+class TestConsoleOwnershipRouting:
+    """Tests for multi-console routing and ownership validation."""
+
+    @pytest.fixture
+    def multi_console_setup(self):
+        """Create mock setup with two network consoles and two Protect consoles."""
+        coord1 = MagicMock()
+        coord1.protect_client = MagicMock()
+        coord1.data = {
+            "sites": {"site1": {"id": "site1", "name": "Site 1"}},
+            "devices": {"site1": {"dev1": {"id": "dev1"}}},
+            "clients": {"site1": {"client1": {"id": "client1"}}},
+            "protect": {
+                "cameras": {"cam1": {"id": "cam1"}},
+                "lights": {"light1": {"id": "light1"}},
+                "chimes": {"chime1": {"id": "chime1"}},
+                "viewers": {"viewer1": {"id": "viewer1"}},
+                "liveviews": {"lv1": {"id": "lv1"}},
+            },
+        }
+        coord1.async_restart_device = AsyncMock()
+        coord1.async_authorize_guest = AsyncMock()
+        coord1.async_generate_voucher = AsyncMock()
+        coord1.async_delete_voucher = AsyncMock()
+        coord1.async_set_recording_mode = AsyncMock()
+        coord1.async_set_hdr_mode = AsyncMock()
+        coord1.async_set_video_mode = AsyncMock()
+        coord1.async_set_microphone_volume = AsyncMock()
+        coord1.async_set_light_mode = AsyncMock()
+        coord1.async_set_light_brightness = AsyncMock()
+        coord1.async_move_ptz_to_preset = AsyncMock()
+        coord1.async_start_ptz_patrol = AsyncMock()
+        coord1.async_stop_ptz_patrol = AsyncMock()
+        coord1.async_set_chime_volume = AsyncMock()
+        coord1.async_play_chime = AsyncMock()
+        coord1.async_set_chime_ringtone = AsyncMock()
+        coord1.async_set_chime_repeat = AsyncMock()
+        coord1.async_trigger_alarm = AsyncMock()
+        coord1.async_update_viewer = AsyncMock()
+        coord1.async_create_liveview = AsyncMock()
+
+        entry1 = MagicMock()
+        entry1.entry_id = "entry_1"
+        entry1.runtime_data = MagicMock()
+        entry1.runtime_data.coordinator = coord1
+
+        coord2 = MagicMock()
+        coord2.protect_client = MagicMock()
+        coord2.data = {
+            "sites": {"site2": {"id": "site2", "name": "Site 2"}},
+            "devices": {"site2": {"dev2": {"id": "dev2"}}},
+            "clients": {"site2": {"client2": {"id": "client2"}}},
+            "protect": {
+                "cameras": {"cam2": {"id": "cam2"}},
+                "lights": {"light2": {"id": "light2"}},
+                "chimes": {"chime2": {"id": "chime2"}},
+                "viewers": {"viewer2": {"id": "viewer2"}},
+                "liveviews": {"lv2": {"id": "lv2"}},
+            },
+        }
+        coord2.async_restart_device = AsyncMock()
+        coord2.async_authorize_guest = AsyncMock()
+        coord2.async_generate_voucher = AsyncMock()
+        coord2.async_delete_voucher = AsyncMock()
+        coord2.async_set_recording_mode = AsyncMock()
+        coord2.async_set_hdr_mode = AsyncMock()
+        coord2.async_set_video_mode = AsyncMock()
+        coord2.async_set_microphone_volume = AsyncMock()
+        coord2.async_set_light_mode = AsyncMock()
+        coord2.async_set_light_brightness = AsyncMock()
+        coord2.async_move_ptz_to_preset = AsyncMock()
+        coord2.async_start_ptz_patrol = AsyncMock()
+        coord2.async_stop_ptz_patrol = AsyncMock()
+        coord2.async_set_chime_volume = AsyncMock()
+        coord2.async_play_chime = AsyncMock()
+        coord2.async_set_chime_ringtone = AsyncMock()
+        coord2.async_set_chime_repeat = AsyncMock()
+        coord2.async_trigger_alarm = AsyncMock()
+        coord2.async_update_viewer = AsyncMock()
+        coord2.async_create_liveview = AsyncMock()
+
+        entry2 = MagicMock()
+        entry2.entry_id = "entry_2"
+        entry2.runtime_data = MagicMock()
+        entry2.runtime_data.coordinator = coord2
+
+        return entry1, coord1, entry2, coord2
+
+    async def test_network_service_routes_to_owning_console(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test network service calls route to console owning site and device."""
+        entry1, coord1, entry2, coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_entries",
+            return_value=[entry1, entry2],
+        ):
+            # Target device on console 2
+            await hass.services.async_call(
+                DOMAIN,
+                "restart_device",
+                {"site_id": "site2", "device_id": "dev2"},
+                blocking=True,
+            )
+            coord2.async_restart_device.assert_called_once_with("site2", "dev2")
+            coord1.async_restart_device.assert_not_called()
+
+            # Target device on console 1
+            await hass.services.async_call(
+                DOMAIN,
+                "restart_device",
+                {"site_id": "site1", "device_id": "dev1"},
+                blocking=True,
+            )
+            coord1.async_restart_device.assert_called_once_with("site1", "dev1")
+
+        await async_unload_services(hass)
+
+    async def test_protect_services_route_to_owning_console(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test Protect services route to the console owning the target resource."""
+        entry1, coord1, entry2, coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_entries",
+            return_value=[entry1, entry2],
+        ):
+            # Camera services on console 2
+            await hass.services.async_call(
+                DOMAIN,
+                "set_recording_mode",
+                {"camera_id": "cam2", "mode": "always"},
+                blocking=True,
+            )
+            coord2.async_set_recording_mode.assert_called_once_with("cam2", "always")
+            coord1.async_set_recording_mode.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_hdr_mode",
+                {"camera_id": "cam2", "mode": "auto"},
+                blocking=True,
+            )
+            coord2.async_set_hdr_mode.assert_called_once_with("cam2", "auto")
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_video_mode",
+                {"camera_id": "cam2", "mode": "sport"},
+                blocking=True,
+            )
+            coord2.async_set_video_mode.assert_called_once_with("cam2", "sport")
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_mic_volume",
+                {"camera_id": "cam2", "volume": 80},
+                blocking=True,
+            )
+            coord2.async_set_microphone_volume.assert_called_once_with("cam2", 80)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "ptz_move",
+                {"camera_id": "cam2", "preset": 2},
+                blocking=True,
+            )
+            coord2.async_move_ptz_to_preset.assert_called_once_with("cam2", 2)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "ptz_patrol",
+                {"camera_id": "cam2", "action": "start", "slot": 1},
+                blocking=True,
+            )
+            coord2.async_start_ptz_patrol.assert_called_once_with("cam2", 1)
+
+            # Light services on console 1
+            await hass.services.async_call(
+                DOMAIN,
+                "set_light_mode",
+                {"light_id": "light1", "mode": "motion"},
+                blocking=True,
+            )
+            coord1.async_set_light_mode.assert_called_once_with("light1", "motion")
+            coord2.async_set_light_mode.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_light_level",
+                {"light_id": "light1", "level": 60},
+                blocking=True,
+            )
+            coord1.async_set_light_brightness.assert_called_once_with("light1", 60)
+
+            # Chime services on console 2
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_volume",
+                {"chime_id": "chime2", "volume": 70},
+                blocking=True,
+            )
+            coord2.async_set_chime_volume.assert_called_once_with("chime2", 70)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_volume",
+                {"chime_id": "chime2", "camera_id": "cam2", "volume": 40},
+                blocking=True,
+            )
+            # camera_id only selects the owning console; the Protect API call
+            # itself stays chime-wide.
+            assert coord2.async_set_chime_volume.call_count == 2
+            coord2.async_set_chime_volume.assert_called_with("chime2", 40)
+            coord1.async_set_chime_volume.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "play_chime_ringtone",
+                {"chime_id": "chime2"},
+                blocking=True,
+            )
+            coord2.async_play_chime.assert_called_once_with("chime2")
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_ringtone",
+                {"chime_id": "chime2", "ringtone_id": "default"},
+                blocking=True,
+            )
+            coord2.async_set_chime_ringtone.assert_called_once_with("chime2", "default")
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_ringtone",
+                {"chime_id": "chime2", "camera_id": "cam2", "ringtone_id": "digital"},
+                blocking=True,
+            )
+            # camera_id only selects the owning console; the Protect API call
+            # itself stays chime-wide.
+            assert coord2.async_set_chime_ringtone.call_count == 2
+            coord2.async_set_chime_ringtone.assert_called_with("chime2", "digital")
+            coord1.async_set_chime_ringtone.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_repeat_times",
+                {"chime_id": "chime2", "repeat_times": 3},
+                blocking=True,
+            )
+            coord2.async_set_chime_repeat.assert_called_once_with("chime2", 3)
+
+            # trigger_alarm takes an alarm-manager webhook id that appears in
+            # no coordinator collection, so the console must be named.
+            await hass.services.async_call(
+                DOMAIN,
+                "trigger_alarm",
+                {"alarm_id": "alarm1", "console_id": entry1.entry_id},
+                blocking=True,
+            )
+            coord1.async_trigger_alarm.assert_called_once_with("alarm1")
+            coord2.async_trigger_alarm.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_liveview",
+                {"viewer_id": "viewer2", "liveview_id": "lv2"},
+                blocking=True,
+            )
+            coord2.async_update_viewer.assert_called_once_with(
+                "viewer2", liveview="lv2"
+            )
+
+        await async_unload_services(hass)
+
+    async def test_cross_console_network_targeting_prevented(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test error when device belongs to a different console."""
+        entry1, _coord1, entry2, _coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match="belongs to a different console"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "restart_device",
+                {"site_id": "site1", "device_id": "dev2"},
+                blocking=True,
+            )
+
+        await async_unload_services(hass)
+
+    async def test_cross_console_protect_targeting_prevented(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test error when secondary Protect resource is on another console."""
+        entry1, _coord1, entry2, _coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match="belongs to a different Protect console"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_volume",
+                {"chime_id": "chime1", "camera_id": "cam2", "volume": 50},
+                blocking=True,
+            )
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match="belongs to a different Protect console"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_liveview",
+                {"viewer_id": "viewer1", "liveview_id": "lv2"},
+                blocking=True,
+            )
+
+        await async_unload_services(hass)
+
+    async def test_legacy_site_id_only_calls_route_correctly(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test legacy site_id-only calls route to the console owning the site."""
+        entry1, coord1, entry2, coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_entries",
+            return_value=[entry1, entry2],
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "generate_voucher",
+                {"site_id": "site2"},
+                blocking=True,
+            )
+            coord2.async_generate_voucher.assert_called_once()
+            coord1.async_generate_voucher.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "delete_voucher",
+                {"site_id": "site1", "voucher_id": "v1"},
+                blocking=True,
+            )
+            coord1.async_delete_voucher.assert_called_once_with("site1", "v1")
+            coord2.async_delete_voucher.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "authorize_guest",
+                {"site_id": "site2", "client_id": "client2"},
+                blocking=True,
+            )
+            coord2.async_authorize_guest.assert_called_once_with("site2", "client2")
+            coord1.async_authorize_guest.assert_not_called()
+
+        await async_unload_services(hass)
+
+    async def test_ambiguous_network_target_fails_informatively(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test ambiguous network target across consoles fails with clear error."""
+        entry1, coord1, entry2, coord2 = multi_console_setup
+        # Both consoles contain the same site "site_shared"
+        coord1.data["sites"]["site_shared"] = {"id": "site_shared"}
+        coord2.data["sites"]["site_shared"] = {"id": "site_shared"}
+
+        await async_setup_services(hass)
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError,
+                match=r"Multiple consoles contain site 'site_shared'",
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "generate_voucher",
+                {"site_id": "site_shared"},
+                blocking=True,
+            )
+
+        await async_unload_services(hass)
+
+    async def test_missing_network_target_fails_informatively(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test missing site or device fails informatively."""
+        entry1, _coord1, entry2, _coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match=r"Site 'unknown_site' not found"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "restart_device",
+                {"site_id": "unknown_site", "device_id": "dev1"},
+                blocking=True,
+            )
+
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match=r"Device 'missing_dev' not found"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "restart_device",
+                {"site_id": "site1", "device_id": "missing_dev"},
+                blocking=True,
+            )
+
+        await async_unload_services(hass)
+
+    async def test_ambiguous_and_missing_protect_target_fails(
+        self, hass: HomeAssistant, multi_console_setup
+    ):
+        """Test ambiguous and missing Protect targets fail."""
+        entry1, _coord1, entry2, _coord2 = multi_console_setup
+        await async_setup_services(hass)
+
+        # Ambiguous when multiple Protect consoles exist and no target is provided
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match="Multiple UniFi Protect consoles"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "create_liveview",
+                {"name": "MyView", "layout": 2},
+                blocking=True,
+            )
+
+        # Missing Protect resource
+        with (
+            patch.object(
+                hass.config_entries,
+                "async_entries",
+                return_value=[entry1, entry2],
+            ),
+            pytest.raises(
+                ServiceValidationError, match=r"Camera 'cam_nonexistent' not found"
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_recording_mode",
+                {"camera_id": "cam_nonexistent", "mode": "always"},
+                blocking=True,
+            )
+
+        # A secondary resource no console claims must NOT fail the call: it is
+        # usually just newer than the last refresh. It proceeds on the console
+        # that owns the primary resource.
+        with patch.object(
+            hass.config_entries,
+            "async_entries",
+            return_value=[entry1, entry2],
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_volume",
+                {"chime_id": "chime1", "camera_id": "cam_unknown", "volume": 50},
+                blocking=True,
+            )
+            _coord1.async_set_chime_volume.assert_called_once_with("chime1", 50)
+            _coord2.async_set_chime_volume.assert_not_called()
+
+        await async_unload_services(hass)
+
+    def test_direct_resolver_unit_tests(self, hass: HomeAssistant, multi_console_setup):
+        """Direct branch coverage tests for network and protect resolvers."""
+        entry1, coord1, entry2, coord2 = multi_console_setup
+
+        # Test no entries found
+        with patch.object(hass.config_entries, "async_entries", return_value=[]):
+            with pytest.raises(
+                ServiceValidationError, match="No UniFi Insights coordinator"
+            ):
+                _get_coordinator_for_network_resource(hass)
+            with pytest.raises(
+                ServiceValidationError, match="No UniFi Protect coordinator"
+            ):
+                _get_coordinator_for_protect_resource(hass)
+
+        # Test single protect console with create_liveview
+        with patch.object(hass.config_entries, "async_entries", return_value=[entry1]):
+            c = _get_coordinator_for_protect_resource(hass)
+            assert c == coord1
+
+        # Test helper functions directly
+        assert _coord_data(None) is None
+        assert _coord_data(MagicMock(runtime_data=None)) is None
+        mock_non_dict = MagicMock()
+        mock_non_dict.runtime_data.coordinator.data = "not-a-dict"
+        assert _coord_data(mock_non_dict) is None
+
+        # Test _entry_has_site fallback
+        assert _entry_has_site(MagicMock(runtime_data=None), "any") is True
+        # Test _entry_has_device fallback
+        assert _entry_has_device(MagicMock(runtime_data=None), "site1", "dev1") is True
+        # Test _entry_has_client fallback
+        assert _entry_has_client(MagicMock(runtime_data=None), "site1", "c1") is True
+        # Test _protect_entry_has_resource fallback
+        assert (
+            _protect_entry_has_resource(MagicMock(runtime_data=None), "cameras", "c1")
+            is True
+        )
+
+        # Test ambiguous device across multiple consoles
+        coord1.data["sites"]["site_ambig"] = {}
+        coord2.data["sites"]["site_ambig"] = {}
+        coord1.data["devices"]["site_ambig"] = {"dev_dup": {}}
+        coord2.data["devices"]["site_ambig"] = {"dev_dup": {}}
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry1, entry2]
+            ),
+            pytest.raises(ServiceValidationError, match="Multiple consoles found for"),
+        ):
+            _get_coordinator_for_network_resource(
+                hass, site_id="site_ambig", device_id="dev_dup"
+            )
+
+        # Test ambiguous protect resource across consoles
+        coord1.data["protect"]["cameras"]["cam_dup"] = {}
+        coord2.data["protect"]["cameras"]["cam_dup"] = {}
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry1, entry2]
+            ),
+            pytest.raises(
+                ServiceValidationError, match="Multiple Protect consoles contain"
+            ),
+        ):
+            _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam_dup"
+            )
+
+
+class TestServiceCoordinatorContract:
+    """Guard the service layer against calling methods the facade lacks."""
+
+    def test_every_coordinator_method_called_by_services_exists(self):
+        """Every ``coordinator.<method>()`` in services.py must exist on the facade.
+
+        The service tests drive MagicMock coordinators, which happily accept any
+        attribute name. That is how ``async_set_camera_chime_volume`` - a method
+        no coordinator ever defined - shipped green. This test reads the real
+        source instead of a mock.
+        """
+        services_py = (
+            Path(__file__).parent.parent
+            / "custom_components"
+            / "unifi_insights"
+            / "services.py"
+        )
+        tree = ast.parse(services_py.read_text(encoding="utf-8"))
+
+        calls: list[tuple[str, int, list[str], bool]] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "coordinator"
+            ):
+                starred = any(isinstance(a, ast.Starred) for a in node.args) or any(
+                    kw.arg is None for kw in node.keywords
+                )
+                calls.append(
+                    (
+                        node.func.attr,
+                        len(node.args),
+                        [kw.arg for kw in node.keywords if kw.arg],
+                        starred,
+                    )
+                )
+
+        assert calls, "no coordinator.<method>() calls found - parser broke"
+
+        missing = sorted(
+            {
+                name
+                for name, _, _, _ in calls
+                if not hasattr(UnifiFacadeCoordinator, name)
+            }
+        )
+        assert not missing, (
+            f"services.py calls coordinator methods that do not exist on "
+            f"UnifiFacadeCoordinator: {missing}"
+        )
+
+        # hasattr alone would still accept a 3-arg call to a 2-arg method, which
+        # is exactly how the per-camera chime bug could come back. Bind instead.
+        bad_arity: list[str] = []
+        for name, positional, keywords, starred in calls:
+            if starred:
+                continue
+            signature = inspect.signature(getattr(UnifiFacadeCoordinator, name))
+            try:
+                signature.bind(
+                    object(),  # self
+                    *[object()] * positional,
+                    **dict.fromkeys(keywords, object()),
+                )
+            except TypeError as err:
+                bad_arity.append(f"{name}: {err}")
+        assert not bad_arity, (
+            f"services.py calls coordinator methods with arguments they do not "
+            f"accept: {bad_arity}"
+        )
+
+
+class TestAlarmRouting:
+    """`alarm_id` is an alarm-manager webhook trigger, not a cached resource."""
+
+    @staticmethod
+    def _console(entry_id, title):
+        """Build a console whose Protect data has every real collection."""
+        coord = MagicMock()
+        coord.protect_client = MagicMock()
+        coord.data = {
+            "sites": {},
+            "devices": {},
+            "clients": {},
+            "protect": {
+                "cameras": {},
+                "lights": {},
+                "sensors": {},
+                "nvrs": {},
+                "viewers": {},
+                "chimes": {},
+                "doorlocks": {},
+                "viewports": {},
+                "liveviews": {},
+                "protect_info": {},
+                "events": {},
+            },
+        }
+        coord.async_trigger_alarm = AsyncMock()
+        entry = MagicMock()
+        entry.entry_id = entry_id
+        entry.title = title
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = coord
+        return entry, coord
+
+    async def test_single_console_routes_despite_unknown_id(self, hass: HomeAssistant):
+        """One console takes the call even though the id is in no collection."""
+        entry, coord = self._console("entry_1", "Dream Machine")
+
+        await async_setup_services(hass)
+        with patch.object(hass.config_entries, "async_entries", return_value=[entry]):
+            await hass.services.async_call(
+                DOMAIN,
+                "trigger_alarm",
+                {"alarm_id": "webhook-trigger-1"},
+                blocking=True,
+            )
+
+        coord.async_trigger_alarm.assert_called_once_with("webhook-trigger-1")
+        await async_unload_services(hass)
+
+    async def test_two_consoles_without_console_id_is_refused(
+        self, hass: HomeAssistant
+    ):
+        """With two consoles and nothing to route on, ask for console_id."""
+        entry1, coord1 = self._console("entry_1", "Dream Machine")
+        entry2, coord2 = self._console("entry_2", "Cloud Key")
+
+        await async_setup_services(hass)
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry1, entry2]
+            ),
+            pytest.raises(ServiceValidationError, match="console_id"),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "trigger_alarm",
+                {"alarm_id": "webhook-trigger-1"},
+                blocking=True,
+            )
+
+        coord1.async_trigger_alarm.assert_not_called()
+        coord2.async_trigger_alarm.assert_not_called()
+        await async_unload_services(hass)
+
+    async def test_console_id_selects_by_title_or_entry_id(self, hass: HomeAssistant):
+        """console_id accepts the entry ID or the console's title."""
+        entry1, coord1 = self._console("entry_1", "Dream Machine")
+        entry2, coord2 = self._console("entry_2", "Cloud Key")
+
+        await async_setup_services(hass)
+        with patch.object(
+            hass.config_entries, "async_entries", return_value=[entry1, entry2]
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "trigger_alarm",
+                {"alarm_id": "t1", "console_id": "Cloud Key"},
+                blocking=True,
+            )
+            coord2.async_trigger_alarm.assert_called_once_with("t1")
+            coord1.async_trigger_alarm.assert_not_called()
+
+            await hass.services.async_call(
+                DOMAIN,
+                "trigger_alarm",
+                {"alarm_id": "t2", "console_id": "entry_1"},
+                blocking=True,
+            )
+            coord1.async_trigger_alarm.assert_called_once_with("t2")
+
+        await async_unload_services(hass)
+
+    async def test_unknown_console_id_lists_the_configured_ones(
+        self, hass: HomeAssistant
+    ):
+        """A console_id that matches nothing names what is configured."""
+        entry1, _ = self._console("entry_1", "Dream Machine")
+        entry2, _ = self._console("entry_2", "Cloud Key")
+
+        await async_setup_services(hass)
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry1, entry2]
+            ),
+            pytest.raises(ServiceValidationError, match="Cloud Key"),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "trigger_alarm",
+                {"alarm_id": "t1", "console_id": "Nonexistent"},
+                blocking=True,
+            )
+
+        await async_unload_services(hass)
+
+
+class TestClientMacRouting:
+    """Guest authorisation is commonly targeted by MAC, not by client id."""
+
+    def test_entry_matches_client_by_mac_address(self):
+        """A MAC belonging to a site's client record counts as ownership."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator.data = {
+            "clients": {
+                "site1": {"abc123": {"id": "abc123", "macAddress": "AA:BB:CC:DD:EE:FF"}}
+            }
+        }
+
+        assert _entry_has_client(entry, "site1", "aa:bb:cc:dd:ee:ff") is True
+        assert _entry_has_client(entry, "site1", "AA-BB-CC-DD-EE-FF") is True
+        assert _entry_has_client(entry, "site1", "abc123") is True
+        assert _entry_has_client(entry, "site1", "11:22:33:44:55:66") is False
+
+    @staticmethod
+    def _console(entry_id, site_id, clients):
+        coord = MagicMock()
+        coord.protect_client = None
+        # No "sites" collection: site filtering stays permissive and keeps
+        # both consoles, so the client branch is what has to decide.
+        coord.data = {
+            "devices": {site_id: {}},
+            "clients": {site_id: clients},
+        }
+        coord.async_authorize_guest = AsyncMock()
+        entry = MagicMock()
+        entry.entry_id = entry_id
+        entry.title = entry_id
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = coord
+        return entry, coord
+
+    async def test_client_on_two_consoles_is_ambiguous(self, hass: HomeAssistant):
+        """A MAC seen on both consoles must raise, not silently pick console 1."""
+        mac = "AA:BB:CC:DD:EE:FF"
+        entry1, coord1 = self._console(
+            "entry_1", "siteX", {"c1": {"id": "c1", "macAddress": mac}}
+        )
+        entry2, coord2 = self._console(
+            "entry_2", "siteX", {"c2": {"id": "c2", "macAddress": mac}}
+        )
+
+        await async_setup_services(hass)
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry1, entry2]
+            ),
+            pytest.raises(ServiceValidationError, match="ambiguous"),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "authorize_guest",
+                {"site_id": "siteX", "client_id": "aabbccddeeff"},
+                blocking=True,
+            )
+
+        coord1.async_authorize_guest.assert_not_called()
+        coord2.async_authorize_guest.assert_not_called()
+        await async_unload_services(hass)
+
+    async def test_client_on_one_console_routes_there(self, hass: HomeAssistant):
+        """The same MAC on only one console routes to that console."""
+        entry1, coord1 = self._console(
+            "entry_1", "siteX", {"c1": {"id": "c1", "macAddress": "11:22:33:44:55:66"}}
+        )
+        entry2, coord2 = self._console(
+            "entry_2", "siteX", {"c2": {"id": "c2", "macAddress": "AA:BB:CC:DD:EE:FF"}}
+        )
+
+        await async_setup_services(hass)
+        with patch.object(
+            hass.config_entries, "async_entries", return_value=[entry1, entry2]
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                "authorize_guest",
+                {"site_id": "siteX", "client_id": "aa-bb-cc-dd-ee-ff"},
+                blocking=True,
+            )
+
+        coord2.async_authorize_guest.assert_called_once()
+        coord1.async_authorize_guest.assert_not_called()
+        await async_unload_services(hass)
+
+
+class TestConsoleRoutingEdgeCases:
+    """Additional unit tests covering edge cases in console routing helpers."""
+
+    def test_coord_data_and_section_edge_cases(self):
+        """Test _coord_data and _coord_section edge cases."""
+        assert _coord_data(None) is None
+
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _coord_data(entry) is None
+        assert _coord_section(entry, "devices") is None
+
+        entry.runtime_data = MagicMock(coordinator=None)
+        assert _coord_data(entry) is None
+
+        entry.runtime_data.coordinator = MagicMock(data="not-a-dict")
+        assert _coord_data(entry) is None
+
+        entry.runtime_data.coordinator.data = {"devices": "not-a-dict", "sites": {"s1": {}}}
+        assert _coord_section(entry, "devices") is None
+        assert _coord_section(entry, "sites") == {"s1": {}}
+
+    def test_entry_has_and_owns_device_edge_cases(self):
+        """Test device ownership checks under abnormal or non-dict coordinator data."""
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _entry_has_device(entry, "s1", "d1") is True
+        assert _entry_owns_device(entry, "s1", "d1") is False
+
+        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"devices": "invalid"}))
+        assert _entry_has_device(entry, "s1", "d1") is True
+        assert _entry_owns_device(entry, "s1", "d1") is False
+
+        entry.runtime_data.coordinator.data = {"devices": {"s1": "invalid"}}
+        assert _entry_has_device(entry, "s1", "d1") is True
+
+        entry.runtime_data.coordinator.data = {"devices": {"s1": {"d1": {}}}}
+        assert _entry_owns_device(entry, None, "d1") is True
+        assert _entry_owns_device(entry, None, "d2") is False
+
+    def test_entry_has_and_owns_client_edge_cases(self):
+        """Test client ownership checks under abnormal coordinator data."""
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _entry_has_client(entry, "s1", "c1") is True
+        assert _entry_owns_client(entry, "s1", "c1") is False
+
+        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"clients": "invalid"}))
+        assert _entry_has_client(entry, "s1", "c1") is True
+        assert _entry_owns_client(entry, "s1", "c1") is False
+
+        entry.runtime_data.coordinator.data = {"clients": {"s1": "invalid"}}
+        assert _entry_has_client(entry, "s1", "c1") is True
+
+        entry.runtime_data.coordinator.data = {"clients": {"s1": {"c1": {"id": "c1"}}}}
+        assert _entry_has_client(entry, None, "c1") is True
+        assert _entry_owns_client(entry, None, "c1") is True
+        assert _entry_owns_client(entry, None, "nonexistent") is False
+
+    def test_mac_key_and_client_records_match_edge_cases(self):
+        """Test _mac_key and _client_records_match edge cases."""
+        assert _mac_key(123) is None
+        assert _mac_key("") is None
+        assert _mac_key("   ") is None
+        assert _mac_key("AA:BB:CC:DD:EE:FF") == "aabbccddeeff"
+
+        records = {"c1": "not-a-dict", "c2": {"mac": "11:22:33:44:55:66"}}
+        assert _client_records_match(records, "c1") is True
+        assert _client_records_match(records, "unknown_client") is False
+        assert _client_records_match(records, "11-22-33-44-55-66") is True
+
+    def test_protect_owns_resource_edge_cases(self):
+        """Test _protect_owns_resource edge cases."""
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _protect_owns_resource(entry, "cameras", "cam1") is None
+
+        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"protect": "invalid"}))
+        assert _protect_owns_resource(entry, "cameras", "cam1") is None
+
+        entry.runtime_data.coordinator.data = {"protect": {"cameras": "invalid"}}
+        assert _protect_owns_resource(entry, "cameras", "cam1") is None
+
+    def test_select_console_duplicate_matches(self):
+        """Test _select_console raises ServiceValidationError when multiple consoles match."""
+        e1 = MagicMock(entry_id="id1", title="Console")
+        e2 = MagicMock(entry_id="id2", title="Console")
+        with pytest.raises(ServiceValidationError, match="matches more than one"):
+            _select_console([e1, e2], "Console", "Protect console")
+
+    async def test_network_resource_device_id_cross_console_mismatch(
+        self, hass: HomeAssistant
+    ):
+        """A device native ID that belongs to a different console than the
+        requested site_id must raise instead of being silently routed."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"sites": {"s1": {}}, "devices": {"s1": {"d1": {}}}}
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"sites": {"s2": {}}, "devices": {"s2": {"d2": {}}}}
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            pytest.raises(ServiceValidationError, match="belongs to a different console than site"),
+        ):
+            _get_coordinator_for_network_resource(hass, site_id="s2", device_id="d1")
+
+    async def test_network_resource_unloaded_site_and_device(self, hass: HomeAssistant):
+        """Test warm-up state where consoles haven't loaded site or device data."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
+            coord = _get_coordinator_for_network_resource(hass, site_id="unknown_site")
+            assert coord is c1
+
+            coord2 = _get_coordinator_for_network_resource(hass, device_id="unknown_dev")
+            assert coord2 is c1
+
+    async def test_network_resource_explicit_device_and_client_ownership(self, hass: HomeAssistant):
+        """Test single explicit match among candidate entries for devices and clients."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {
+            "sites": {"s1": {}},
+            "devices": {"s1": {"d_shared": {}}},
+            "clients": {"s1": {"c_shared": {"id": "c_shared"}}},
+        }
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"sites": {"s1": {}}}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_network_resource(hass, site_id="s1", device_id="d_shared")
+            assert coord is c1
+
+            coord_client = _get_coordinator_for_network_resource(hass, site_id="s1", client_id="c_shared")
+            assert coord_client is c1
+
+        # One console has site s1 explicitly, while e2 does not have s1 in sites
+        e2.runtime_data.coordinator.data = {"sites": {"s2": {}}}
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord_site = _get_coordinator_for_network_resource(hass, site_id="s1")
+            assert coord_site is c1
+
+    async def test_protect_resource_ownership_resolution_and_no_target_ambiguous(
+        self, hass: HomeAssistant
+    ):
+        """Protect resolver picks the console that owns the resource, and
+        raises when no resource_type is given and multiple consoles are
+        configured (no positive target to route on)."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam1"
+            )
+            assert coord is c1
+
+            with pytest.raises(
+                ServiceValidationError, match="carries no target to route on"
+            ):
+                _get_coordinator_for_protect_resource(hass, resource_id="cam1")
+
+    async def test_protect_resource_unloaded_data_and_unresolved_candidates(self, hass: HomeAssistant):
+        """Test Protect coordinator when data is unloaded or candidates cannot be resolved."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
+            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam_new")
+            assert coord is c1
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            pytest.raises(ServiceValidationError, match="Cannot tell which Protect console owns"),
+        ):
+            _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam_unknown")
+
+    async def test_protect_secondary_resource_unloaded_fallback(self, hass: HomeAssistant):
+        """Test secondary resource fallback when it is not yet in cached Protect data."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {
+            "protect": {"chimes": {"chime1": {}}, "cameras": {}}
+        }
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
+            coord = _get_coordinator_for_protect_resource(
+                hass,
+                resource_type="chime",
+                resource_id="chime1",
+                secondary_resource_type="camera",
+                secondary_resource_id="cam_brand_new",
+            )
+            assert coord is c1
+
+    async def test_service_handlers_with_camera_id_and_ignored_guest_options(self, hass: HomeAssistant):
+        """Test service calls passing optional camera_id and ignored guest options."""
+        coord = MagicMock(protect_client=MagicMock())
+        coord.async_set_chime_volume = AsyncMock()
+        coord.async_set_chime_ringtone = AsyncMock()
+        coord.async_set_chime_repeat = AsyncMock()
+        coord.async_authorize_guest = AsyncMock()
+        coord.data = {
+            "sites": {"s1": {}},
+            "clients": {"s1": {"c1": {"id": "c1"}}},
+            "protect": {"chimes": {"chime1": {}}, "cameras": {"cam1": {}}},
+        }
+        entry = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=coord))
+
+        await async_setup_services(hass)
+        with patch.object(hass.config_entries, "async_entries", return_value=[entry]):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_volume",
+                {"chime_id": "chime1", "volume": 50, "camera_id": "cam1"},
+                blocking=True,
+            )
+            coord.async_set_chime_volume.assert_called_once_with("chime1", 50)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_ringtone",
+                {"chime_id": "chime1", "ringtone_id": "default", "camera_id": "cam1"},
+                blocking=True,
+            )
+            coord.async_set_chime_ringtone.assert_called_once_with("chime1", "default")
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_repeat_times",
+                {"chime_id": "chime1", "repeat_times": 3, "camera_id": "cam1"},
+                blocking=True,
+            )
+            coord.async_set_chime_repeat.assert_called_once_with("chime1", 3)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "authorize_guest",
+                {"site_id": "s1", "client_id": "c1", "duration_minutes": 60},
+                blocking=True,
+            )
+            coord.async_authorize_guest.assert_called_once_with("s1", "c1")
+
+        await async_unload_services(hass)
+
+    def test_client_records_match_non_mac_chars(self):
+        """Test _client_records_match when client_id has no hex characters."""
+        records = {"c1": {"mac": "11:22:33:44:55:66"}}
+        assert _client_records_match(records, ":::---") is False
+
+    async def test_protect_resource_single_explicit_match(self, hass: HomeAssistant):
+        """Test Protect coordinator disambiguation when one console explicitly owns the resource."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}  # Unloaded Protect data
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
+            assert coord is c1
+
+    async def test_network_resource_multiple_candidate_single_explicit_site(self, hass: HomeAssistant):
+        """Test network coordinator disambiguation when multiple match site_id but only one explicitly owns it."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"sites": {"s1": {}}}
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}  # Unloaded data, so _entry_has_site is True
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_network_resource(hass, site_id="s1")
+            assert coord is c1
+
+    def test_entry_owns_device_site_scoped_and_cross_site_fallback(self):
+        """A device recorded under a different site than requested is still
+        found by the full-collection ownership scan, not just the site-scoped
+        lookup."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock(
+            coordinator=MagicMock(
+                data={"devices": {"s1": {"d1": {}}, "s2": {"d2": {}}}}
+            )
+        )
+        # site_devices is a dict and contains the id: short-circuit True.
+        assert _entry_owns_device(entry, "s1", "d1") is True
+        # site_devices is a dict but lacks the id: falls through to the
+        # cross-site scan, which finds it under "s2".
+        assert _entry_owns_device(entry, "s1", "d2") is True
+
+    def test_entry_owns_client_site_scoped_and_cross_site_fallback(self):
+        """A client recorded under a different site than requested is still
+        found by the full-collection ownership scan, not just the site-scoped
+        lookup."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock(
+            coordinator=MagicMock(
+                data={
+                    "clients": {
+                        "s1": {"c1": {"id": "c1"}},
+                        "s2": {"c2": {"id": "c2"}},
+                    }
+                }
+            )
+        )
+        # site_clients is a dict and matches: short-circuit True.
+        assert _entry_owns_client(entry, "s1", "c1") is True
+        # site_clients is a dict but doesn't match: falls through to the
+        # cross-site scan, which finds it under "s2".
+        assert _entry_owns_client(entry, "s1", "c2") is True
+
+    async def test_network_resource_device_id_resolves_via_ownership(
+        self, hass: HomeAssistant
+    ):
+        """A native device_id with no site_id given resolves via
+        device-ownership filtering alone."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"devices": {"s1": {"d1": {}}}}
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"devices": {"s2": {"d2": {}}}}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_network_resource(hass, device_id="d1")
+            assert coord is c1
+
+    async def test_network_resource_no_ownership_signal_raises_ambiguous(
+        self, hass: HomeAssistant
+    ):
+        """When neither client nor site data can positively pick a console,
+        the resolver raises instead of silently guessing the first entry."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {}
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            pytest.raises(ServiceValidationError, match="target is ambiguous"),
+        ):
+            _get_coordinator_for_network_resource(hass, client_id="mystery_client")
+
+    async def test_protect_resource_resolves_via_ownership_with_multiple_candidates(
+        self, hass: HomeAssistant
+    ):
+        """Protect resolver picks the console that owns the resource when
+        multiple Protect consoles are configured and neither uniquely-owned
+        camera collides with the other."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam1"
+            )
+            assert coord is c1
