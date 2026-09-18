@@ -732,6 +732,21 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                         ):
                             return self.async_abort(reason="account_mismatch")
 
+                        # The guard above only fires when both ids look like
+                        # MACs, so a legacy entry still keyed on a site id or
+                        # host slips past it. Setup and the migration both
+                        # check for an existing owner before claiming a
+                        # unique_id; async_update_reload_and_abort does not,
+                        # and Home Assistant will happily let two entries
+                        # share one.
+                        if new_id and new_id != entry.unique_id:
+                            entries = self.hass.config_entries
+                            owner = entries.async_entry_for_domain_unique_id(
+                                DOMAIN, new_id
+                            )
+                            if owner and owner.entry_id != entry.entry_id:
+                                return self.async_abort(reason="already_configured")
+
                         new_data = {
                             CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
                             CONF_HOST: user_input[CONF_HOST],

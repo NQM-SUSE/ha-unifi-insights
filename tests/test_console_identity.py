@@ -735,6 +735,85 @@ async def test_reconfigure_transient_device_error_preserves_console_mac(
         assert entry.unique_id == "11:22:33:44:55:66"
 
 
+async def test_reconfigure_rejects_a_unique_id_another_entry_owns(
+    hass: HomeAssistant,
+) -> None:
+    """Reconfigure must not claim a unique_id that another entry already holds.
+
+    The account_mismatch guard only fires when the stored id and the newly
+    discovered one both look like MACs, so a legacy entry still keyed on a
+    site id slips past it. async_update_reload_and_abort does not check for
+    an existing owner and Home Assistant will let two entries share one
+    unique_id, which is why setup and the migration both look first.
+    """
+    legacy = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="site-a",
+        title="UniFi - Legacy",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "initial_key",
+            CONF_CONSOLE_ID: "site-a",
+        },
+    )
+    legacy.add_to_hass(hass)
+
+    # A second entry already owns the console this reconfigure would resolve to.
+    owner = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="aa:bb:cc:dd:ee:ff",
+        title="UniFi - Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.2",
+            CONF_API_KEY: "other_key",
+            CONF_CONSOLE_ID: "aa:bb:cc:dd:ee:ff",
+        },
+    )
+    owner.add_to_hass(hass)
+
+    net_cm, _ = _make_mock_client(
+        sites=[MagicMock(id="site-a", name="Default")],
+        devices=[
+            MagicMock(
+                type=None,
+                model="UniFi Dream Machine PRO SE",
+                mac="AA:BB:CC:DD:EE:FF",
+                name="Crestwood",
+            )
+        ],
+    )
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": legacy.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.2",
+                CONF_API_KEY: "initial_key",
+            },
+        )
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    # Neither entry was mutated.
+    assert legacy.unique_id == "site-a"
+    assert owner.unique_id == "aa:bb:cc:dd:ee:ff"
+
+
 async def test_reconfigure_detects_gateway_with_unknown_model(
     hass: HomeAssistant,
 ) -> None:
