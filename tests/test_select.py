@@ -197,6 +197,80 @@ class TestAsyncSetupEntry:
         assert len(entities) == 1
         assert isinstance(entities[0], UnifiProtectViewerLiveviewSelect)
 
+    async def test_setup_entry_rediscovery_dedupes_ptz_and_liveview_selects(
+        self, mock_config_entry
+    ):
+        """Re-running discovery skips already-known PTZ preset/liveview selects."""
+        mock_coordinator = MagicMock()
+        mock_coordinator.protect_client = MagicMock()
+        mock_coordinator.data = {
+            "sites": {},
+            "devices": {},
+            "protect": {
+                "cameras": {
+                    "cam1": {
+                        "id": "cam1",
+                        "name": "PTZ Camera",
+                        "state": "CONNECTED",
+                        "isPtz": True,
+                    },
+                },
+                "chimes": {},
+                "viewers": {
+                    "viewer1": {
+                        "id": "viewer1",
+                        "name": "Living Room Viewer",
+                        "state": "CONNECTED",
+                    },
+                },
+                "liveviews": {
+                    "lv1": {"id": "lv1", "name": "Default View"},
+                },
+                "lights": {},
+                "sensors": {},
+                "nvrs": {},
+            },
+        }
+        mock_config_entry.runtime_data = MagicMock()
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def add_entities(new_entities, **kwargs):
+            entities.extend(new_entities)
+
+        await async_setup_entry(MagicMock(), mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        ptz_before = len(
+            [e for e in entities if isinstance(e, UnifiProtectPTZPresetSelect)]
+        )
+        liveview_before = len(
+            [e for e in entities if isinstance(e, UnifiProtectViewerLiveviewSelect)]
+        )
+        assert ptz_before == 1
+        assert liveview_before == 1
+        first_total = len(entities)
+
+        # Re-running discovery with unchanged data must not add duplicates.
+        listener()
+
+        assert len(entities) == first_total
+        assert (
+            len([e for e in entities if isinstance(e, UnifiProtectPTZPresetSelect)])
+            == ptz_before
+        )
+        assert (
+            len(
+                [
+                    e
+                    for e in entities
+                    if isinstance(e, UnifiProtectViewerLiveviewSelect)
+                ]
+            )
+            == liveview_before
+        )
+
 
 class TestUnifiProtectHDRModeSelect:
     """Tests for UnifiProtectHDRModeSelect entity."""

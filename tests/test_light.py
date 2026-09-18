@@ -125,6 +125,42 @@ class TestAsyncSetupEntry:
         entities = async_add_entities.call_args[0][0]
         assert len(entities) == 3
 
+    @pytest.mark.asyncio
+    async def test_setup_entry_skips_light_that_fails_to_initialize(
+        self, hass, mock_coordinator
+    ) -> None:
+        """A light whose data raises during initialization is skipped, not fatal."""
+        mock_coordinator.data["protect"]["lights"] = {
+            "light_bad": {
+                "id": "light_bad",
+                "name": "Bad Light",
+                "state": "CONNECTED",
+                # Non-numeric ledLevel makes the brightness computation raise
+                # TypeError inside UnifiProtectLight._update_from_data().
+                "lightDeviceSettings": {"ledLevel": "not-a-number"},
+            },
+            "light_good": {
+                "id": "light_good",
+                "name": "Good Light",
+                "state": "CONNECTED",
+                "lightDeviceSettings": {"ledLevel": 50},
+            },
+        }
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+
+        # Only the light that initialized successfully should be added.
+        async_add_entities.assert_called_once()
+        entities = async_add_entities.call_args[0][0]
+        assert len(entities) == 1
+        assert entities[0]._device_id == "light_good"
+
 
 class TestUnifiProtectLight:
     """Tests for UnifiProtectLight entity."""

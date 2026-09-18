@@ -778,6 +778,38 @@ class TestSFPPortSensors:
         # Port 26 has sfp_found=False → 0 SFP sensors
         assert len(sfp_sensors) == 4
 
+    async def test_setup_rediscovery_dedupes_sfp_sensors(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Re-running discovery on unchanged SFP port data adds no duplicates."""
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        sfp_sensors_before = [
+            e
+            for e in added_entities
+            if isinstance(e, UnifiPortSensor)
+            and e.entity_description.key.startswith("port_sfp_")
+        ]
+        assert len(sfp_sensors_before) == 4
+
+        listener()
+
+        sfp_sensors_after = [
+            e
+            for e in added_entities
+            if isinstance(e, UnifiPortSensor)
+            and e.entity_description.key.startswith("port_sfp_")
+        ]
+        assert len(sfp_sensors_after) == 4
+
     async def test_setup_port_labels_passed(
         self, hass: HomeAssistant, mock_coordinator, mock_config_entry
     ):
@@ -1716,6 +1748,43 @@ class TestAsyncSetupEntryWithNVRSensors:
         nvr_sensors = [e for e in entities if isinstance(e, UnifiProtectNVRSensor)]
         assert len(nvr_sensors) == 0
 
+    async def test_setup_entry_nvrs_not_a_dict_is_skipped(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A malformed (non-dict) top-level nvrs collection is skipped."""
+        mock_coordinator.data["protect"]["nvrs"] = "not-a-dict"
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+
+        nvr_sensors = [e for e in entities if isinstance(e, UnifiProtectNVRSensor)]
+        assert len(nvr_sensors) == 0
+
+    async def test_setup_entry_malformed_nvr_record_is_skipped(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A non-dict record inside the nvrs collection is skipped without
+        raising, while a well-formed sibling NVR still gets sensors."""
+        mock_coordinator.data["protect"]["nvrs"]["nvr_bad"] = "not-a-dict"
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+
+        nvr_sensors = [e for e in entities if isinstance(e, UnifiProtectNVRSensor)]
+        # The original well-formed "nvr1" still produces its 4 sensors.
+        assert len(nvr_sensors) == 4
+        assert all(s._device_id != "nvr_bad" for s in nvr_sensors)
+
 
 class TestAsyncSetupEntryEdgeCases:
     """Test setup entry edge cases for sensors."""
@@ -1990,6 +2059,40 @@ class TestAsyncSetupEntryEdgeCases:
         ]
         assert len(wan_sensors) > 0
 
+    async def test_setup_entry_wan_sensors_dedupe_on_rediscovery(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Re-running discovery for a gateway device adds no duplicate WAN sensors."""
+        mock_coordinator.data["devices"]["site1"]["device1"]["model"] = "UDM-Pro"
+        mock_coordinator.data["devices"]["site1"]["device1"]["features"] = ["gateway"]
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        wan_sensors_before = [
+            e
+            for e in entities
+            if isinstance(e, UnifiInsightsSensor)
+            and e.entity_description.key.startswith("wan_")
+        ]
+        assert len(wan_sensors_before) > 0
+
+        listener()
+
+        wan_sensors_after = [
+            e
+            for e in entities
+            if isinstance(e, UnifiInsightsSensor)
+            and e.entity_description.key.startswith("wan_")
+        ]
+        assert len(wan_sensors_after) == len(wan_sensors_before)
+
     async def test_setup_entry_uplink_rate_sensors_created_with_uplink_data(
         self, hass: HomeAssistant, mock_coordinator, mock_config_entry
     ):
@@ -2062,6 +2165,141 @@ class TestAsyncSetupEntryEdgeCases:
         )
         assert tx_sensor is not None
         assert tx_sensor.entity_description.translation_key == "tx_rate"
+
+    async def test_setup_entry_uses_top_level_ports_field(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A top-level `ports` field on device data is used directly, taking
+        priority over `interfaces.ports`."""
+        mock_coordinator.data["devices"]["site1"]["device1"]["ports"] = [
+            {"idx": 40, "state": "UP", "speedMbps": 1000},
+        ]
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+
+        port_indices = {
+            e._port_idx for e in entities if isinstance(e, UnifiPortSensor)
+        }
+        assert 40 in port_indices
+
+    async def test_setup_entry_ignores_unparseable_poe_values(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Malformed PoE data (non-dict, non-numeric power) is ignored rather
+        than raising, and no PoE sensor is created for those ports."""
+        mock_coordinator.data["devices"]["site1"]["device1"]["interfaces"][
+            "ports"
+        ] += [
+            {"idx": 30, "state": "UP", "poe": "not-a-dict"},
+            {"idx": 31, "state": "UP", "poe": {"power": "invalid"}},
+            {"idx": 32, "state": "UP", "poe_power_w": "not-a-number"},
+        ]
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+
+        poe_port_indices = {
+            e._port_idx
+            for e in entities
+            if isinstance(e, UnifiPortSensor)
+            and e.entity_description.key == "port_poe_power"
+        }
+        assert 30 not in poe_port_indices
+        assert 31 not in poe_port_indices
+        assert 32 not in poe_port_indices
+
+    async def test_setup_entry_stats_not_a_dict_for_device_is_skipped(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A malformed (non-dict) stats entry for a switching device is
+        skipped without raising, and regular port sensors are unaffected."""
+        mock_coordinator.data["devices"]["site1"]["device1"]["features"] = [
+            "switching"
+        ]
+        mock_coordinator.data["stats"]["site1"]["device1"] = "not-a-dict"
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+
+        # Regular interface port sensors (e.g. port 1, which is UP) are still
+        # created even though the stats-based fallback was skipped.
+        port_indices = {
+            e._port_idx for e in entities if isinstance(e, UnifiPortSensor)
+        }
+        assert 1 in port_indices
+
+    async def test_setup_entry_stats_fallback_skips_invalid_keys_and_dedupes(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Non-numeric keys in poe_ports/port_bytes stats are skipped; valid
+        new ports are added once and not duplicated on rediscovery."""
+        mock_coordinator.data["devices"]["site1"]["device3"] = {
+            "id": "device3",
+            "name": "Fallback Switch",
+            "model": "USW-8",
+            "state": "ONLINE",
+            "features": ["switching"],
+            "interfaces": {"ports": [{"idx": 1, "state": "DOWN"}]},
+        }
+        mock_coordinator.data["stats"]["site1"]["device3"] = {
+            "poe_ports": {
+                "abc": 5.0,
+                "5": 12.0,
+            },
+            "port_bytes": {
+                "xyz": {"tx_bytes": 100},
+                "5": {"tx_bytes": 200, "rx_bytes": 100},
+            },
+        }
+        mock_config_entry.runtime_data.coordinator = mock_coordinator
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, mock_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        device3_sensors = [
+            e
+            for e in entities
+            if isinstance(e, UnifiPortSensor) and e._device_id == "device3"
+        ]
+        # Only port 5 (valid digit key) should have sensors; "abc"/"xyz" are
+        # skipped as non-numeric keys.
+        assert {e._port_idx for e in device3_sensors} == {5}
+        keys = {e.entity_description.key for e in device3_sensors}
+        assert "port_poe_power" in keys
+        assert "port_tx_bytes" in keys
+        assert "port_rx_bytes" in keys
+        before_count = len(device3_sensors)
+
+        # Re-running discovery with unchanged data must not add duplicates.
+        listener()
+
+        device3_sensors_after = [
+            e
+            for e in entities
+            if isinstance(e, UnifiPortSensor) and e._device_id == "device3"
+        ]
+        assert len(device3_sensors_after) == before_count
 
 
 class TestUnifiInsightsSensorEdgeCases:
@@ -2702,6 +2940,45 @@ class TestAsyncSetupEntrySiteClientSensors:
 
         site_sensors = [e for e in entities if isinstance(e, UnifiSiteClientSensor)]
         assert len(site_sensors) == 0
+
+    async def test_setup_entry_clients_and_wifi_not_dicts_are_skipped(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """Malformed (non-dict) top-level clients/wifi collections are skipped
+        without raising, and produce no site or WiFi sensors."""
+        mock_coordinator.data["clients"] = "not-a-dict"
+        mock_coordinator.data["wifi"] = "not-a-dict"
+
+        config_entry = MagicMock()
+        config_entry.runtime_data = MagicMock()
+        config_entry.runtime_data.coordinator = mock_coordinator
+        config_entry.entry_id = "test_entry"
+
+        entities = []
+
+        def mock_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        with (
+            patch(
+                "custom_components.unifi_insights.sensor.er.async_get",
+                return_value=MagicMock(
+                    async_entries_for_config_entry=MagicMock(return_value=[])
+                ),
+            ),
+            patch(
+                "custom_components.unifi_insights.sensor.er.async_entries_for_config_entry",
+                return_value=[],
+            ),
+        ):
+            await async_setup_entry(hass, config_entry, mock_add_entities)
+
+        site_sensors = [e for e in entities if isinstance(e, UnifiSiteClientSensor)]
+        wifi_sensors = [
+            e for e in entities if isinstance(e, UnifiWifiClientCountSensor)
+        ]
+        assert len(site_sensors) == 0
+        assert len(wifi_sensors) == 0
 
 
 class TestHasProtectStat:

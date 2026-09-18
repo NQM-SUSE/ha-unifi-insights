@@ -79,6 +79,22 @@ class TestAsyncSetupEntry:
 
         async_add_entities.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_setup_returns_early_when_wifi_not_a_dict(
+        self, hass: HomeAssistant, mock_coordinator
+    ) -> None:
+        """No entities are added and no exception raised when wifi data is malformed."""
+        mock_coordinator.data["wifi"] = "not-a-dict"
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+
+        async_add_entities.assert_not_called()
+
 
 class TestUnifiWifiQrCodeImage:
     """Tests for the UnifiWifiQrCodeImage entity."""
