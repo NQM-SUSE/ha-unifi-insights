@@ -8,12 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers import (
-    device_registry as dr,
-)
-from homeassistant.helpers import (
-    entity_registry as er,
-)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -2717,65 +2711,6 @@ class TestConsoleOwnershipRouting:
                 hass, resource_type="camera", resource_id="cam_dup"
             )
 
-    async def test_device_and_entity_registry_resolution(
-        self, hass: HomeAssistant, multi_console_setup
-    ):
-        """Test device and entity registry lookup resolves to coordinator."""
-        entry1, _coord1, entry2, coord2 = multi_console_setup
-        await async_setup_services(hass)
-
-        # Mock device registry
-        mock_dev_reg = MagicMock()
-        mock_dev_reg.async_get.return_value = MagicMock(config_entries={"entry_2"})
-
-        with (
-            patch.object(
-                hass.config_entries,
-                "async_entries",
-                return_value=[entry1, entry2],
-            ),
-            patch(
-                "custom_components.unifi_insights.services.dr.async_get",
-                return_value=mock_dev_reg,
-            ),
-            patch.dict(hass.data, {dr.DATA_REGISTRY: mock_dev_reg}),
-        ):
-            await hass.services.async_call(
-                DOMAIN,
-                "restart_device",
-                {"site_id": "site2", "device_id": "ha_device_id"},
-                blocking=True,
-            )
-            coord2.async_restart_device.assert_called_once_with("site2", "ha_device_id")
-
-        # Mock entity registry
-        mock_ent_reg = MagicMock()
-        mock_ent_reg.async_get.return_value = MagicMock(config_entry_id="entry_2")
-
-        with (
-            patch.object(
-                hass.config_entries,
-                "async_entries",
-                return_value=[entry1, entry2],
-            ),
-            patch(
-                "custom_components.unifi_insights.services.er.async_get",
-                return_value=mock_ent_reg,
-            ),
-            patch.dict(hass.data, {er.DATA_REGISTRY: mock_ent_reg}),
-        ):
-            await hass.services.async_call(
-                DOMAIN,
-                "set_recording_mode",
-                {"camera_id": "ha_entity_id", "mode": "always"},
-                blocking=True,
-            )
-            coord2.async_set_recording_mode.assert_called_once_with(
-                "ha_entity_id", "always"
-            )
-
-        await async_unload_services(hass)
-
 
 class TestServiceCoordinatorContract:
     """Guard the service layer against calling methods the facade lacks."""
@@ -3157,8 +3092,11 @@ class TestConsoleRoutingEdgeCases:
         with pytest.raises(ServiceValidationError, match="matches more than one"):
             _select_console([e1, e2], "Console", "Protect console")
 
-    async def test_network_resource_registry_fallback_and_mismatch(self, hass: HomeAssistant):
-        """Test device registry mismatch and fallback to entity registry."""
+    async def test_network_resource_device_id_cross_console_mismatch(
+        self, hass: HomeAssistant
+    ):
+        """A device native ID that belongs to a different console than the
+        requested site_id must raise instead of being silently routed."""
         c1 = MagicMock()
         e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
         e1.runtime_data.coordinator.data = {"sites": {"s1": {}}, "devices": {"s1": {"d1": {}}}}
@@ -3167,23 +3105,11 @@ class TestConsoleRoutingEdgeCases:
         e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
         e2.runtime_data.coordinator.data = {"sites": {"s2": {}}, "devices": {"s2": {"d2": {}}}}
 
-        dev_reg = MagicMock()
-        dev_reg.async_get.return_value = MagicMock(config_entries={"unrelated_entry"})
-        ent_reg = MagicMock()
-        ent_reg.async_get.return_value = MagicMock(config_entry_id="e1")
-
         with (
             patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
-            patch("custom_components.unifi_insights.services.dr.async_get", return_value=dev_reg),
-            patch.dict(hass.data, {dr.DATA_REGISTRY: dev_reg}),
-            patch("custom_components.unifi_insights.services.er.async_get", return_value=ent_reg),
-            patch.dict(hass.data, {er.DATA_REGISTRY: ent_reg}),
+            pytest.raises(ServiceValidationError, match="belongs to a different console than site"),
         ):
-            coord = _get_coordinator_for_network_resource(hass, device_id="d1")
-            assert coord is c1
-
-            with pytest.raises(ServiceValidationError, match="belongs to a different console than site"):
-                _get_coordinator_for_network_resource(hass, site_id="s2", device_id="d1")
+            _get_coordinator_for_network_resource(hass, site_id="s2", device_id="d1")
 
     async def test_network_resource_unloaded_site_and_device(self, hass: HomeAssistant):
         """Test warm-up state where consoles haven't loaded site or device data."""
@@ -3225,8 +3151,12 @@ class TestConsoleRoutingEdgeCases:
             coord_site = _get_coordinator_for_network_resource(hass, site_id="s1")
             assert coord_site is c1
 
-    async def test_protect_resource_entity_registry_and_no_target(self, hass: HomeAssistant):
-        """Test Protect coordinator lookup via entity registry and empty target."""
+    async def test_protect_resource_ownership_resolution_and_no_target_ambiguous(
+        self, hass: HomeAssistant
+    ):
+        """Protect resolver picks the console that owns the resource, and
+        raises when no resource_type is given and multiple consoles are
+        configured (no positive target to route on)."""
         c1 = MagicMock(protect_client=MagicMock())
         e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
         e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
@@ -3235,21 +3165,16 @@ class TestConsoleRoutingEdgeCases:
         e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
         e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
 
-        ent_reg = MagicMock()
-        ent_reg.async_get.return_value = MagicMock(config_entry_id="e1")
-
-        with (
-            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
-            patch("custom_components.unifi_insights.services.dr.async_get", return_value=MagicMock(async_get=MagicMock(return_value=None))),
-            patch.dict(hass.data, {dr.DATA_REGISTRY: MagicMock()}),
-            patch("custom_components.unifi_insights.services.er.async_get", return_value=ent_reg),
-            patch.dict(hass.data, {er.DATA_REGISTRY: ent_reg}),
-        ):
-            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam1"
+            )
             assert coord is c1
 
-            coord_no_type = _get_coordinator_for_protect_resource(hass, resource_id="cam1")
-            assert coord_no_type is c1
+            with pytest.raises(
+                ServiceValidationError, match="carries no target to route on"
+            ):
+                _get_coordinator_for_protect_resource(hass, resource_id="cam1")
 
     async def test_protect_resource_unloaded_data_and_unresolved_candidates(self, hass: HomeAssistant):
         """Test Protect coordinator when data is unloaded or candidates cannot be resolved."""
@@ -3344,23 +3269,6 @@ class TestConsoleRoutingEdgeCases:
         records = {"c1": {"mac": "11:22:33:44:55:66"}}
         assert _client_records_match(records, ":::---") is False
 
-    async def test_protect_resource_device_registry_resolution(self, hass: HomeAssistant):
-        """Test Protect coordinator lookup via device registry."""
-        c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
-        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
-
-        dev_reg = MagicMock()
-        dev_reg.async_get.return_value = MagicMock(config_entries={"e1"})
-
-        with (
-            patch.object(hass.config_entries, "async_entries", return_value=[e1]),
-            patch("custom_components.unifi_insights.services.dr.async_get", return_value=dev_reg),
-            patch.dict(hass.data, {dr.DATA_REGISTRY: dev_reg}),
-        ):
-            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
-            assert coord is c1
-
     async def test_protect_resource_single_explicit_match(self, hass: HomeAssistant):
         """Test Protect coordinator disambiguation when one console explicitly owns the resource."""
         c1 = MagicMock(protect_client=MagicMock())
@@ -3426,12 +3334,11 @@ class TestConsoleRoutingEdgeCases:
         # cross-site scan, which finds it under "s2".
         assert _entry_owns_client(entry, "s1", "c2") is True
 
-    async def test_network_resource_registry_missing_falls_back_to_device_ownership(
+    async def test_network_resource_device_id_resolves_via_ownership(
         self, hass: HomeAssistant
     ):
-        """Device registry absent and entity registry pointing at an
-        unrelated config entry must not block resolution; the resolver falls
-        back to device-ownership filtering."""
+        """A native device_id with no site_id given resolves via
+        device-ownership filtering alone."""
         c1 = MagicMock()
         e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
         e1.runtime_data.coordinator.data = {"devices": {"s1": {"d1": {}}}}
@@ -3440,29 +3347,15 @@ class TestConsoleRoutingEdgeCases:
         e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
         e2.runtime_data.coordinator.data = {"devices": {"s2": {"d2": {}}}}
 
-        ent_reg = MagicMock()
-        ent_reg.async_get.return_value = MagicMock(config_entry_id="orphaned_entry")
-
-        with (
-            patch.object(
-                hass.config_entries, "async_entries", return_value=[e1, e2]
-            ),
-            patch(
-                "custom_components.unifi_insights.services.er.async_get",
-                return_value=ent_reg,
-            ),
-            patch.dict(hass.data, {er.DATA_REGISTRY: ent_reg}),
-        ):
-            del hass.data[dr.DATA_REGISTRY]
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
             coord = _get_coordinator_for_network_resource(hass, device_id="d1")
             assert coord is c1
 
-    async def test_network_resource_no_ownership_signal_falls_back_to_first_entry(
+    async def test_network_resource_no_ownership_signal_raises_ambiguous(
         self, hass: HomeAssistant
     ):
         """When neither client nor site data can positively pick a console,
-        the resolver deterministically falls back to the first entry instead
-        of raising or guessing."""
+        the resolver raises instead of silently guessing the first entry."""
         c1 = MagicMock()
         e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
         e1.runtime_data.coordinator.data = {}
@@ -3471,16 +3364,18 @@ class TestConsoleRoutingEdgeCases:
         e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
         e2.runtime_data.coordinator.data = {}
 
-        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_network_resource(hass, client_id="mystery_client")
-            assert coord is c1
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            pytest.raises(ServiceValidationError, match="target is ambiguous"),
+        ):
+            _get_coordinator_for_network_resource(hass, client_id="mystery_client")
 
-    async def test_protect_resource_registries_absent_and_unmatched(
+    async def test_protect_resource_resolves_via_ownership_with_multiple_candidates(
         self, hass: HomeAssistant
     ):
-        """Protect resolver falls back to resource ownership when the device
-        registry is absent and the entity registry points at an unrelated
-        config entry."""
+        """Protect resolver picks the console that owns the resource when
+        multiple Protect consoles are configured and neither uniquely-owned
+        camera collides with the other."""
         c1 = MagicMock(protect_client=MagicMock())
         e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
         e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
@@ -3489,45 +3384,7 @@ class TestConsoleRoutingEdgeCases:
         e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
         e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
 
-        ent_reg = MagicMock()
-        ent_reg.async_get.return_value = MagicMock(config_entry_id="orphaned_entry")
-
-        with (
-            patch.object(
-                hass.config_entries, "async_entries", return_value=[e1, e2]
-            ),
-            patch(
-                "custom_components.unifi_insights.services.er.async_get",
-                return_value=ent_reg,
-            ),
-            patch.dict(hass.data, {er.DATA_REGISTRY: ent_reg}),
-        ):
-            del hass.data[dr.DATA_REGISTRY]
-            coord = _get_coordinator_for_protect_resource(
-                hass, resource_type="camera", resource_id="cam1"
-            )
-            assert coord is c1
-
-    async def test_protect_resource_device_registry_no_matching_entry(
-        self, hass: HomeAssistant
-    ):
-        """A device-registry hit that names a config entry we don't own is
-        ignored, and resolution falls back to resource ownership."""
-        c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
-        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
-
-        dev_reg = MagicMock()
-        dev_reg.async_get.return_value = MagicMock(config_entries={"unrelated_entry"})
-
-        with (
-            patch.object(hass.config_entries, "async_entries", return_value=[e1]),
-            patch(
-                "custom_components.unifi_insights.services.dr.async_get",
-                return_value=dev_reg,
-            ),
-            patch.dict(hass.data, {dr.DATA_REGISTRY: dev_reg}),
-        ):
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
             coord = _get_coordinator_for_protect_resource(
                 hass, resource_type="camera", resource_id="cam1"
             )

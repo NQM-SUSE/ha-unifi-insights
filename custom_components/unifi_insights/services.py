@@ -10,12 +10,6 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import (
     config_validation as cv,
 )
-from homeassistant.helpers import (
-    device_registry as dr,
-)
-from homeassistant.helpers import (
-    entity_registry as er,
-)
 
 from .const import (
     CHIME_RINGTONE_CHRISTMAS,
@@ -252,29 +246,7 @@ def _get_coordinator_for_network_resource(
         msg = "No UniFi Insights coordinator found"
         raise ServiceValidationError(msg)
 
-    # 1. Check Home Assistant device and entity registries
-    resolved_entry: Any | None = None
-    if device_id and hasattr(hass, "data") and isinstance(hass.data, dict):
-        if dr.DATA_REGISTRY in hass.data:
-            dev_reg = dr.async_get(hass)
-            dev_entry = dev_reg.async_get(device_id)
-            if dev_entry and dev_entry.config_entries:
-                matching_e = [
-                    e for e in entries if e.entry_id in dev_entry.config_entries
-                ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
-        if resolved_entry is None and er.DATA_REGISTRY in hass.data:
-            ent_reg = er.async_get(hass)
-            ent_entry = ent_reg.async_get(device_id)
-            if ent_entry and ent_entry.config_entry_id:
-                matching_e = [
-                    e for e in entries if e.entry_id == ent_entry.config_entry_id
-                ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
-
-    # 2. Filter entries by site_id
+    # 1. Filter entries by site_id
     if site_id is not None:
         matching_entries = [
             entry for entry in entries if _entry_has_site(entry, site_id)
@@ -285,17 +257,7 @@ def _get_coordinator_for_network_resource(
     else:
         matching_entries = entries
 
-    # If already resolved via registry, verify it conforms to site_id
-    if resolved_entry is not None:
-        if resolved_entry not in matching_entries:
-            msg = (
-                f"Device '{device_id}' belongs to a different console than"
-                f" site '{site_id}'"
-            )
-            raise ServiceValidationError(msg)
-        return resolved_entry.runtime_data.coordinator
-
-    # 3. Filter / validate by device_id if specified
+    # 2. Filter / validate by device_id if specified
     if device_id is not None:
         entries_with_device = [
             entry
@@ -343,7 +305,7 @@ def _get_coordinator_for_network_resource(
 
         return entries_with_device[0].runtime_data.coordinator
 
-    # 4. Filter by client_id if specified
+    # 3. Filter by client_id if specified
     if client_id is not None and len(matching_entries) > 1:
         entries_with_client = [
             entry
@@ -363,7 +325,7 @@ def _get_coordinator_for_network_resource(
             msg = f"Multiple consoles contain client '{client_id}'; target is ambiguous"
             raise ServiceValidationError(msg)
 
-    # 5. When multiple entries match site_id
+    # 4. When multiple entries match site_id
     if len(matching_entries) > 1:
         explicit_matches = [
             entry
@@ -375,6 +337,14 @@ def _get_coordinator_for_network_resource(
             raise ServiceValidationError(msg)
         if len(explicit_matches) == 1:
             return explicit_matches[0].runtime_data.coordinator
+
+    if len(matching_entries) > 1:
+        msg = (
+            f"Multiple consoles found for site '{site_id}'; target is ambiguous"
+            if site_id
+            else "Multiple UniFi Insights consoles are configured; target is ambiguous"
+        )
+        raise ServiceValidationError(msg)
 
     return matching_entries[0].runtime_data.coordinator
 
@@ -428,33 +398,7 @@ def _get_coordinator_for_protect_resource(
         entry = _select_console(protect_entries, console_id, "UniFi Protect console")
         return entry.runtime_data.coordinator
 
-    # 1. Check Home Assistant device and entity registries
-    resolved_entry: Any | None = None
-    if resource_id and hasattr(hass, "data") and isinstance(hass.data, dict):
-        if dr.DATA_REGISTRY in hass.data:
-            dev_reg = dr.async_get(hass)
-            dev_entry = dev_reg.async_get(resource_id)
-            if dev_entry and dev_entry.config_entries:
-                matching_e = [
-                    e for e in protect_entries if e.entry_id in dev_entry.config_entries
-                ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
-        if resolved_entry is None and er.DATA_REGISTRY in hass.data:
-            ent_reg = er.async_get(hass)
-            ent_entry = ent_reg.async_get(resource_id)
-            if ent_entry and ent_entry.config_entry_id:
-                matching_e = [
-                    e
-                    for e in protect_entries
-                    if e.entry_id == ent_entry.config_entry_id
-                ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
-
     if resource_type is None or resource_id is None:
-        if resolved_entry is not None:
-            return resolved_entry.runtime_data.coordinator
         if len(protect_entries) > 1:
             known = ", ".join(
                 sorted(str(getattr(e, "title", e.entry_id)) for e in protect_entries)
@@ -474,14 +418,11 @@ def _get_coordinator_for_protect_resource(
         "viewer": "viewers",
     }.get(resource_type, f"{resource_type}s")
 
-    if resolved_entry is not None:
-        matching_entries = [resolved_entry]
-    else:
-        matching_entries = [
-            entry
-            for entry in protect_entries
-            if _protect_entry_has_resource(entry, collection_key, resource_id)
-        ]
+    matching_entries = [
+        entry
+        for entry in protect_entries
+        if _protect_entry_has_resource(entry, collection_key, resource_id)
+    ]
 
     if not matching_entries:
         msg = (
