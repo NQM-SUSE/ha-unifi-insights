@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+import pytest
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -2659,7 +2659,7 @@ class TestConsoleOwnershipRouting:
 
         # Test single protect console with create_liveview
         with patch.object(hass.config_entries, "async_entries", return_value=[entry1]):
-            c = _get_coordinator_for_protect_resource(hass)
+            c, _ = _get_coordinator_for_protect_resource(hass)
             assert c == coord1
 
         # Test helper functions directly
@@ -3020,7 +3020,10 @@ class TestConsoleRoutingEdgeCases:
         entry.runtime_data.coordinator = MagicMock(data="not-a-dict")
         assert _coord_data(entry) is None
 
-        entry.runtime_data.coordinator.data = {"devices": "not-a-dict", "sites": {"s1": {}}}
+        entry.runtime_data.coordinator.data = {
+            "devices": "not-a-dict",
+            "sites": {"s1": {}},
+        }
         assert _coord_section(entry, "devices") is None
         assert _coord_section(entry, "sites") == {"s1": {}}
 
@@ -3031,7 +3034,9 @@ class TestConsoleRoutingEdgeCases:
         assert _entry_has_device(entry, "s1", "d1") is True
         assert _entry_owns_device(entry, "s1", "d1") is False
 
-        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"devices": "invalid"}))
+        entry.runtime_data = MagicMock(
+            coordinator=MagicMock(data={"devices": "invalid"})
+        )
         assert _entry_has_device(entry, "s1", "d1") is True
         assert _entry_owns_device(entry, "s1", "d1") is False
 
@@ -3049,7 +3054,9 @@ class TestConsoleRoutingEdgeCases:
         assert _entry_has_client(entry, "s1", "c1") is True
         assert _entry_owns_client(entry, "s1", "c1") is False
 
-        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"clients": "invalid"}))
+        entry.runtime_data = MagicMock(
+            coordinator=MagicMock(data={"clients": "invalid"})
+        )
         assert _entry_has_client(entry, "s1", "c1") is True
         assert _entry_owns_client(entry, "s1", "c1") is False
 
@@ -3079,7 +3086,9 @@ class TestConsoleRoutingEdgeCases:
         entry.runtime_data = None
         assert _protect_owns_resource(entry, "cameras", "cam1") is None
 
-        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"protect": "invalid"}))
+        entry.runtime_data = MagicMock(
+            coordinator=MagicMock(data={"protect": "invalid"})
+        )
         assert _protect_owns_resource(entry, "cameras", "cam1") is None
 
         entry.runtime_data.coordinator.data = {"protect": {"cameras": "invalid"}}
@@ -3098,36 +3107,58 @@ class TestConsoleRoutingEdgeCases:
         """A device native ID that belongs to a different console than the
         requested site_id must raise instead of being silently routed."""
         c1 = MagicMock()
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
-        e1.runtime_data.coordinator.data = {"sites": {"s1": {}}, "devices": {"s1": {"d1": {}}}}
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
+        e1.runtime_data.coordinator.data = {
+            "sites": {"s1": {}},
+            "devices": {"s1": {"d1": {}}},
+        }
 
         c2 = MagicMock()
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
-        e2.runtime_data.coordinator.data = {"sites": {"s2": {}}, "devices": {"s2": {"d2": {}}}}
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
+        e2.runtime_data.coordinator.data = {
+            "sites": {"s2": {}},
+            "devices": {"s2": {"d2": {}}},
+        }
 
         with (
             patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
-            pytest.raises(ServiceValidationError, match="belongs to a different console than site"),
+            pytest.raises(
+                ServiceValidationError, match="belongs to a different console than site"
+            ),
         ):
             _get_coordinator_for_network_resource(hass, site_id="s2", device_id="d1")
 
     async def test_network_resource_unloaded_site_and_device(self, hass: HomeAssistant):
         """Test warm-up state where consoles haven't loaded site or device data."""
         c1 = MagicMock()
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {}
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
-            coord = _get_coordinator_for_network_resource(hass, site_id="unknown_site")
+            coord, _ = _get_coordinator_for_network_resource(
+                hass, site_id="unknown_site"
+            )
             assert coord is c1
 
-            coord2 = _get_coordinator_for_network_resource(hass, device_id="unknown_dev")
+            coord2, _ = _get_coordinator_for_network_resource(
+                hass, device_id="unknown_dev"
+            )
             assert coord2 is c1
 
-    async def test_network_resource_explicit_device_and_client_ownership(self, hass: HomeAssistant):
+    async def test_network_resource_explicit_device_and_client_ownership(
+        self, hass: HomeAssistant
+    ):
         """Test single explicit match among candidate entries for devices and clients."""
         c1 = MagicMock()
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {
             "sites": {"s1": {}},
             "devices": {"s1": {"d_shared": {}}},
@@ -3135,20 +3166,26 @@ class TestConsoleRoutingEdgeCases:
         }
 
         c2 = MagicMock()
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {"sites": {"s1": {}}}
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_network_resource(hass, site_id="s1", device_id="d_shared")
+            coord, _ = _get_coordinator_for_network_resource(
+                hass, site_id="s1", device_id="d_shared"
+            )
             assert coord is c1
 
-            coord_client = _get_coordinator_for_network_resource(hass, site_id="s1", client_id="c_shared")
+            coord_client, _ = _get_coordinator_for_network_resource(
+                hass, site_id="s1", client_id="c_shared"
+            )
             assert coord_client is c1
 
         # One console has site s1 explicitly, while e2 does not have s1 in sites
         e2.runtime_data.coordinator.data = {"sites": {"s2": {}}}
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord_site = _get_coordinator_for_network_resource(hass, site_id="s1")
+            coord_site, _ = _get_coordinator_for_network_resource(hass, site_id="s1")
             assert coord_site is c1
 
     async def test_protect_resource_ownership_resolution_and_no_target_ambiguous(
@@ -3158,15 +3195,19 @@ class TestConsoleRoutingEdgeCases:
         raises when no resource_type is given and multiple consoles are
         configured (no positive target to route on)."""
         c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
 
         c2 = MagicMock(protect_client=MagicMock())
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_protect_resource(
+            coord, _ = _get_coordinator_for_protect_resource(
                 hass, resource_type="camera", resource_id="cam1"
             )
             assert coord is c1
@@ -3176,36 +3217,52 @@ class TestConsoleRoutingEdgeCases:
             ):
                 _get_coordinator_for_protect_resource(hass, resource_id="cam1")
 
-    async def test_protect_resource_unloaded_data_and_unresolved_candidates(self, hass: HomeAssistant):
+    async def test_protect_resource_unloaded_data_and_unresolved_candidates(
+        self, hass: HomeAssistant
+    ):
         """Test Protect coordinator when data is unloaded or candidates cannot be resolved."""
         c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {}
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
-            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam_new")
+            coord, _ = _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam_new"
+            )
             assert coord is c1
 
         c2 = MagicMock(protect_client=MagicMock())
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {}
 
         with (
             patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
-            pytest.raises(ServiceValidationError, match="Cannot tell which Protect console owns"),
+            pytest.raises(
+                ServiceValidationError, match="Cannot tell which Protect console owns"
+            ),
         ):
-            _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam_unknown")
+            _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam_unknown"
+            )
 
-    async def test_protect_secondary_resource_unloaded_fallback(self, hass: HomeAssistant):
+    async def test_protect_secondary_resource_unloaded_fallback(
+        self, hass: HomeAssistant
+    ):
         """Test secondary resource fallback when it is not yet in cached Protect data."""
         c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {
             "protect": {"chimes": {"chime1": {}}, "cameras": {}}
         }
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
-            coord = _get_coordinator_for_protect_resource(
+            coord, _ = _get_coordinator_for_protect_resource(
                 hass,
                 resource_type="chime",
                 resource_id="chime1",
@@ -3214,7 +3271,9 @@ class TestConsoleRoutingEdgeCases:
             )
             assert coord is c1
 
-    async def test_service_handlers_with_camera_id_and_ignored_guest_options(self, hass: HomeAssistant):
+    async def test_service_handlers_with_camera_id_and_ignored_guest_options(
+        self, hass: HomeAssistant
+    ):
         """Test service calls passing optional camera_id and ignored guest options."""
         coord = MagicMock(protect_client=MagicMock())
         coord.async_set_chime_volume = AsyncMock()
@@ -3226,7 +3285,9 @@ class TestConsoleRoutingEdgeCases:
             "clients": {"s1": {"c1": {"id": "c1"}}},
             "protect": {"chimes": {"chime1": {}}, "cameras": {"cam1": {}}},
         }
-        entry = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=coord))
+        entry = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=coord)
+        )
 
         await async_setup_services(hass)
         with patch.object(hass.config_entries, "async_entries", return_value=[entry]):
@@ -3272,29 +3333,41 @@ class TestConsoleRoutingEdgeCases:
     async def test_protect_resource_single_explicit_match(self, hass: HomeAssistant):
         """Test Protect coordinator disambiguation when one console explicitly owns the resource."""
         c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
 
         c2 = MagicMock(protect_client=MagicMock())
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {}  # Unloaded Protect data
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
+            coord, _ = _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id="cam1"
+            )
             assert coord is c1
 
-    async def test_network_resource_multiple_candidate_single_explicit_site(self, hass: HomeAssistant):
+    async def test_network_resource_multiple_candidate_single_explicit_site(
+        self, hass: HomeAssistant
+    ):
         """Test network coordinator disambiguation when multiple match site_id but only one explicitly owns it."""
         c1 = MagicMock()
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {"sites": {"s1": {}}}
 
         c2 = MagicMock()
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {}  # Unloaded data, so _entry_has_site is True
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_network_resource(hass, site_id="s1")
+            coord, _ = _get_coordinator_for_network_resource(hass, site_id="s1")
             assert coord is c1
 
     def test_entry_owns_device_site_scoped_and_cross_site_fallback(self):
@@ -3340,15 +3413,19 @@ class TestConsoleRoutingEdgeCases:
         """A native device_id with no site_id given resolves via
         device-ownership filtering alone."""
         c1 = MagicMock()
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {"devices": {"s1": {"d1": {}}}}
 
         c2 = MagicMock()
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {"devices": {"s2": {"d2": {}}}}
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_network_resource(hass, device_id="d1")
+            coord, _ = _get_coordinator_for_network_resource(hass, device_id="d1")
             assert coord is c1
 
     async def test_network_resource_no_ownership_signal_raises_ambiguous(
@@ -3357,11 +3434,15 @@ class TestConsoleRoutingEdgeCases:
         """When neither client nor site data can positively pick a console,
         the resolver raises instead of silently guessing the first entry."""
         c1 = MagicMock()
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {}
 
         c2 = MagicMock()
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {}
 
         with (
@@ -3377,15 +3458,977 @@ class TestConsoleRoutingEdgeCases:
         multiple Protect consoles are configured and neither uniquely-owned
         camera collides with the other."""
         c1 = MagicMock(protect_client=MagicMock())
-        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1 = MagicMock(
+            entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1)
+        )
         e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
 
         c2 = MagicMock(protect_client=MagicMock())
-        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2 = MagicMock(
+            entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2)
+        )
         e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
 
         with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
-            coord = _get_coordinator_for_protect_resource(
+            coord, _ = _get_coordinator_for_protect_resource(
                 hass, resource_type="camera", resource_id="cam1"
             )
             assert coord is c1
+
+
+class TestServiceComprehensiveFullCoverage:
+    """Tests covering all target resolution, error handling, and coordinator routing paths."""
+
+    def test_extract_target_id_variations(self):
+        """Test _extract_target_id with various payloads."""
+        from custom_components.unifi_insights.services import _extract_target_id
+
+        # Empty dict
+        call = MagicMock(service="restart_device", data={})
+        assert _extract_target_id(call, "device_id") is None
+
+        # Whitespace
+        call = MagicMock(service="restart_device", data={"device_id": "   "})
+        assert _extract_target_id(call, "device_id") is None
+
+        # Valid stripped string
+        call = MagicMock(service="restart_device", data={"device_id": "  dev1  "})
+        assert _extract_target_id(call, "device_id") == "dev1"
+
+        # Target dict with primary field
+        call = MagicMock(
+            service="restart_device", data={"target": {"device_id": "dev_target"}}
+        )
+        assert _extract_target_id(call, "device_id") == "dev_target"
+
+        # Target dict with entity_id
+        call = MagicMock(
+            service="restart_device", data={"target": {"entity_id": "switch.dev"}}
+        )
+        assert _extract_target_id(call, "device_id") == "switch.dev"
+
+        # Target dict with device_id
+        call = MagicMock(
+            service="restart_device", data={"target": {"device_id": "d123"}}
+        )
+        assert _extract_target_id(call, "camera_id") == "d123"
+
+        # Top-level entity_id
+        call = MagicMock(service="restart_device", data={"entity_id": "switch.dev2"})
+        assert _extract_target_id(call, "device_id") == "switch.dev2"
+
+        # Top-level device_id when looking for camera_id
+        call = MagicMock(service="set_recording_mode", data={"device_id": "cam_dev"})
+        assert _extract_target_id(call, "camera_id") == "cam_dev"
+
+        # List with single item
+        call = MagicMock(service="restart_device", data={"device_id": ["dev_single"]})
+        assert _extract_target_id(call, "device_id") == "dev_single"
+
+        # Empty list raises
+        call = MagicMock(service="restart_device", data={"device_id": []})
+        with pytest.raises(
+            ServiceValidationError, match="At least one target must be specified"
+        ):
+            _extract_target_id(call, "device_id")
+
+        # Multiple items list raises
+        call = MagicMock(service="restart_device", data={"device_id": ["dev1", "dev2"]})
+        with pytest.raises(
+            ServiceValidationError,
+            match="Multiple targets specified for restart_device",
+        ):
+            _extract_target_id(call, "device_id")
+
+        # Non-string, non-list
+        call = MagicMock(service="restart_device", data={"device_id": 12345})
+        assert _extract_target_id(call, "device_id") is None
+
+    async def test_resolve_network_device_id_branches(self, hass: HomeAssistant):
+        """Test _resolve_network_device_id helper branches."""
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        from custom_components.unifi_insights.services import _resolve_network_device_id
+
+        dev_reg = dr.async_get(hass)
+        ent_reg = er.async_get(hass)
+
+        entry1 = MockConfigEntry(domain=DOMAIN, entry_id="entry1", title="Console 1")
+        entry1.add_to_hass(hass)
+        entry1.runtime_data = MagicMock(
+            coordinator=MagicMock(
+                data={"devices": {"site1": {"d1": {}}, "site_ident": {"dev_ident": {}}}}
+            )
+        )
+
+        # 1. Target entity not found in registry (has ".")
+        with pytest.raises(
+            ServiceValidationError,
+            match=r"Target entity 'switch\.missing' not found in entity registry",
+        ):
+            _resolve_network_device_id(hass, "switch.missing", None, [entry1])
+
+        # 2. Entity found but platform != DOMAIN
+        other_ent = ent_reg.async_get_or_create("switch", "other_domain", "other_uid")
+        with pytest.raises(
+            ServiceValidationError, match="is not a UniFi Insights entity"
+        ):
+            _resolve_network_device_id(hass, other_ent.entity_id, None, [entry1])
+
+        # 3. Entity found with DOMAIN platform and device_id matching dev_reg, unique_id matches devices
+        ha_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "site1_d1")},
+        )
+        ent_with_dev = ent_reg.async_get_or_create(
+            "switch",
+            DOMAIN,
+            "site1_d1_status",
+            config_entry=entry1,
+            device_id=ha_dev.id,
+        )
+        d, s, ent = _resolve_network_device_id(
+            hass, ent_with_dev.entity_id, None, [entry1]
+        )
+        assert d == "d1"
+        assert s == "site1"
+        assert ent == entry1
+
+        # 4. Entity with unique_id split len >= 2 fallback
+        ent_parts = ent_reg.async_get_or_create(
+            "switch",
+            DOMAIN,
+            "site2_d2",
+            config_entry=entry1,
+        )
+        d, s, ent = _resolve_network_device_id(
+            hass, ent_parts.entity_id, None, [entry1]
+        )
+        assert d == "d2"
+        assert s == "site2"
+
+        # 5. Device target: not in matching config entries and no domain identifier
+        other_entry = MockConfigEntry(domain="other_domain", entry_id="other_entry")
+        other_entry.add_to_hass(hass)
+        other_dev = dev_reg.async_get_or_create(
+            config_entry_id="other_entry",
+            identifiers={("other_domain", "other_id")},
+        )
+        with pytest.raises(
+            ServiceValidationError, match="is not a UniFi Insights device"
+        ):
+            _resolve_network_device_id(hass, other_dev.id, None, [entry1])
+
+        # 6. Device target with protect_ and client_ prefixes and other domain (tests lines 351 and 354 continue)
+        skipped_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={
+                ("other_domain", "other_1"),
+                (DOMAIN, "protect_camera_1"),
+                (DOMAIN, "client_mac_1"),
+            },
+        )
+        with pytest.raises(ServiceValidationError, match="Could not resolve target"):
+            _resolve_network_device_id(hass, skipped_dev.id, None, [entry1])
+
+        # 7. Device target with site identifier matching devices_by_site (tests line 354: return d, s, entry)
+        ident_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "site_ident_dev_ident")},
+        )
+        d, s, ent = _resolve_network_device_id(hass, ident_dev.id, None, [entry1])
+        assert d == "dev_ident"
+        assert s == "site_ident"
+        assert ent == entry1
+
+        # 8. Device target with site_id prefix matching site_id
+        site_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "customsite_customdev")},
+        )
+        d, s, ent = _resolve_network_device_id(
+            hass, site_dev.id, "customsite", [entry1]
+        )
+        assert d == "customdev"
+        assert s == "customsite"
+
+        # 9. Device target with rpartition fallback
+        d, s, ent = _resolve_network_device_id(hass, site_dev.id, None, [entry1])
+        assert d == "customdev"
+        assert s == "customsite"
+
+        # 10. Raw native ID without registry entry
+        d, s, ent = _resolve_network_device_id(hass, "native_d", "s1", [entry1])
+        assert d == "native_d"
+        assert s == "s1"
+        assert ent is None
+
+    async def test_resolve_protect_resource_id_branches(self, hass: HomeAssistant):
+        """Test _resolve_protect_resource_id helper branches."""
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        from custom_components.unifi_insights.services import (
+            _resolve_protect_resource_id,
+        )
+
+        dev_reg = dr.async_get(hass)
+        ent_reg = er.async_get(hass)
+
+        entry1 = MockConfigEntry(
+            domain=DOMAIN, entry_id="pentry1", title="Protect Console 1"
+        )
+        entry1.add_to_hass(hass)
+        entry1.runtime_data = MagicMock(
+            coordinator=MagicMock(
+                data={"protect": {"cameras": {"cam1": {}}, "lights": {"light1": {}}}}
+            )
+        )
+
+        # 1. Target entity not found in registry (has ".")
+        with pytest.raises(
+            ServiceValidationError,
+            match=r"Target entity 'camera\.missing' not found in entity registry",
+        ):
+            _resolve_protect_resource_id(hass, "camera", "camera.missing", [entry1])
+
+        # 2. Entity found but platform != DOMAIN
+        other_ent = ent_reg.async_get_or_create(
+            "camera", "other_domain", "other_cam_uid"
+        )
+        with pytest.raises(
+            ServiceValidationError, match="is not a UniFi Protect camera"
+        ):
+            _resolve_protect_resource_id(hass, "camera", other_ent.entity_id, [entry1])
+
+        # 3. Entity found with DOMAIN platform and device_id matching dev_reg, unique_id matches protect data
+        ha_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "protect_camera_cam1")},
+        )
+        cam_ent = ent_reg.async_get_or_create(
+            "camera",
+            DOMAIN,
+            f"{DOMAIN}_camera_cam1",
+            config_entry=entry1,
+            device_id=ha_dev.id,
+        )
+        res_id, ent = _resolve_protect_resource_id(
+            hass, "camera", cam_ent.entity_id, [entry1]
+        )
+        assert res_id == "cam1"
+        assert ent == entry1
+
+        # 4. Entity with unique_id split fallback (collection not matching)
+        cam_ent_fallback = ent_reg.async_get_or_create(
+            "camera",
+            DOMAIN,
+            f"{DOMAIN}_camera_camfallback_extra",
+            config_entry=entry1,
+        )
+        res_id, ent = _resolve_protect_resource_id(
+            hass, "camera", cam_ent_fallback.entity_id, [entry1]
+        )
+        assert res_id == "camfallback"
+
+        # 5. Device target: not in matching config entries and no domain identifier
+        other_entry = MockConfigEntry(domain="other_domain", entry_id="pother_entry")
+        other_entry.add_to_hass(hass)
+        other_dev = dev_reg.async_get_or_create(
+            config_entry_id="pother_entry",
+            identifiers={("other_domain", "other_protect_dev")},
+        )
+        with pytest.raises(
+            ServiceValidationError, match="is not a UniFi Protect camera"
+        ):
+            _resolve_protect_resource_id(hass, "camera", other_dev.id, [entry1])
+
+        # 6. Device target with identifier from other domain (tests line 476: if domain != DOMAIN: continue)
+        other_domain_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={
+                ("other_domain", "other_id"),
+                (DOMAIN, "unifi_device_without_prefix"),
+            },
+        )
+        ent_reg.async_get_or_create(
+            "camera",
+            DOMAIN,
+            f"{DOMAIN}_camera_camfromdevice_sub",
+            config_entry=entry1,
+            device_id=other_domain_dev.id,
+        )
+        res_id, ent = _resolve_protect_resource_id(
+            hass, "camera", other_domain_dev.id, [entry1]
+        )
+        assert res_id == "camfromdevice"
+
+        # 7. Device target with protect_ prefix of wrong resource type
+        wrong_type_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "protect_light_l1")},
+        )
+        with pytest.raises(
+            ServiceValidationError, match=r"Target '.*' is a light, not a camera"
+        ):
+            _resolve_protect_resource_id(hass, "camera", wrong_type_dev.id, [entry1])
+
+        # 8. Camera fallback: device has no protect_camera identifier but entity in registry does
+        dev_no_ident = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "unifi_device_without_prefix")},
+        )
+        ent_reg.async_get_or_create(
+            "camera",
+            DOMAIN,
+            f"{DOMAIN}_camera_camfromdevice_sub",
+            config_entry=entry1,
+            device_id=dev_no_ident.id,
+        )
+        res_id, ent = _resolve_protect_resource_id(
+            hass, "camera", dev_no_ident.id, [entry1]
+        )
+        assert res_id == "camfromdevice"
+
+        # 9. Device target cannot be resolved
+        unresolvable_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "custom_unknown_identifier")},
+        )
+        with pytest.raises(
+            ServiceValidationError,
+            match=r"Could not resolve target '.*' to a UniFi Protect light",
+        ):
+            _resolve_protect_resource_id(hass, "light", unresolvable_dev.id, [entry1])
+
+        # 10. Raw native ID without registry entry
+        res_id, ent = _resolve_protect_resource_id(
+            hass, "camera", "native_cam_id", [entry1]
+        )
+        assert res_id == "native_cam_id"
+        assert ent is None
+
+    async def test_resolve_network_client_id_branches(self, hass: HomeAssistant):
+        """Test _resolve_network_client_id helper branches."""
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        from custom_components.unifi_insights.services import _resolve_network_client_id
+
+        dev_reg = dr.async_get(hass)
+        ent_reg = er.async_get(hass)
+
+        entry1 = MockConfigEntry(domain=DOMAIN, entry_id="centry1", title="Console 1")
+        entry1.add_to_hass(hass)
+        entry1.runtime_data = MagicMock(coordinator=MagicMock(data={}))
+
+        # 1. Target entity not found in registry (has ".")
+        with pytest.raises(
+            ServiceValidationError,
+            match=r"Target entity 'device_tracker\.missing' not found in entity registry",
+        ):
+            _resolve_network_client_id(hass, "device_tracker.missing", [entry1])
+
+        # 2. Entity found but platform != DOMAIN
+        other_ent = ent_reg.async_get_or_create(
+            "device_tracker", "other_domain", "other_tracker"
+        )
+        with pytest.raises(
+            ServiceValidationError, match="is not a UniFi Insights entity"
+        ):
+            _resolve_network_client_id(hass, other_ent.entity_id, [entry1])
+
+        # 3. Entity found with MAC in unique_id and device_id linked to dev_reg
+        ha_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "client_00:11:22:33:44:55")},
+        )
+        tracker_ent = ent_reg.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_00-11-22-33-44-55",
+            config_entry=entry1,
+            device_id=ha_dev.id,
+        )
+        c_id, ent = _resolve_network_client_id(hass, tracker_ent.entity_id, [entry1])
+        assert c_id == "00:11:22:33:44:55"
+        assert ent == entry1
+
+        # 4. Entity without MAC but split("_") >= 2
+        tracker_nonmac = ent_reg.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            "prefix_client123",
+            config_entry=entry1,
+        )
+        c_id, ent = _resolve_network_client_id(hass, tracker_nonmac.entity_id, [entry1])
+        assert c_id == "client123"
+
+        # 5. Device target: not in matching config entries and no domain identifier
+        other_entry = MockConfigEntry(domain="other_domain", entry_id="cother_entry")
+        other_entry.add_to_hass(hass)
+        other_dev = dev_reg.async_get_or_create(
+            config_entry_id="cother_entry",
+            identifiers={("other_domain", "other_client_dev")},
+        )
+        with pytest.raises(
+            ServiceValidationError, match="is not a UniFi Insights device"
+        ):
+            _resolve_network_client_id(hass, other_dev.id, [entry1])
+
+        # 6. Device target with client_ prefix
+        c_id, ent = _resolve_network_client_id(hass, ha_dev.id, [entry1])
+        assert c_id == "00:11:22:33:44:55"
+        assert ent == entry1
+
+        # 7. Raw client ID without registry entry
+        c_id, ent = _resolve_network_client_id(hass, "raw_client_mac", [entry1])
+        assert c_id == "raw_client_mac"
+        assert ent is None
+
+    async def test_coordinator_routing_edge_branches(self, hass: HomeAssistant):
+        """Test _get_coordinator_for_network_resource and Protect edge branches."""
+        from homeassistant.helpers import device_registry as dr
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        from custom_components.unifi_insights.services import (
+            _get_coordinator_for_network_resource,
+            _get_coordinator_for_protect_resource,
+        )
+
+        dev_reg = dr.async_get(hass)
+
+        coord1 = MagicMock()
+        coord1.data = {
+            "sites": {"site1": {}},
+            "devices": {"site1": {"d1": {}}},
+            "clients": {"site1": {"00:11:22:33:44:55": {"mac": "00:11:22:33:44:55"}}},
+        }
+        entry1 = MockConfigEntry(domain=DOMAIN, entry_id="rentry1", title="Console 1")
+        entry1.add_to_hass(hass)
+        entry1.runtime_data = MagicMock(coordinator=coord1)
+
+        coord2 = MagicMock()
+        coord2.data = {"sites": {"site2": {}}, "devices": {"site2": {"d2": {}}}}
+        entry2 = MockConfigEntry(domain=DOMAIN, entry_id="rentry2", title="Console 2")
+        entry2.add_to_hass(hass)
+        entry2.runtime_data = MagicMock(coordinator=coord2)
+
+        # Device belongs to different console than site_id
+        dev1 = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "site1_d1")},
+        )
+        with patch.object(
+            hass.config_entries, "async_entries", return_value=[entry1, entry2]
+        ):
+            with pytest.raises(
+                ServiceValidationError,
+                match="belongs to a different console than site 'site2'",
+            ):
+                _get_coordinator_for_network_resource(
+                    hass, site_id="site2", device_id=dev1.id
+                )
+
+            # Native device in cross_console_entries with site_id mismatch
+            with pytest.raises(
+                ServiceValidationError,
+                match="Device 'd1' belongs to a different console than site 'site2'",
+            ):
+                _get_coordinator_for_network_resource(
+                    hass, site_id="site2", device_id="d1"
+                )
+
+            # Line 611: site_id is None and resolved_site is not None
+            # Line 668: resolved_reg_entry is not None and resolved_reg_entry in entries_with_device
+            c_res, dev_res = _get_coordinator_for_network_resource(
+                hass, site_id=None, device_id=dev1.id
+            )
+            assert c_res == coord1
+            assert dev_res == "d1"
+
+            # Line 694: Multiple candidate entries matching site, resolved_reg_entry picks coordinator
+            entry1_dup = MockConfigEntry(
+                domain=DOMAIN, entry_id="entry1_dup", title="Console 1 Dup"
+            )
+            entry1_dup.add_to_hass(hass)
+            entry1_dup.runtime_data = MagicMock(
+                coordinator=MagicMock(data={"sites": {"site1": {}}})
+            )
+
+            client_dev = dev_reg.async_get_or_create(
+                config_entry_id=entry1.entry_id,
+                identifiers={(DOMAIN, "client_00:11:22:33:44:55")},
+            )
+            with patch.object(
+                hass.config_entries, "async_entries", return_value=[entry1, entry1_dup]
+            ):
+                c, cid = _get_coordinator_for_network_resource(
+                    hass, site_id="site1", client_id=client_dev.id
+                )
+                assert c == coord1
+                assert cid == "00:11:22:33:44:55"
+
+        # Protect cross-console mismatch (lines 826-830)
+        coord_p1 = MagicMock(protect_client=MagicMock())
+        coord_p1.data = {"protect": {"cameras": {}}}  # cam1 not loaded in p1
+        entry_p1 = MockConfigEntry(domain=DOMAIN, entry_id="rp1", title="Protect 1")
+        entry_p1.add_to_hass(hass)
+        entry_p1.runtime_data = MagicMock(coordinator=coord_p1)
+
+        coord_p2 = MagicMock(protect_client=MagicMock())
+        coord_p2.data = {"protect": {"cameras": {"cam1": {}}}}  # cam1 loaded in p2
+        entry_p2 = MockConfigEntry(domain=DOMAIN, entry_id="rp2", title="Protect 2")
+        entry_p2.add_to_hass(hass)
+        entry_p2.runtime_data = MagicMock(coordinator=coord_p2)
+
+        cam1_dev = dev_reg.async_get_or_create(
+            config_entry_id=entry_p1.entry_id,
+            identifiers={(DOMAIN, "protect_camera_cam1")},
+        )
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry_p1, entry_p2]
+            ),
+            pytest.raises(
+                ServiceValidationError,
+                match="belongs to a different console than the target console",
+            ),
+        ):
+            _get_coordinator_for_protect_resource(
+                hass,
+                resource_type="camera",
+                resource_id=cam1_dev.id,
+            )
+
+        # Protect multiple matching entries resolved via resolved_reg_entry (line 834)
+        coord_p1.data = {"protect": {"cameras": {"cam1": {}}}}
+        coord_p_dup = MagicMock(protect_client=MagicMock())
+        coord_p_dup.data = {"protect": {"cameras": {"cam1": {}}}}
+        entry_p_dup = MockConfigEntry(
+            domain=DOMAIN, entry_id="rp_dup", title="Protect Dup"
+        )
+        entry_p_dup.add_to_hass(hass)
+        entry_p_dup.runtime_data = MagicMock(coordinator=coord_p_dup)
+        with patch.object(
+            hass.config_entries, "async_entries", return_value=[entry_p1, entry_p_dup]
+        ):
+            c, cid = _get_coordinator_for_protect_resource(
+                hass, resource_type="camera", resource_id=cam1_dev.id
+            )
+            assert c == coord_p1
+            assert cid == "cam1"
+
+    async def test_service_handlers_missing_target_validations(
+        self, hass: HomeAssistant
+    ):
+        """Test that each service handler raises when target/id is missing."""
+        from custom_components.unifi_insights.services import (
+            SERVICE_AUTHORIZE_GUEST,
+            SERVICE_PLAY_CHIME_RINGTONE,
+            SERVICE_PTZ_MOVE,
+            SERVICE_PTZ_PATROL,
+            SERVICE_RESTART_DEVICE,
+            SERVICE_SET_CHIME_REPEAT_TIMES,
+            SERVICE_SET_CHIME_RINGTONE,
+            SERVICE_SET_CHIME_VOLUME,
+            SERVICE_SET_HDR_MODE,
+            SERVICE_SET_LIGHT_LEVEL,
+            SERVICE_SET_LIGHT_MODE,
+            SERVICE_SET_LIVEVIEW,
+            SERVICE_SET_MIC_VOLUME,
+            SERVICE_SET_RECORDING_MODE,
+            SERVICE_SET_VIDEO_MODE,
+        )
+
+        await async_setup_services(hass)
+
+        # 1. restart_device missing device_id
+        with pytest.raises(
+            ServiceValidationError, match="Device ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_RESTART_DEVICE, {}, blocking=True
+            )
+
+        # 2. set_recording_mode missing camera_id
+        with pytest.raises(
+            ServiceValidationError, match="Camera ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_RECORDING_MODE, {"mode": "always"}, blocking=True
+            )
+
+        # 3. set_hdr_mode missing camera_id
+        with pytest.raises(
+            ServiceValidationError, match="Camera ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_HDR_MODE, {"mode": "auto"}, blocking=True
+            )
+
+        # 4. set_video_mode missing camera_id
+        with pytest.raises(
+            ServiceValidationError, match="Camera ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_VIDEO_MODE, {"mode": "high_fps"}, blocking=True
+            )
+
+        # 5. set_mic_volume missing camera_id
+        with pytest.raises(
+            ServiceValidationError, match="Camera ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_MIC_VOLUME, {"volume": 50}, blocking=True
+            )
+
+        # 6. set_light_mode missing light_id
+        with pytest.raises(
+            ServiceValidationError, match="Light ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_LIGHT_MODE, {"mode": "motion"}, blocking=True
+            )
+
+        # 7. set_light_level missing light_id
+        with pytest.raises(
+            ServiceValidationError, match="Light ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_LIGHT_LEVEL, {"level": 3}, blocking=True
+            )
+
+        # 8. ptz_move missing camera_id
+        with pytest.raises(
+            ServiceValidationError, match="Camera ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_PTZ_MOVE, {"preset": 1}, blocking=True
+            )
+
+        # 9. ptz_patrol missing camera_id
+        with pytest.raises(
+            ServiceValidationError, match="Camera ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_PTZ_PATROL, {"action": "start"}, blocking=True
+            )
+
+        # 10. set_chime_volume missing chime_id
+        with pytest.raises(
+            ServiceValidationError, match="Chime ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_CHIME_VOLUME, {"volume": 80}, blocking=True
+            )
+
+        # 11. play_chime_ringtone missing chime_id
+        with pytest.raises(
+            ServiceValidationError, match="Chime ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_PLAY_CHIME_RINGTONE, {}, blocking=True
+            )
+
+        # 12. set_chime_ringtone missing chime_id
+        with pytest.raises(
+            ServiceValidationError, match="Chime ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_SET_CHIME_RINGTONE,
+                {"ringtone_id": "digital"},
+                blocking=True,
+            )
+
+        # 13. set_chime_repeat_times missing chime_id
+        with pytest.raises(
+            ServiceValidationError, match="Chime ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_SET_CHIME_REPEAT_TIMES,
+                {"repeat_times": 3},
+                blocking=True,
+            )
+
+        # 14. authorize_guest missing client_id
+        with pytest.raises(
+            ServiceValidationError, match="Client ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_AUTHORIZE_GUEST, {"site_id": "site1"}, blocking=True
+            )
+
+        # 15. set_liveview missing viewer_id
+        with pytest.raises(
+            ServiceValidationError, match="Viewer ID or target is required"
+        ):
+            await hass.services.async_call(
+                DOMAIN, SERVICE_SET_LIVEVIEW, {"liveview_id": "lv1"}, blocking=True
+            )
+
+        # Chime services with camera_id as list
+        coord = MagicMock(protect_client=MagicMock())
+        coord.async_set_chime_volume = AsyncMock()
+        coord.async_set_chime_ringtone = AsyncMock()
+        coord.async_set_chime_repeat = AsyncMock()
+        entry = MagicMock(
+            entry_id="entry_p",
+            title="Protect",
+            runtime_data=MagicMock(coordinator=coord),
+        )
+        coord.data = {"protect": {"chimes": {"chime1": {}}, "cameras": {"cam1": {}}}}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[entry]):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_SET_CHIME_VOLUME,
+                {"chime_id": "chime1", "volume": 50, "camera_id": ["cam1"]},
+                blocking=True,
+            )
+            assert coord.async_set_chime_volume.called
+
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_SET_CHIME_RINGTONE,
+                {"chime_id": "chime1", "ringtone_id": "digital", "camera_id": ["cam1"]},
+                blocking=True,
+            )
+            assert coord.async_set_chime_ringtone.called
+
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_SET_CHIME_REPEAT_TIMES,
+                {"chime_id": "chime1", "repeat_times": 2, "camera_id": ["cam1"]},
+                blocking=True,
+            )
+            assert coord.async_set_chime_repeat.called
+
+        # Restart device site search (multiple sites in coordinator data)
+        coord_net = MagicMock()
+        coord_net.async_restart_device = AsyncMock()
+        coord_net.data = {
+            "devices": {"other_site": {"other_d": {}}, "site_target": {"target_d": {}}}
+        }
+        entry_net = MagicMock(
+            entry_id="entry_net",
+            title="Network",
+            runtime_data=MagicMock(coordinator=coord_net),
+        )
+
+        with patch.object(
+            hass.config_entries, "async_entries", return_value=[entry_net]
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_RESTART_DEVICE,
+                {"device_id": "target_d"},
+                blocking=True,
+            )
+            coord_net.async_restart_device.assert_called_once_with(
+                "site_target", "target_d"
+            )
+
+        # When coordinator.data has no devices section (warming up), device is accepted by resolver
+        # but site_id cannot be inferred, hitting lines 1241-1242
+        coord_warming = MagicMock(data={})
+        entry_warming = MagicMock(
+            entry_id="entry_warm",
+            title="Warming",
+            runtime_data=MagicMock(coordinator=coord_warming),
+        )
+        with (
+            patch.object(
+                hass.config_entries, "async_entries", return_value=[entry_warming]
+            ),
+            pytest.raises(
+                ServiceValidationError,
+                match="Site ID is required to restart device 'd_unloaded'",
+            ),
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_RESTART_DEVICE,
+                {"device_id": "d_unloaded"},
+                blocking=True,
+            )
+
+        await async_unload_services(hass)
+        # Call unload a second time when no services are registered to cover false branches
+        await async_unload_services(hass)
+
+    async def test_resolver_fine_grained_branches(self, hass: HomeAssistant):
+        """Test fine-grained branch conditions for resolvers and handlers."""
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        from custom_components.unifi_insights.services import (
+            SERVICE_RESTART_DEVICE,
+            _resolve_network_client_id,
+            _resolve_network_device_id,
+            _resolve_protect_resource_id,
+        )
+
+        dev_reg = dr.async_get(hass)
+        ent_reg = er.async_get(hass)
+
+        entry1 = MockConfigEntry(
+            domain=DOMAIN, entry_id="fg_entry1", title="Console FG"
+        )
+        entry1.add_to_hass(hass)
+        entry1.runtime_data = MagicMock(
+            coordinator=MagicMock(
+                data={
+                    "devices": {"s1": {"d_exist": {}}, "s_empty": "not_a_dict"},
+                    "clients": {"s1": {"00:11:22:33:44:55": {}}},
+                    "protect": {"cameras": {"cam_exist": {}}, "lights": "not_a_dict"},
+                }
+            )
+        )
+
+        # --- Network Device branches ---
+        # 1. Entity without config_entry_id, without device_id, unique_id="single" (len(parts) < 2), no dev_entry
+        ent_no_cfg = ent_reg.async_get_or_create(
+            "switch",
+            DOMAIN,
+            "single",
+        )
+        with pytest.raises(ServiceValidationError, match="Could not resolve target"):
+            _resolve_network_device_id(hass, ent_no_cfg.entity_id, None, [entry1])
+
+        # 2. Entity with non-matching config_entry_id
+        mismatch_entry = MockConfigEntry(domain=DOMAIN, entry_id="mismatch_entry")
+        mismatch_entry.add_to_hass(hass)
+        ent_mismatch_cfg = ent_reg.async_get_or_create(
+            "switch",
+            DOMAIN,
+            "s1_otherdev",
+            config_entry=mismatch_entry,
+        )
+        d, s, e = _resolve_network_device_id(
+            hass, ent_mismatch_cfg.entity_id, None, [entry1]
+        )
+        assert d == "otherdev"
+        assert s == "s1"
+        assert e is None
+
+        # 3. Device where identifier starts with s1_ but device is not in s_devs or s_devs not dict
+        dev_not_in_sdevs = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={
+                (DOMAIN, "s1_notthere"),
+                (DOMAIN, "s_empty_ignored"),
+                (DOMAIN, "otherprefix_dev"),
+            },
+        )
+        d, s, e = _resolve_network_device_id(hass, dev_not_in_sdevs.id, None, [entry1])
+        assert d in {"notthere", "ignored", "dev"}
+
+        # 4. Device where resolved_entry is already set, checking resolved_entry is None branch
+        # Also testing restart_device with site_id provided (1231->1236)
+        coord = MagicMock()
+        coord.async_restart_device = AsyncMock()
+        coord.data = {"devices": {"s1": {"d_exist": {}}}}
+        entry_with_coord = MockConfigEntry(
+            domain=DOMAIN, entry_id="fg_restart", title="Restart FG"
+        )
+        entry_with_coord.add_to_hass(hass)
+        entry_with_coord.runtime_data = MagicMock(coordinator=coord)
+
+        await async_setup_services(hass)
+        with patch.object(
+            hass.config_entries, "async_entries", return_value=[entry_with_coord]
+        ):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_RESTART_DEVICE,
+                {"device_id": "d_exist", "site_id": "s1"},
+                blocking=True,
+            )
+            assert coord.async_restart_device.called
+
+        # --- Protect Resource branches ---
+        # 1. Entity without config_entry_id, without device_id, unique_id has no match
+        ent_p_nocfg = ent_reg.async_get_or_create(
+            "camera",
+            DOMAIN,
+            f"{DOMAIN}_camera_notmatching_camnone",
+        )
+        res_id, e = _resolve_protect_resource_id(
+            hass, "camera", ent_p_nocfg.entity_id, [entry1]
+        )
+        assert res_id == "notmatching"
+        assert e is None
+
+        # 2. Entity with non-matching config_entry_id
+        ent_p_mismatch = ent_reg.async_get_or_create(
+            "camera",
+            DOMAIN,
+            f"{DOMAIN}_camera_cam_exist",
+            config_entry=mismatch_entry,
+        )
+        res_id, e = _resolve_protect_resource_id(
+            hass, "camera", ent_p_mismatch.entity_id, [entry1]
+        )
+        assert res_id == "cam_exist"
+        assert e == entry1
+
+        # 3. Protect resource_type != camera (e.g. light) with entity that cannot be resolved and no dev_entry
+        ent_light_single = ent_reg.async_get_or_create(
+            "light",
+            DOMAIN,
+            "singlelight",
+        )
+        with pytest.raises(ServiceValidationError, match="Could not resolve target"):
+            _resolve_protect_resource_id(
+                hass, "light", ent_light_single.entity_id, [entry1]
+            )
+
+        # 4. Camera device fallback loop with unrelated entity on the device
+        dev_cam_unrelated = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "other_device_id")},
+        )
+        ent_reg.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "sensor_temperature",
+            config_entry=entry1,
+            device_id=dev_cam_unrelated.id,
+        )
+        with pytest.raises(ServiceValidationError, match="Could not resolve target"):
+            _resolve_protect_resource_id(hass, "camera", dev_cam_unrelated.id, [entry1])
+
+        # --- Network Client branches ---
+        # 1. Entity without config_entry_id, without device_id, unique_id has no match
+        ent_c_nocfg = ent_reg.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            "singletracker",
+        )
+        c_id, e = _resolve_network_client_id(hass, ent_c_nocfg.entity_id, [entry1])
+        assert c_id == ent_c_nocfg.entity_id
+        assert e is None
+
+        # 2. Entity with non-matching config_entry_id
+        ent_c_mismatch = ent_reg.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            "prefix_clienttest",
+            config_entry=mismatch_entry,
+        )
+        c_id, e = _resolve_network_client_id(hass, ent_c_mismatch.entity_id, [entry1])
+        assert c_id == "clienttest"
+        assert e is None
+
+        # 3. Client device target with non-client identifier fallback
+        dev_client_other = dev_reg.async_get_or_create(
+            config_entry_id=entry1.entry_id,
+            identifiers={(DOMAIN, "other_prefix_00:11:22:33:44:55")},
+        )
+        c_id, e = _resolve_network_client_id(hass, dev_client_other.id, [entry1])
+        assert c_id == dev_client_other.id
+        assert e == entry1

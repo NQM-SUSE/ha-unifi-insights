@@ -17,29 +17,265 @@ refresh_data:
 restart_device:
   name: Restart Device
   description: Restart a UniFi device.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     site_id:
       name: Site ID
-      description: The site ID where the device is located.
-      required: true
+      description: The site ID where the device is located (optional when targeting an entity or device).
+      required: false
       selector:
         text:
     device_id:
       name: Device ID
       description: The ID of the device to restart.
-      required: true
+      required: false
       selector:
         text:
+
+# UniFi Protect Camera services
+set_recording_mode:
+  name: Set Recording Mode
+  description: Set the recording mode for a UniFi Protect camera.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: camera
+  fields:
+    camera_id:
+      name: Camera ID
+      description: The ID of the camera
+      required: false
+      selector:
+        text:
+    mode:
+      name: Recording Mode
+      description: The recording mode to set
+      required: true
+      selector:
+        select:
+          options:
+            - "always"
+            - "never"
+            - "detections"
+
+set_hdr_mode:
+  name: Set HDR Mode
+  description: Set the HDR mode for a UniFi Protect camera.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: camera
+  fields:
+    camera_id:
+      name: Camera ID
+      description: The ID of the camera
+      required: false
+      selector:
+        text:
+    mode:
+      name: HDR Mode
+      description: HDR mode (auto, always, never)
+      required: true
+      selector:
+        select:
+          options:
+            - "auto"
+            - "always"
+            - "never"
+
+set_video_mode:
+  name: Set Video Mode
+  description: Set the video mode (FPS) for a UniFi Protect camera.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: camera
+  fields:
+    camera_id:
+      name: Camera ID
+      description: The ID of the camera
+      required: false
+      selector:
+        text:
+    mode:
+      name: Video Mode
+      description: Video mode (high_fps, default, slow)
+      required: true
+      selector:
+        select:
+          options:
+            - "high_fps"
+            - "default"
+            - "slow"
+
+set_mic_volume:
+  name: Set Microphone Volume
+  description: Set the microphone volume level for a UniFi Protect camera.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: camera
+  fields:
+    camera_id:
+      name: Camera ID
+      description: The ID of the camera
+      required: false
+      selector:
+        text:
+    volume:
+      name: Volume
+      description: Microphone volume level (0-100)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+
+ptz_move:
+  name: PTZ Move
+  description: Move a PTZ camera in a given direction.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: camera
+  fields:
+    camera_id:
+      name: Camera ID
+      description: The ID of the camera
+      required: false
+      selector:
+        text:
+    direction:
+      name: Direction
+      description: Movement direction
+      required: true
+      selector:
+        select:
+          options:
+            - "up"
+            - "down"
+            - "left"
+            - "right"
+            - "home"
+
+ptz_patrol:
+  name: PTZ Patrol
+  description: Control the patrol function on a PTZ camera.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: camera
+  fields:
+    camera_id:
+      name: Camera ID
+      description: The ID of the camera
+      required: false
+      selector:
+        text:
+    action:
+      name: Action
+      description: Patrol action (start, stop)
+      required: true
+      selector:
+        select:
+          options:
+            - "start"
+            - "stop"
+    slot:
+      name: Slot
+      description: Patrol slot number
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 1
+
+# UniFi Protect Light services
+set_light_mode:
+  name: Set Light Mode
+  description: Set the lighting mode for a UniFi Protect light.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: light
+  fields:
+    light_id:
+      name: Light ID
+      description: The ID of the light
+      required: false
+      selector:
+        text:
+    mode:
+      name: Mode
+      description: Light mode (motion, when_dark, manual)
+      required: true
+      selector:
+        select:
+          options:
+            - "motion"
+            - "when_dark"
+            - "manual"
+
+set_light_level:
+  name: Set Light Level
+  description: Set the brightness level for a UniFi Protect light.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
+      domain: light
+  fields:
+    light_id:
+      name: Light ID
+      description: The ID of the light
+      required: false
+      selector:
+        text:
+    level:
+      name: Brightness Level
+      description: Brightness level (1-6)
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 6
+          step: 1
 
 # UniFi Protect Chime services
 set_chime_volume:
   name: Set Chime Volume
   description: Set the volume level for a UniFi Protect chime.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     chime_id:
       name: Chime ID
       description: ID of the chime
-      required: true
+      required: false
       example: "60e9c8c0e3e4b8001a123456"
       selector:
         text:
@@ -68,11 +304,16 @@ set_chime_volume:
 play_chime_ringtone:
   name: Play Chime Ringtone
   description: Play a ringtone on a UniFi Protect chime.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     chime_id:
       name: Chime ID
       description: ID of the chime
-      required: true
+      required: false
       example: "60e9c8c0e3e4b8001a123456"
       selector:
         text:
@@ -96,11 +337,16 @@ play_chime_ringtone:
 set_chime_ringtone:
   name: Set Chime Ringtone
   description: Set the ringtone for a UniFi Protect chime.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     chime_id:
       name: Chime ID
       description: ID of the chime
-      required: true
+      required: false
       example: "60e9c8c0e3e4b8001a123456"
       selector:
         text:
@@ -134,11 +380,16 @@ set_chime_ringtone:
 set_chime_repeat_times:
   name: Set Chime Repeat Times
   description: Set the number of times a chime repeats when triggered.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     chime_id:
       name: Chime ID
       description: ID of the chime
-      required: true
+      required: false
       example: "60e9c8c0e3e4b8001a123456"
       selector:
         text:
@@ -168,6 +419,11 @@ set_chime_repeat_times:
 authorize_guest:
   name: Authorize Guest
   description: Authorize guest access for a client on the UniFi Network.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     site_id:
       name: Site ID
@@ -178,7 +434,7 @@ authorize_guest:
     client_id:
       name: Client ID
       description: The ID of the client to authorize
-      required: true
+      required: false
       selector:
         text:
     duration_minutes:
@@ -346,11 +602,16 @@ create_liveview:
 set_liveview:
   name: Set Live View
   description: Set the active live view for a viewer.
+  target:
+    device:
+      integration: unifi_insights
+    entity:
+      integration: unifi_insights
   fields:
     viewer_id:
       name: Viewer ID
       description: The ID of the viewer
-      required: true
+      required: false
       selector:
         text:
     liveview_id:
