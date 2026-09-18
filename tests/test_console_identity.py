@@ -789,3 +789,173 @@ async def test_async_setup_entry_discovers_console_identity_from_device_gateway(
         assert entry.unique_id == "22:33:44:55:66:77"
         assert entry.title == "UniFi - Dream Router"
         await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_console_identity_extra_coverage_branches(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """Cover edge cases in _first_site_id, device parsing, setup fallbacks and protect coordinator."""
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+    from custom_components.unifi_insights.coordinators.protect import UnifiProtectCoordinator
+
+    # 1. _first_site_id when sites is not a dict
+    coord = MagicMock()
+    coord.data = {"sites": "not_a_dict"}
+    assert _first_site_id(coord) is None
+
+    # 2. Local setup fallback to site_id and host, plus non-dict site devices handling
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Local)",
+        unique_id="local_api_key_fallback",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.100",
+            CONF_API_KEY: "local_api_key_fallback",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_device_data_with_non_dicts(coord_self):
+        coord_self.data = {
+            "devices": {
+                "invalid_site": "not_a_dict",
+                "valid_site": {
+                    "invalid_dev": "not_a_dict",
+                    "plain_switch": {
+                        "is_gateway": False,
+                        "model": "USW-Flex",
+                        "mac": "00:11:22:33:44:55",
+                    },
+                },
+            }
+        }
+
+    async def fake_config_sites(coord_self):
+        coord_self.data = {
+            "sites": {
+                "my_custom_site": {"id": "my_custom_site"},
+            }
+        }
+
+    with (
+        patch("custom_components.unifi_insights.async_probe_network", new_callable=AsyncMock) as mock_probe_net,
+        patch("custom_components.unifi_insights.async_probe_protect", new_callable=AsyncMock) as mock_probe_prot,
+        patch("custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh", autospec=True, side_effect=fake_config_sites),
+        patch("custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh", autospec=True, side_effect=fake_device_data_with_non_dicts),
+        patch("homeassistant.config_entries.ConfigEntries.async_forward_entry_setups", new_callable=AsyncMock),
+    ):
+        mock_probe_net.return_value = ProbeResult(ProbeStatus.AVAILABLE, [MagicMock(id="my_custom_site")])
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        assert entry.data.get(CONF_CONSOLE_ID) == "my_custom_site"
+        assert entry.unique_id == "my_custom_site"
+        await hass.config_entries.async_unload(entry.entry_id)
+
+    # 3. Protect coordinator methods when client is None or timers already stopped
+    protect_coord = UnifiProtectCoordinator(
+        hass,
+        network_client=MagicMock(),
+        protect_client=None,
+        entry=entry,
+    )
+    protect_coord._unsub_sensor_reconcile = None
+    protect_coord._stop_sensor_reconcile_timer()
+    await protect_coord.async_refresh_sensors()
+
+
+async def test_config_flow_local_probe_protect_nvr_and_reconfigure_mismatch(
+    hass: HomeAssistant,
+) -> None:
+    """Test local config flow extracts NVR info and remote reconfigure aborts on console mismatch."""
+    # 1. Local flow with Protect probe returning NVR
+    from custom_components.unifi_insights.api import UniFiResponseError
+    net_cm, net_client = _make_mock_client()
+    net_client.sites.get_all = AsyncMock(side_effect=UniFiResponseError("Not Found", status_code=404))
+
+    nvr_mock = MagicMock()
+    nvr_mock.mac = "aa-bb-cc-dd-ee-99"
+    nvr_mock.name = "Test NVR Console"
+    nvr_mock.display_name = None
+
+    protect_client = MagicMock()
+    protect_client.nvr.get = AsyncMock(return_value=nvr_mock)
+    protect_client.cameras.get_all = AsyncMock(return_value=[])
+    protect_cm = MagicMock()
+    protect_cm.__aenter__ = AsyncMock(return_value=protect_client)
+    protect_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch("custom_components.unifi_insights.config_flow.UniFiNetworkClient", return_value=net_cm),
+        patch("custom_components.unifi_insights.config_flow.UniFiProtectClient", return_value=protect_cm),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch("custom_components.unifi_insights.async_setup_entry", return_value=True),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.10",
+                CONF_API_KEY: "protect_nvr_key",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+        assert result["type"] == FlowResultType.CREATE_ENTRY
+        assert result["data"].get(CONF_CONSOLE_ID) == "aa:bb:cc:dd:ee:99"
+        assert result["data"].get(CONF_CONSOLE_NAME) == "Test NVR Console"
+
+    # 2. Remote reconfigure aborts on mismatched console_id
+    remote_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="existing_console_111",
+        title="UniFi - Remote Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
+            CONF_API_KEY: "remote_api_key",
+            CONF_CONSOLE_ID: "existing_console_111",
+        },
+    )
+    remote_entry.add_to_hass(hass)
+
+    hosts = [
+        _remote_host("existing_console_111", "Console 1"),
+        _remote_host("different_console_222", "Console 2"),
+    ]
+    cloud_cm, _ = _make_mock_client(
+        get_hosts=hosts,
+        sites=[MagicMock(id="default", name="Default")],
+    )
+
+    with (
+        patch("custom_components.unifi_insights.config_flow.UniFiNetworkClient", return_value=cloud_cm),
+        patch("custom_components.unifi_insights.config_flow.ApiKeyAuth"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": remote_entry.entry_id,
+            },
+        )
+        assert result["step_id"] == "reconfigure"
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_API_KEY: "new_api_key",
+                CONF_CONSOLE_ID: "different_console_222",
+            },
+        )
+        assert result["type"] == FlowResultType.ABORT
+        assert result["reason"] == "account_mismatch"
