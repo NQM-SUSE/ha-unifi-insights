@@ -280,13 +280,8 @@ def _get_coordinator_for_network_resource(
             entry for entry in entries if _entry_has_site(entry, site_id)
         ]
         if not matching_entries:
-            has_any_site_data = any(
-                _coord_section(e, "sites") is not None for e in entries
-            )
-            if has_any_site_data:
-                msg = f"Site '{site_id}' not found on any configured UniFi console"
-                raise ServiceValidationError(msg)
-            matching_entries = entries
+            msg = f"Site '{site_id}' not found on any configured UniFi console"
+            raise ServiceValidationError(msg)
     else:
         matching_entries = entries
 
@@ -314,26 +309,18 @@ def _get_coordinator_for_network_resource(
                 if entry not in matching_entries
                 and _entry_has_device(entry, None, device_id)
             ]
-            has_any_device_data = any(
-                _coord_section(e, "devices") is not None for e in entries
-            )
             if cross_console_entries and site_id:
                 msg = (
                     f"Device '{device_id}' belongs to a different console than"
                     f" site '{site_id}'"
                 )
                 raise ServiceValidationError(msg)
-            if has_any_device_data:
-                msg = (
-                    f"Device '{device_id}' not found on console for site '{site_id}'"
-                    if site_id
-                    else (
-                        f"Device '{device_id}' not found on any"
-                        " configured UniFi console"
-                    )
-                )
-                raise ServiceValidationError(msg)
-            entries_with_device = matching_entries
+            msg = (
+                f"Device '{device_id}' not found on console for site '{site_id}'"
+                if site_id
+                else f"Device '{device_id}' not found on any configured UniFi console"
+            )
+            raise ServiceValidationError(msg)
 
         if len(entries_with_device) > 1:
             explicit_matches = [
@@ -497,17 +484,11 @@ def _get_coordinator_for_protect_resource(
         ]
 
     if not matching_entries:
-        has_any_protect_data = any(
-            _protect_owns_resource(e, collection_key, resource_id) is not None
-            for e in protect_entries
+        msg = (
+            f"{resource_type.capitalize()} '{resource_id}' not found on any"
+            " configured UniFi Protect console"
         )
-        if has_any_protect_data:
-            msg = (
-                f"{resource_type.capitalize()} '{resource_id}' not found on any"
-                " configured UniFi Protect console"
-            )
-            raise ServiceValidationError(msg)
-        matching_entries = protect_entries
+        raise ServiceValidationError(msg)
 
     if len(matching_entries) > 1:
         explicit_matches = [
