@@ -25,6 +25,7 @@ from .api.protect import UniFiProtectClient
 from .console_identity import (
     first_non_default_site_id,
     is_console_device,
+    normalize_mac,
     resolve_console_identity,
 )
 from .const import (
@@ -412,7 +413,7 @@ async def async_setup_entry(
         if isinstance(nvrs, dict) and nvrs:
             first_nvr = next(iter(nvrs.values()), None)
             if isinstance(first_nvr, dict):
-                console_mac = first_nvr.get("mac")
+                console_mac = normalize_mac(first_nvr.get("mac"))
                 if not console_name:
                     console_name = first_nvr.get("name")
 

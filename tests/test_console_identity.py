@@ -1203,7 +1203,10 @@ async def test_async_setup_entry_discovers_console_identity_from_nvr(
         coord_self.data = {
             "nvrs": {
                 "nvr_1": {
-                    "mac": "aa:bb:cc:dd:ee:11",
+                    # Deliberately unnormalised: setup must store this the
+                    # same way the config flow would, or the two identities
+                    # disagree and the console gains a second entry.
+                    "mac": "AA-BB-CC-DD-EE-11",
                     "name": "Home UDM",
                 }
             }

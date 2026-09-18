@@ -40,6 +40,7 @@ from .console_identity import (
     DEFAULT_SITE_ID,
     device_fields,
     first_non_default_site_id,
+    normalize_mac,
     resolve_console_identity,
 )
 from .const import (
@@ -213,30 +214,37 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
             res = await async_probe_network(network_client)
             if res.status is ProbeStatus.AVAILABLE and res.sites:
                 site_ids = [getattr(site, "id", None) for site in res.sites]
-                try:
-                    # Sites are scanned in API order and the scan stops at the
-                    # first console found, so the ordinary single-site console
-                    # still costs one request. Only a controller whose gateway
-                    # lives outside the first site pays for more - and that is
-                    # exactly the case that used to leave the flow with no MAC
-                    # while setup found one, producing a duplicate entry.
-                    for site_id in site_ids:
+                # Sites are scanned in API order and the scan stops at the
+                # first console found, so the ordinary single-site console
+                # still costs one request. Only a controller whose gateway
+                # lives outside the first site pays for more - and that is
+                # exactly the case that used to leave the flow with no MAC
+                # while setup found one, producing a duplicate entry.
+                for site_id in site_ids:
+                    # Guarding per site, not around the loop: the client stays
+                    # usable after a failed request, and setup would still find
+                    # the console in a later site. Abandoning the scan here
+                    # would put the two paths back out of step.
+                    try:
                         devices = await network_client.devices.get_all(
                             site_id=site_id or DEFAULT_SITE_ID
                         )
-                        mac, name = resolve_console_identity(
-                            device_fields(dev) for dev in devices
+                    except Exception:
+                        _LOGGER.debug(
+                            "Could not inspect devices for site %s",
+                            site_id,
+                            exc_info=True,
                         )
-                        if name and "name" not in console_info:
-                            console_info["name"] = name
-                        if mac:
-                            console_info["id"] = mac
-                            console_info["mac"] = mac
-                            break
-                except Exception:
-                    _LOGGER.debug(
-                        "Could not inspect local network devices", exc_info=True
+                        continue
+                    mac, name = resolve_console_identity(
+                        device_fields(dev) for dev in devices
                     )
+                    if name and "name" not in console_info:
+                        console_info["name"] = name
+                    if mac:
+                        console_info["id"] = mac
+                        console_info["mac"] = mac
+                        break
 
                 if "id" not in console_info:
                     # Same ordering rule setup applies, so both derive the
@@ -277,12 +285,10 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                         try:
                             nvr = await nvr_call
                             if nvr:
-                                nvr_mac = getattr(nvr, "mac", None)
-                                if type(nvr_mac) is str:
-                                    console_info["id"] = nvr_mac.lower().replace(
-                                        "-", ":"
-                                    )
-                                    console_info["mac"] = console_info["id"]
+                                nvr_mac = normalize_mac(getattr(nvr, "mac", None))
+                                if nvr_mac:
+                                    console_info["id"] = nvr_mac
+                                    console_info["mac"] = nvr_mac
                                 nvr_name = getattr(nvr, "name", None) or getattr(
                                     nvr, "display_name", None
                                 )
