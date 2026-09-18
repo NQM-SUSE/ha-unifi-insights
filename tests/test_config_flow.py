@@ -1537,6 +1537,105 @@ async def test_reconfigure_remote_success(hass: HomeAssistant) -> None:
         assert result["reason"] == "reconfigure_successful"
 
 
+async def test_reconfigure_remote_adopts_the_console_as_unique_id(
+    hass: HomeAssistant,
+) -> None:
+    """Test reconfigure moves a cloud entry's unique ID onto the console."""
+    remote_entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Cloud)",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
+            CONF_CONSOLE_ID: "console123",
+            CONF_API_KEY: "old_api_key",
+        },
+        unique_id="old_api_key",
+    )
+    remote_entry.add_to_hass(hass)
+
+    discovery_cm = _make_client_context(get_hosts=[_remote_host("new_console")])
+    validation_cm = _make_client_context(
+        sites=[MagicMock(id="default", name="Default")]
+    )
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            side_effect=[discovery_cm, validation_cm],
+        ),
+        patch("custom_components.unifi_insights.config_flow.ApiKeyAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+        # The reload runs async_migrate_entry, which also rewrites the
+        # unique_id. Stub it out so only the flow can set it here.
+        patch(
+            "custom_components.unifi_insights.async_migrate_entry",
+            return_value=True,
+        ),
+    ):
+        result = await remote_entry.start_reconfigure_flow(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_CONSOLE_ID: "new_console",
+                CONF_API_KEY: "old_api_key",
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert remote_entry.unique_id == "new_console"
+    assert remote_entry.data[CONF_CONSOLE_ID] == "new_console"
+
+
+async def test_reconfigure_remote_console_rejects_the_key(
+    hass: HomeAssistant,
+) -> None:
+    """Test reconfigure re-shows the form when the console rejects the key."""
+    remote_entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Cloud)",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_REMOTE,
+            CONF_CONSOLE_ID: "console123",
+            CONF_API_KEY: "old_api_key",
+        },
+        unique_id="old_api_key",
+    )
+    remote_entry.add_to_hass(hass)
+
+    discovery_cm = _make_client_context(get_hosts=[_remote_host("new_console")])
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=discovery_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.ApiKeyAuth"),
+        patch(
+            "custom_components.unifi_insights.config_flow"
+            ".UnifiInsightsConfigFlow._async_validate_remote_console",
+            side_effect=UniFiAuthenticationError("console rejected the key"),
+        ),
+    ):
+        result = await remote_entry.start_reconfigure_flow(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_CONSOLE_ID: "new_console",
+                CONF_API_KEY: "old_api_key",
+            },
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {CONF_CONSOLE_ID: "invalid_console_id"}
+    assert remote_entry.data[CONF_CONSOLE_ID] == "console123"
+    assert remote_entry.unique_id == "old_api_key"
+
+
 async def test_reconfigure_auth_error(
     hass: HomeAssistant,
     mock_config_entry,
