@@ -1362,6 +1362,10 @@ async def async_setup_entry(
     coordinator: UnifiFacadeCoordinator = config_entry.runtime_data.coordinator
     known_sensor_keys: set[tuple[Any, ...]] = set()
     initial_entities: list[SensorEntity] = []
+    # Only the first pass feeds the stale-entity sweep below. Without this the
+    # list would keep every entity discovered for the lifetime of the entry,
+    # long after the one sweep that reads it has run.
+    setup_complete = False
 
     @callback
     def async_discover_sensors() -> None:
@@ -1447,9 +1451,11 @@ async def async_setup_entry(
         if entities:
             _LOGGER.info("Adding %d UniFi Insights sensors", len(entities))
             async_add_entities(entities)
-            initial_entities.extend(entities)
+            if not setup_complete:
+                initial_entities.extend(entities)
 
     async_discover_sensors()
+    setup_complete = True
     config_entry.async_on_unload(coordinator.async_add_listener(async_discover_sensors))
 
     # Clean up stale port entities from previous runs
