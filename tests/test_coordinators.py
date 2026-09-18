@@ -49,6 +49,7 @@ from custom_components.unifi_insights.coordinators.protect import (
     STALE_EVENT_TIMEOUT,
     UnifiProtectCoordinator,
 )
+from custom_components.unifi_insights.entity import is_device_online
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -1126,6 +1127,318 @@ class TestUnifiDeviceCoordinator:
         assert coordinator._available is True
 
     @pytest.mark.asyncio
+    async def test_process_site_5xx_fallback_with_client_retry(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """v1 devices 5xx falls back to legacy devices and retries clients.
+
+        Regression test: the v1 devices endpoint returns 500 (USW Pro XG
+        family), the site has a legacy name, and the first clients.get_all()
+        call fails. The legacy device becomes the primary device, the retried
+        client appears, and clients.get_all is awaited twice.
+        """
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Switch",
+                    "model": "USW-24",
+                    "type": "usw",
+                    "ip": "192.168.1.10",
+                    "up": True,
+                    "port_table": [
+                        {
+                            "port_idx": 1,
+                            "up": True,
+                            "speed": 1000,
+                            "name": "Port 1",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        clients_call_count = 0
+
+        async def clients_side_effect(site_id):
+            nonlocal clients_call_count
+            clients_call_count += 1
+            if clients_call_count == 1:
+                msg = "Service Unavailable"
+                raise UniFiResponseError(msg, status_code=503)
+            return [
+                _create_mock_model(
+                    {"id": "client1", "name": "Retried Client", "type": "WIRED"}
+                )
+            ]
+
+        coordinator.network_client.clients.get_all = AsyncMock(
+            side_effect=clients_side_effect
+        )
+
+        devices_dict, stats_dict, clients_dict = await coordinator._process_site(
+            "default", legacy_site_name="default"
+        )
+
+        # The legacy device is keyed by its controller id (mapped from _id),
+        # consistent with the v1 keying: devices without an id fall back to
+        # their MAC, but this legacy device has an _id.
+        assert "60a1b2c3d4e5f67890123456" in devices_dict
+        assert "AA:BB:CC:DD:EE:FF" not in devices_dict
+        legacy_device = devices_dict["60a1b2c3d4e5f67890123456"]
+        assert legacy_device["name"] == "Legacy Switch"
+        assert legacy_device["macAddress"] == "AA:BB:CC:DD:EE:FF"
+        # Legacy "up": True is mapped to a v1-style string state that
+        # is_device_online() can read.
+        assert legacy_device["state"] == "ONLINE"
+        assert is_device_online(legacy_device)
+        # port_table is normalized into the v1-shaped ports list
+        assert legacy_device["ports"][0]["idx"] == 1
+
+        # The retried client appears, keyed by client id
+        assert "client1" in clients_dict
+        assert clients_dict["client1"]["name"] == "Retried Client"
+
+        assert clients_call_count == 2
+        assert coordinator.network_client.clients.get_all.await_count == 2
+
+        # The per-device statistics endpoint still works in fallback mode:
+        # the 5xx was on the v1 devices list endpoint only.
+        assert stats_dict["60a1b2c3d4e5f67890123456"]["id"] == (
+            "60a1b2c3d4e5f67890123456"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_device_to_v1_dict_up_state_mapping(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Legacy bool ``up`` maps to a string ``state`` is_device_online reads."""
+        online = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "mac": "AA:BB:CC:DD:EE:FF", "up": True}
+        )
+        offline = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "mac": "AA:BB:CC:DD:EE:FF", "up": False}
+        )
+        assert online["state"] == "ONLINE"
+        assert is_device_online(online)
+        assert offline["state"] == "OFFLINE"
+        assert not is_device_online(offline)
+
+        # An existing usable string state is preserved, and a non-string
+        # legacy ``state`` (0/1) does not block the conversion.
+        preserved = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "up": True, "state": "ONLINE"}
+        )
+        assert preserved["state"] == "ONLINE"
+        int_state = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "up": True, "state": 1}
+        )
+        assert int_state["state"] == "ONLINE"
+        assert is_device_online(int_state)
+
+    def test_legacy_device_to_v1_dict_falls_back_to_mac_id(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """No ``_id`` maps id from mac; field_map keys are copied when absent."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "fw_version": "6.6.55",
+                "port_table": [
+                    {"port_idx": 1, "up": True},
+                    {"name": "no port_idx, dropped"},
+                    "not-a-dict-entry",
+                ],
+            }
+        )
+
+        # No "_id" present, so id falls back to the device's mac.
+        assert mapped["id"] == "AA:BB:CC:DD:EE:FF"
+        # A field_map key present in legacy and absent from mapped is copied
+        # to its v1 camelCase alias.
+        assert mapped["firmwareVersion"] == "6.6.55"
+        # port_table entries are filtered: the dict without port_idx and the
+        # non-dict entry are both dropped, leaving only the valid port.
+        assert len(mapped["ports"]) == 1
+        assert mapped["ports"][0]["port_idx"] == 1
+
+    def test_legacy_device_to_v1_dict_preserves_existing_id_and_mapped_field(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """An existing ``id``/mapped alias is not clobbered by the fallbacks."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "_id": "60a1b2c3d4e5f67890123456",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "id": "already-set",
+                "fw_version": "6.6.55",
+                "firmwareVersion": "already-mapped",
+            }
+        )
+        # legacy_id is truthy but "id" is already present, so it is untouched.
+        assert mapped["id"] == "already-set"
+        # firmwareVersion is already present, so fw_version is not copied over.
+        assert mapped["firmwareVersion"] == "already-mapped"
+
+    def test_legacy_device_to_v1_dict_no_valid_ports_omits_ports_key(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A port_table with no valid entries leaves ``ports`` unset."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "port_table": [
+                    {"name": "missing port_idx"},
+                    "not-a-dict-entry",
+                ],
+            }
+        )
+        assert "ports" not in mapped
+
+    def test_normalize_legacy_port_missing_port_idx_returns_none(self):
+        """A port_table entry without port_idx cannot be normalized."""
+        assert UnifiDeviceCoordinator._normalize_legacy_port({"name": "no idx"}) is None
+
+    def test_normalize_legacy_port_maps_all_optional_fields(self):
+        """Optional identification/SFP fields are copied through when present."""
+        normalized = UnifiDeviceCoordinator._normalize_legacy_port(
+            {
+                "port_idx": 5,
+                "up": True,
+                "media": "GE",
+                "is_uplink": True,
+                "name": "Uplink",
+                "ifname": "eth5",
+                "network_name": "Corporate LAN",
+                "sfp_found": True,
+                "sfp_part": "SFP-10G-SR",
+                "sfp_vendor": "Ubiquiti",
+                "sfp_serial": "SN12345",
+                "sfp_compliance": "10GBASE-SR",
+            }
+        )
+        assert normalized is not None
+        assert normalized["media"] == "GE"
+        assert normalized["is_uplink"] is True
+        assert normalized["ifname"] == "eth5"
+        assert normalized["network_name"] == "Corporate LAN"
+        assert normalized["sfp_found"] is True
+        assert normalized["sfp_part"] == "SFP-10G-SR"
+        assert normalized["sfp_vendor"] == "Ubiquiti"
+        assert normalized["sfp_serial"] == "SN12345"
+        assert normalized["sfp_compliance"] == "10GBASE-SR"
+
+    @pytest.mark.asyncio
+    async def test_process_site_5xx_fallback_legacy_failure_raises(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """When v1 5xx and the legacy fetch both fail, the v1 error propagates."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            side_effect=UniFiConnectionError("Connection refused")
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+    @pytest.mark.asyncio
+    async def test_process_site_5xx_with_empty_legacy_raises(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A v1 5xx with an empty legacy response fails instead of wiping devices."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[]
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+        # The refresh keeps the previous snapshot instead of writing an
+        # empty device map (same contract as any other site failure).
+        previous = copy.deepcopy(coordinator.data["devices"])
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        assert coordinator.data["devices"] == previous
+
+    @pytest.mark.asyncio
+    async def test_process_site_5xx_without_legacy_site_raises(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A v1 5xx without a legacy site name cannot fall back and raises."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default")
+
+    @pytest.mark.asyncio
+    async def test_process_site_4xx_does_not_fall_back(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Only 5xx triggers the legacy fallback; a 4xx error propagates."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Forbidden", status_code=403)
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+        coordinator.network_client.devices.get_legacy_site_devices.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_site_clients_4xx_raises_without_fallback(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A clients failure with healthy v1 devices propagates (no fallback)."""
+        coordinator.network_client.clients.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Service Unavailable", status_code=503)
+        )
+
+        with pytest.raises(UniFiResponseError):
+            await coordinator._process_site("default", legacy_site_name="default")
+
+        coordinator.network_client.clients.get_all.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_uses_legacy_devices_on_v1_5xx(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """End-to-end: a v1 devices 5xx refresh succeeds via legacy devices."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Switch",
+                    "model": "USW-24",
+                    "type": "usw",
+                    "up": True,
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert "60a1b2c3d4e5f67890123456" in result["devices"]["default"]
+        assert result["devices"]["default"]["60a1b2c3d4e5f67890123456"]["name"] == (
+            "Legacy Switch"
+        )
+        assert coordinator._available is True
+
+    @pytest.mark.asyncio
     async def test_async_update_data_merges_legacy_temperature(
         self, coordinator: UnifiDeviceCoordinator
     ):
@@ -1892,6 +2205,28 @@ class TestUnifiDeviceCoordinator:
 
         port3 = next(p for p in ports if p["port_idx"] == 3)
         assert "poe" not in port3
+
+    def test_merge_legacy_port_data_skips_port_without_port_idx(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A port_table entry without port_idx is dropped, not appended."""
+        device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {
+                "port_table": [
+                    {"port_idx": 1, "up": True},
+                    {"up": True, "name": "no port_idx"},
+                ]
+            }
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_port_data(
+            device_dict, legacy_devices_by_mac
+        )
+
+        ports = device_dict.get("ports", [])
+        assert len(ports) == 1
+        assert ports[0]["port_idx"] == 1
 
 
 # ============================================================================
