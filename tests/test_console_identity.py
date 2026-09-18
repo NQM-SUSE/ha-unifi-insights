@@ -879,6 +879,214 @@ async def test_reconfigure_detects_gateway_with_unknown_model(
     assert result["reason"] == "account_mismatch"
 
 
+async def test_flow_finds_console_in_a_later_site(hass: HomeAssistant) -> None:
+    """The flow scans past the first site to find the gateway.
+
+    Setup scans every site, so a gateway outside sites[0] left the flow with
+    a site-or-host id while setup adopted the MAC. The two identities then
+    disagreed and re-adding the console produced a second config entry.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="site-a",
+        title="UniFi - Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "initial_key",
+            CONF_CONSOLE_ID: "site-a",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    net_cm, net_client = _make_mock_client(
+        sites=[MagicMock(id="site-a", name="A"), MagicMock(id="site-b", name="B")],
+    )
+    per_site = {
+        "site-a": [MagicMock(type=None, model="USW Pro Max 24", name="Switch")],
+        "site-b": [
+            MagicMock(
+                type=None,
+                model="UniFi Dream Machine PRO SE",
+                mac="AA:BB:CC:DD:EE:FF",
+                name="Crestwood",
+            )
+        ],
+    }
+
+    async def _devices(site_id=None, **_kwargs):
+        return per_site.get(site_id, [])
+
+    net_client.devices.get_all = AsyncMock(side_effect=_devices)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.1",
+                CONF_API_KEY: "initial_key",
+            },
+        )
+        await hass.async_block_till_done()
+
+        assert result["reason"] == "reconfigure_successful"
+        # The MAC from the second site replaces the weaker site-based id.
+        assert entry.data[CONF_CONSOLE_ID] == "aa:bb:cc:dd:ee:ff"
+        assert entry.unique_id == "aa:bb:cc:dd:ee:ff"
+
+
+async def test_flow_stops_scanning_once_the_console_is_found(
+    hass: HomeAssistant,
+) -> None:
+    """A console in the first site still costs exactly one device request.
+
+    Widening the scan is only worth it if the ordinary case does not pay for
+    it, so the loop must stop at the first site that yields a console.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="aa:bb:cc:dd:ee:ff",
+        title="UniFi - Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "initial_key",
+            CONF_CONSOLE_ID: "aa:bb:cc:dd:ee:ff",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    gateway = MagicMock(
+        type=None,
+        model="UniFi Dream Machine PRO SE",
+        mac="AA:BB:CC:DD:EE:FF",
+        name="Crestwood",
+    )
+    net_cm, net_client = _make_mock_client(
+        sites=[
+            MagicMock(id="site-a", name="A"),
+            MagicMock(id="site-b", name="B"),
+            MagicMock(id="site-c", name="C"),
+        ],
+        devices=[gateway],
+    )
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.1",
+                CONF_API_KEY: "initial_key",
+            },
+        )
+        await hass.async_block_till_done()
+
+    # Three sites configured, but the console is in the first one.
+    assert net_client.devices.get_all.await_count == 1
+
+
+async def test_flow_and_setup_agree_on_a_default_first_site(
+    hass: HomeAssistant,
+) -> None:
+    """Both paths skip the "default" site id and pick the same next one.
+
+    ``Site.id`` is synthesized from ``internalReference``, so a controller can
+    genuinely report "default" first. The flow used to fall back to the host
+    here while ``_first_site_id`` skipped ahead to the next site, which is the
+    disagreement this shares a rule to prevent.
+    """
+    # No stored identity: a stored one would rightly take precedence over a
+    # freshly derived site id, which would hide what the flow derived.
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=None,
+        title="UniFi - Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "https://192.168.1.1",
+            CONF_API_KEY: "initial_key",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    # No console among the devices, so identity falls back to a site id.
+    net_cm, _ = _make_mock_client(
+        sites=[
+            MagicMock(id="default", name="Default"),
+            MagicMock(id="site-b", name="B"),
+        ],
+        devices=[MagicMock(type=None, model="USW Pro Max 24", name="Switch")],
+    )
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.1",
+                CONF_API_KEY: "initial_key",
+            },
+        )
+        await hass.async_block_till_done()
+
+    # The flow picked the first non-default site, not the host...
+    assert entry.data[CONF_CONSOLE_ID] == "site-b"
+    # ...which is exactly what setup derives from the same site order.
+    coordinator = MagicMock()
+    coordinator.data = {"sites": {"default": {}, "site-b": {}}}
+    assert _first_site_id(coordinator) == "site-b"
+
+
 class TestConsoleDeviceDetection:
     """Identify the console among the Network devices.
 
@@ -995,7 +1203,10 @@ async def test_async_setup_entry_discovers_console_identity_from_nvr(
         coord_self.data = {
             "nvrs": {
                 "nvr_1": {
-                    "mac": "aa:bb:cc:dd:ee:11",
+                    # Deliberately unnormalised: setup must store this the
+                    # same way the config flow would, or the two identities
+                    # disagree and the console gains a second entry.
+                    "mac": "AA-BB-CC-DD-EE-11",
                     "name": "Home UDM",
                 }
             }
