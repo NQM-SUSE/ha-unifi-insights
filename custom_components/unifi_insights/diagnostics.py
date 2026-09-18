@@ -137,13 +137,26 @@ MAC_KEYS = frozenset(
 
 # A punctuated MAC anywhere in a string, whatever key it arrived under.
 _MAC_PATTERN = re.compile(r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b")
+# A whole value that is a MAC. Unlike the pattern above this also accepts the
+# unpunctuated form, which is only safe to assume when it is the entire value:
+# twelve hex characters in the middle of a sentence are not an address.
+_MAC_VALUE_PATTERN = re.compile(
+    r"[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{12}"
+)
 
 
 def _mac_placeholder(mac: str, seen: dict[str, str]) -> str:
     """Return a stable placeholder for a MAC address within one report."""
-    # Punctuation and case vary by endpoint; a value under a MAC key that is
-    # not hex at all still gets its own placeholder rather than sharing one.
-    normalized = re.sub(r"[^0-9a-f]", "", mac.lower()) or mac.lower()
+    # Punctuation and case vary by endpoint, so real addresses canonicalize to
+    # one key. Anything else keeps its own value as the key: stripping it down
+    # to its hex characters would make "not-a-mac" and "aac" collide, and the
+    # placeholders are only useful while distinct values stay distinct.
+    lowered = mac.lower()
+    normalized = (
+        re.sub(r"[:-]", "", lowered)
+        if _MAC_VALUE_PATTERN.fullmatch(lowered)
+        else f"raw:{lowered}"
+    )
     placeholder = seen.get(normalized)
     if placeholder is None:
         placeholder = f"**REDACTED-MAC-{len(seen) + 1}**"
@@ -161,7 +174,8 @@ def _anonymize_macs(
     `macAddress`, `bssid`, `apMac`, `swMac` and more, and a client record
     accepts unknown extra fields, so any future MAC field would be published
     the moment the controller starts sending it. Every MAC-shaped value is
-    therefore rewritten regardless of the key that carried it.
+    therefore rewritten regardless of the key that carried it, punctuated or
+    not, whether it appears as a value or as a mapping key.
 
     The same MAC always maps to the same placeholder, so a report still shows
     which access point or switch port a client sits behind, and devices keyed
@@ -180,7 +194,7 @@ def _anonymize_macs(
     if isinstance(value, str):
         if not value or value == REDACTED:
             return value
-        if is_mac_field:
+        if is_mac_field or _MAC_VALUE_PATTERN.fullmatch(value):
             return _mac_placeholder(value, seen)
         return _MAC_PATTERN.sub(
             lambda match: _mac_placeholder(match.group(), seen), value
@@ -189,7 +203,7 @@ def _anonymize_macs(
         return {
             (
                 _mac_placeholder(key, seen)
-                if isinstance(key, str) and _MAC_PATTERN.fullmatch(key)
+                if isinstance(key, str) and _MAC_VALUE_PATTERN.fullmatch(key)
                 else key
             ): _anonymize_macs(
                 item, seen, is_mac_field=isinstance(key, str) and key in MAC_KEYS

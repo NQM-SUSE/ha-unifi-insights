@@ -353,3 +353,75 @@ def test_redact_coordinator_data_tolerates_unexpected_shapes(data: Any) -> None:
     has not loaded yet, or when a section is missing or shaped unexpectedly.
     """
     assert _redact_coordinator_data(data) == data
+
+
+async def test_diagnostics_redacts_unpunctuated_macs_anywhere(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test an unpunctuated MAC is redacted under an unknown key or as a key.
+
+    The controller is not consistent about punctuation, and the key list only
+    knows the MAC fields that exist today. A bare twelve-hex value is an
+    address wherever it turns up, and it is the same address as its punctuated
+    form, so both have to reach the same placeholder.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["clients"] = {
+        "site-1": {
+            "client-1": {
+                "macAddress": "AA:BB:CC:44:55:60",
+                # A field no model declares, holding the unpunctuated form.
+                "wiredUplinkMacAddress": "aabbcc445560",
+            }
+        }
+    }
+    coordinator.data["devices"] = {
+        # Devices reported without an id are keyed by MAC, and nothing
+        # guarantees the controller punctuates it.
+        "site-1": {"aabbcc445560": {"name": "Hallway AP", "model": "U7-Pro"}}
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    client = diagnostics["data"]["clients"]["site-1"]["client-1"]
+    (device_key,) = diagnostics["data"]["devices"]["site-1"]
+
+    assert client["wiredUplinkMacAddress"].startswith("**REDACTED-MAC-")
+    assert device_key.startswith("**REDACTED-MAC-")
+    # One address, one placeholder, whichever way it was written.
+    assert client["wiredUplinkMacAddress"] == client["macAddress"] == device_key
+    assert "aabbcc445560" not in _strings(diagnostics)
+
+
+async def test_diagnostics_keeps_malformed_mac_values_distinct(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test two unparsable values under MAC keys do not share a placeholder.
+
+    The models accept any string for a MAC field. Canonicalizing by discarding
+    everything that is not a hex character would make `not-a-mac` and `aac`
+    the same value, which quietly rewrites the client-to-device relationships
+    the placeholders exist to preserve.
+    """
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["clients"] = {
+        "site-1": {
+            "client-1": {"macAddress": "not-a-mac", "apMac": "aac"},
+            "client-2": {"macAddress": "aac"},
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    clients = diagnostics["data"]["clients"]["site-1"]
+    first = clients["client-1"]
+    second = clients["client-2"]
+
+    assert first["macAddress"] != first["apMac"]
+    # The same unparsable value is still the same value.
+    assert first["apMac"] == second["macAddress"]
+    for value in (first["macAddress"], first["apMac"]):
+        assert value.startswith("**REDACTED-MAC-")
+    assert "not-a-mac" not in _strings(diagnostics)
