@@ -10,6 +10,7 @@ from homeassistant.components.update import (
     UpdateEntity,
     UpdateEntityFeature,
 )
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -36,20 +37,46 @@ async def async_setup_entry(
 ) -> None:
     """Set up update entities for UniFi Insights integration."""
     coordinator = entry.runtime_data.coordinator
-    entities: list[UnifiNetworkDeviceUpdate] = []
+    known_device_keys: set[tuple[str, str]] = set()
+    first_setup = True
 
-    # Add update entities for network devices
-    entities.extend(
-        UnifiNetworkDeviceUpdate(
-            coordinator=coordinator,
-            site_id=site_id,
-            device_id=device_id,
-        )
-        for site_id, devices in coordinator.data.get("devices", {}).items()
-        for device_id in devices
-    )
+    @callback
+    def async_discover_updates() -> None:
+        """Discover and add new update entities."""
+        nonlocal first_setup
+        if not coordinator.data or not isinstance(coordinator.data, dict):
+            return
 
-    async_add_entities(entities)
+        devices_by_site = coordinator.data.get("devices", {})
+        if not isinstance(devices_by_site, dict):
+            return
+
+        new_entities: list[UnifiNetworkDeviceUpdate] = []
+        for site_id, devices in devices_by_site.items():
+            if not isinstance(devices, dict):
+                continue
+            for device_id, device_data in devices.items():
+                if not isinstance(device_data, dict):
+                    continue
+                key = (site_id, device_id)
+                if key in known_device_keys:
+                    continue
+                known_device_keys.add(key)
+                new_entities.append(
+                    UnifiNetworkDeviceUpdate(
+                        coordinator=coordinator,
+                        site_id=site_id,
+                        device_id=device_id,
+                    )
+                )
+
+        if new_entities or first_setup:
+            _LOGGER.info("Adding %d UniFi update entities", len(new_entities))
+            async_add_entities(new_entities)
+        first_setup = False
+
+    async_discover_updates()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_updates))
 
 
 class UnifiNetworkDeviceUpdate(CoordinatorEntity[UnifiFacadeCoordinator], UpdateEntity):

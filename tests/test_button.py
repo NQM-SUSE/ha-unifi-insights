@@ -15,6 +15,7 @@ from custom_components.unifi_insights.button import (
     UnifiProtectPTZPatrolStopButton,
     async_setup_entry,
 )
+from custom_components.unifi_insights.const import CONF_CLIENT_CONTROL
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -689,6 +690,100 @@ class TestAsyncSetupEntry:
             added_entities.extend(new_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
+
+    async def test_setup_entry_dedupes_ptz_and_chime_buttons_on_rediscovery(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Re-running discovery with unchanged data skips already-known buttons."""
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        first_count = len(added_entities)
+        assert first_count > 0
+
+        ptz_start_before = len(
+            [e for e in added_entities if isinstance(e, UnifiProtectPTZPatrolStartButton)]
+        )
+        ptz_stop_before = len(
+            [e for e in added_entities if isinstance(e, UnifiProtectPTZPatrolStopButton)]
+        )
+        chime_before = len(
+            [e for e in added_entities if isinstance(e, UnifiProtectChimePlayButton)]
+        )
+
+        # Re-run discovery on unchanged data; nothing new should be added.
+        listener()
+
+        assert len(added_entities) == first_count
+        assert (
+            len([e for e in added_entities if isinstance(e, UnifiProtectPTZPatrolStartButton)])
+            == ptz_start_before
+        )
+        assert (
+            len([e for e in added_entities if isinstance(e, UnifiProtectPTZPatrolStopButton)])
+            == ptz_stop_before
+        )
+        assert (
+            len([e for e in added_entities if isinstance(e, UnifiProtectChimePlayButton)])
+            == chime_before
+        )
+
+    async def test_setup_entry_dedupes_client_reconnect_button_on_rediscovery(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Reconnect buttons are only created once per client across rediscovery."""
+        mock_config_entry.options = {CONF_CLIENT_CONTROL: True}
+        mock_coordinator.data["clients"]["site1"] = {
+            "client1": {
+                "id": "client1",
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "name": "Test Client",
+            }
+        }
+
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        reconnect_buttons = [
+            e for e in added_entities if isinstance(e, UnifiClientReconnectButton)
+        ]
+        assert len(reconnect_buttons) == 1
+
+        listener()
+
+        reconnect_buttons = [
+            e for e in added_entities if isinstance(e, UnifiClientReconnectButton)
+        ]
+        assert len(reconnect_buttons) == 1
+
+    async def test_setup_entry_clients_not_a_dict_is_skipped(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A non-dict top-level clients collection is skipped without raising."""
+        mock_config_entry.options = {CONF_CLIENT_CONTROL: True}
+        mock_coordinator.data["clients"] = "not-a-dict"
+
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        reconnect_buttons = [
+            e for e in added_entities if isinstance(e, UnifiClientReconnectButton)
+        ]
+        assert len(reconnect_buttons) == 0
 
 
 class TestClientReconnectButtonEdgeCases:

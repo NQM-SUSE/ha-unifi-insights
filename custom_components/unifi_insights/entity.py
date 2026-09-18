@@ -41,6 +41,24 @@ def get_field(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return default
 
 
+def device_has_feature(device_data: dict[str, Any], *features_to_match: str) -> bool:
+    """
+    Return True when a device advertises any of the requested features.
+
+    Controllers report `features` either as a list of names or as a mapping of
+    name to a truthy value (sometimes a nested detail object), depending on
+    firmware and endpoint, so both shapes are accepted.
+    """
+    features = device_data.get("features", [])
+    if isinstance(features, dict):
+        return any(
+            bool(features.get(feature_name)) for feature_name in features_to_match
+        )
+    if isinstance(features, list):
+        return any(feature_name in features for feature_name in features_to_match)
+    return False
+
+
 def is_device_online(data: dict[str, Any]) -> bool:
     """
     Check if device is online, handling different status field formats.
@@ -188,7 +206,7 @@ class UnifiInsightsEntity(CoordinatorEntity[UnifiFacadeCoordinator]):
             device_info["hw_version"] = " | ".join(hw_info)
 
         # Set suggested area based on device type
-        model = device_data.get("model", "").lower()
+        model = get_field(device_data, "model", default="").lower()
         if any(
             model.startswith(prefix)
             for prefix in ("usw", "switch", "uap", "ap", "udm", "usg")

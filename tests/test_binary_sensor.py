@@ -1020,6 +1020,45 @@ class TestUnifiPortBinarySensor:
         # 2 SFP ports (25 and 26) → 2 binary sensors
         assert len(sfp_sensors) == 2
 
+    async def test_setup_skips_malformed_ports_and_dedupes(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """Malformed/non-SFP/duplicate ports are skipped; only valid ones are added."""
+        mock_coordinator.data["devices"]["site1"]["device1"]["ports"] = [
+            "not-a-dict",  # skipped: not a dict
+            {"idx": 30, "media": 123},  # skipped: media not a string
+            {"idx": 31, "media": "Copper"},  # skipped: media doesn't start with SFP
+            {"media": "SFP+"},  # skipped: no idx/port_idx
+            {"idx": 25, "media": "SFP+", "name": "SFP+ 1"},  # added
+            {"idx": 25, "media": "SFP+", "name": "SFP+ 1 dup"},  # skipped: dup key
+        ]
+        mock_coordinator.data["devices"]["site2"] = {
+            "device2": {
+                "id": "device2",
+                "name": "Non-list Ports Device",
+                "model": "USW-Lite-8-PoE",
+                "state": "ONLINE",
+                "ports": "not-a-list",
+            },
+        }
+
+        config_entry = MagicMock()
+        config_entry.runtime_data = MagicMock()
+        config_entry.runtime_data.coordinator = mock_coordinator
+
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, config_entry, add_entities)
+
+        sfp_sensors = [
+            e for e in added_entities if isinstance(e, UnifiPortBinarySensor)
+        ]
+        assert len(sfp_sensors) == 1
+        assert sfp_sensors[0].unique_id == "device1_port_sfp_present_25"
+
 
 class TestProtectBinarySensorCapabilityFiltering:
     """Tests for capability-based filtering of Protect binary sensor entities."""

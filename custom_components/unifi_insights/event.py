@@ -57,46 +57,83 @@ async def async_setup_entry(
     if not coordinator.protect_client:
         return
 
-    entities: list[
-        UnifiProtectDoorbellEventEntity
-        | UnifiProtectSmartDetectEventEntity
-        | UnifiProtectSensorEventEntity
-    ] = []
+    known_event_keys: set[tuple[str, str]] = set()
+    first_setup = True
 
-    # Get cameras data
-    cameras = coordinator.data["protect"].get("cameras", {})
+    @callback
+    def async_discover_events() -> None:
+        """Discover and add new event entities."""
+        nonlocal first_setup
+        if (
+            not coordinator.data
+            or not isinstance(coordinator.data, dict)
+            or "protect" not in coordinator.data
+            or not isinstance(coordinator.data["protect"], dict)
+        ):
+            return
 
-    # Add doorbell event entities for cameras with doorbell feature
-    for camera_id, camera_data in cameras.items():
-        # Check if doorbell camera
-        if _is_doorbell_camera(camera_data):
-            entities.append(
-                UnifiProtectDoorbellEventEntity(
-                    coordinator=coordinator,
-                    device_id=camera_id,
-                )
-            )
+        protect = coordinator.data["protect"]
+        entities: list[
+            UnifiProtectDoorbellEventEntity
+            | UnifiProtectSmartDetectEventEntity
+            | UnifiProtectSensorEventEntity
+        ] = []
 
-        # Add smart detection event entity for all cameras
-        smart_detect_types = camera_data.get("smartDetectTypes", [])
-        if smart_detect_types:
-            entities.append(
-                UnifiProtectSmartDetectEventEntity(
-                    coordinator=coordinator,
-                    device_id=camera_id,
-                )
-            )
+        # Get cameras data
+        cameras = protect.get("cameras", {})
+        if isinstance(cameras, dict):
+            for camera_id, camera_data in cameras.items():
+                if not isinstance(camera_data, dict):
+                    continue
 
-    # Add sensor open/close event entities
-    entities.extend(
-        UnifiProtectSensorEventEntity(
-            coordinator=coordinator,
-            device_id=sensor_id,
-        )
-        for sensor_id in coordinator.data["protect"].get("sensors", {})
-    )
+                # Add doorbell event entities for cameras with doorbell feature
+                if _is_doorbell_camera(camera_data):
+                    doorbell_key = (camera_id, "doorbell")
+                    if doorbell_key not in known_event_keys:
+                        known_event_keys.add(doorbell_key)
+                        entities.append(
+                            UnifiProtectDoorbellEventEntity(
+                                coordinator=coordinator,
+                                device_id=camera_id,
+                            )
+                        )
 
-    async_add_entities(entities)
+                # Add smart detection event entity for all cameras
+                smart_detect_types = camera_data.get("smartDetectTypes", [])
+                if smart_detect_types:
+                    smart_key = (camera_id, "smart_detect")
+                    if smart_key not in known_event_keys:
+                        known_event_keys.add(smart_key)
+                        entities.append(
+                            UnifiProtectSmartDetectEventEntity(
+                                coordinator=coordinator,
+                                device_id=camera_id,
+                            )
+                        )
+
+        # Add sensor open/close event entities
+        sensors = protect.get("sensors", {})
+        if isinstance(sensors, dict):
+            for sensor_id, sensor_data in sensors.items():
+                if not isinstance(sensor_data, dict):
+                    continue
+                sensor_key = (sensor_id, "sensor")
+                if sensor_key not in known_event_keys:
+                    known_event_keys.add(sensor_key)
+                    entities.append(
+                        UnifiProtectSensorEventEntity(
+                            coordinator=coordinator,
+                            device_id=sensor_id,
+                        )
+                    )
+
+        if entities or first_setup:
+            _LOGGER.info("Adding %d UniFi Protect event entities", len(entities))
+            async_add_entities(entities)
+        first_setup = False
+
+    async_discover_events()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_events))
 
 
 def _is_doorbell_camera(camera_data: dict[str, Any]) -> bool:

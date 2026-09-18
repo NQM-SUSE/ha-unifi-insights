@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.core import callback
 
 from .const import (
     ATTR_CAMERA_ID,
@@ -46,20 +47,46 @@ async def async_setup_entry(
         _LOGGER.debug("Skipping camera setup - Protect API not available")
         return
 
-    entities = []
+    known_camera_ids: set[str] = set()
 
-    # Add cameras
-    for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-        _LOGGER.debug("Adding camera entity for %s", camera_data.get("name", camera_id))
-        entities.append(
-            UnifiProtectCamera(
-                coordinator=coordinator,
-                camera_id=camera_id,
+    @callback
+    def async_discover_cameras() -> None:
+        """Discover and add new cameras."""
+        if (
+            not coordinator.data
+            or not isinstance(coordinator.data, dict)
+            or "protect" not in coordinator.data
+            or not isinstance(coordinator.data["protect"], dict)
+        ):
+            return
+
+        cameras = coordinator.data["protect"].get("cameras", {})
+        if not isinstance(cameras, dict):
+            return
+
+        new_entities: list[Camera] = []
+        for camera_id, camera_data in cameras.items():
+            if not isinstance(camera_data, dict):
+                continue
+            if camera_id in known_camera_ids:
+                continue
+            _LOGGER.debug(
+                "Adding camera entity for %s", camera_data.get("name", camera_id)
             )
-        )
+            known_camera_ids.add(camera_id)
+            new_entities.append(
+                UnifiProtectCamera(
+                    coordinator=coordinator,
+                    camera_id=camera_id,
+                )
+            )
 
-    _LOGGER.info("Adding %d UniFi Protect cameras", len(entities))
-    async_add_entities(entities)
+        if new_entities:
+            _LOGGER.info("Adding %d UniFi Protect cameras", len(new_entities))
+            async_add_entities(new_entities)
+
+    async_discover_cameras()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_cameras))
 
 
 class UnifiProtectCamera(UnifiProtectEntity, Camera):

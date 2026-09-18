@@ -6,12 +6,12 @@ import io
 import logging
 from typing import TYPE_CHECKING, Any
 
+import segno
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
-import segno
 
 from .const import DOMAIN, MANUFACTURER
 from .coordinators import UnifiFacadeCoordinator
@@ -35,27 +35,54 @@ async def async_setup_entry(
 ) -> None:
     """Set up WiFi QR code images for UniFi Insights."""
     coordinator = entry.runtime_data.coordinator
+    known_wifi_keys: set[tuple[str, str]] = set()
 
-    entities: list[UnifiWifiQrCodeImage] = []
-    for site_id, wifi_networks in coordinator.data.get("wifi", {}).items():
-        for wifi_id, wifi_data in wifi_networks.items():
-            # Only networks for which we resolved a connect string (i.e. the
-            # passphrase was available from the classic API) get a QR code.
-            if not wifi_data.get("qr_code"):
+    @callback
+    def async_discover_images() -> None:
+        """Discover and add new WiFi QR code image entities."""
+        if not coordinator.data or not isinstance(coordinator.data, dict):
+            return
+
+        wifi_by_site = coordinator.data.get("wifi", {})
+        if not isinstance(wifi_by_site, dict):
+            return
+
+        new_entities: list[UnifiWifiQrCodeImage] = []
+        for site_id, wifi_networks in wifi_by_site.items():
+            if not isinstance(wifi_networks, dict):
                 continue
-            wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
-            _LOGGER.debug("Creating WiFi QR code image for %s (%s)", wifi_name, wifi_id)
-            entities.append(
-                UnifiWifiQrCodeImage(
-                    hass=hass,
-                    coordinator=coordinator,
-                    site_id=site_id,
-                    wifi_id=wifi_id,
+            for wifi_id, wifi_data in wifi_networks.items():
+                if not isinstance(wifi_data, dict):
+                    continue
+                # Only networks for which we resolved a connect string (i.e. the
+                # passphrase was available from the classic API) get a QR code.
+                if not wifi_data.get("qr_code"):
+                    continue
+                key = (site_id, wifi_id)
+                if key in known_wifi_keys:
+                    continue
+                known_wifi_keys.add(key)
+                wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
+                _LOGGER.debug(
+                    "Creating WiFi QR code image for %s (%s)", wifi_name, wifi_id
                 )
-            )
+                new_entities.append(
+                    UnifiWifiQrCodeImage(
+                        hass=hass,
+                        coordinator=coordinator,
+                        site_id=site_id,
+                        wifi_id=wifi_id,
+                    )
+                )
 
-    if entities:
-        async_add_entities(entities)
+        if new_entities:
+            _LOGGER.info(
+                "Adding %d UniFi WiFi QR code image entities", len(new_entities)
+            )
+            async_add_entities(new_entities)
+
+    async_discover_images()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_images))
 
 
 class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity):

@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
@@ -29,6 +30,7 @@ from .const import (
 from .entity import (
     UnifiProtectEntity,
     async_call_coordinator_action,
+    device_has_feature as _device_has_feature,
     get_field,
     is_device_online,
 )
@@ -44,18 +46,6 @@ _LOGGER = logging.getLogger(__name__)
 
 # Switch entities are action-based, allow parallel execution
 PARALLEL_UPDATES = 1
-
-
-def _device_has_feature(device_data: dict[str, Any], *features_to_match: str) -> bool:
-    """Return True when a device advertises any of the requested features."""
-    features = device_data.get("features", [])
-    if isinstance(features, dict):
-        return any(
-            bool(features.get(feature_name)) for feature_name in features_to_match
-        )
-    if isinstance(features, list):
-        return any(feature_name in features for feature_name in features_to_match)
-    return False
 
 
 def _get_firewall_rule_action(rule_data: dict[str, Any]) -> str | None:
@@ -119,7 +109,6 @@ async def async_setup_entry(
     """Set up switches for UniFi integration."""
     coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
     client_control = entry.options.get(CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL)
-    entities: list[SwitchEntity] = []
 
     # Remove orphaned client block switches when client control is disabled.
     # This mirrors the device_tracker cleanup pattern so toggling the option
@@ -138,214 +127,249 @@ async def async_setup_entry(
                 )
                 registry.async_remove(reg_entry.entity_id)
 
-    # Add Protect switches if available
-    if coordinator.protect_client:
-        # Add camera switches (microphone, privacy mode, status light, high FPS)
-        for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-            camera_name = camera_data.get("name", camera_id)
-            _LOGGER.debug(
-                "Adding camera switches for camera %s",
-                camera_name,
-            )
-            # Microphone switch
-            entities.append(
-                UnifiProtectMicrophoneSwitch(
-                    coordinator=coordinator,
-                    camera_id=camera_id,
-                )
-            )
-            # Privacy mode switch
-            entities.append(
-                UnifiProtectPrivacySwitch(
-                    coordinator=coordinator,
-                    camera_id=camera_id,
-                )
-            )
-            # Status light switch
-            entities.append(
-                UnifiProtectStatusLightSwitch(
-                    coordinator=coordinator,
-                    camera_id=camera_id,
-                )
-            )
-            # High FPS mode switch (only for cameras that support it).
-            # Protect ≤6.x used the boolean flag hasHighFpsCapability; v7.1+
-            # removed it in favour of listing "highFps" in featureFlags.videoModes.
-            feature_flags = camera_data.get("featureFlags", {})
-            if isinstance(feature_flags, dict) and (
-                feature_flags.get("hasHighFpsCapability", False)
-                or "highFps" in feature_flags.get("videoModes", [])
-            ):
-                entities.append(
-                    UnifiProtectHighFPSSwitch(
-                        coordinator=coordinator,
-                        camera_id=camera_id,
-                    )
-                )
+    known_switch_keys: set[tuple[Any, ...]] = set()
+    first_setup = True
 
-    # Add client block/allow switches for each connected client (when enabled)
-    if client_control:
-        for site_id, clients in coordinator.data.get("clients", {}).items():
-            for client_id, client_data in clients.items():
-                client_name = (
-                    client_data.get("name")
-                    or client_data.get("hostname")
-                    or client_data.get("mac", client_id)
-                )
-                _LOGGER.debug(
-                    "Adding block/allow switch for client %s",
-                    client_name,
-                )
-                entities.append(
-                    UnifiClientBlockSwitch(
-                        coordinator=coordinator,
-                        site_id=site_id,
-                        client_id=client_id,
-                    )
-                )
+    @callback
+    def async_discover_switches() -> None:
+        nonlocal first_setup
+        """Discover and add new switches."""
+        if not coordinator.data or not isinstance(coordinator.data, dict):
+            return
 
-    # Add WiFi network enable/disable switches
-    for site_id, wifi_networks in coordinator.data.get("wifi", {}).items():
-        for wifi_id, wifi_data in wifi_networks.items():
-            wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
-            _LOGGER.debug(
-                "Adding enable/disable switch for WiFi network %s",
-                wifi_name,
-            )
-            entities.append(
-                UnifiWifiSwitch(
-                    coordinator=coordinator,
-                    site_id=site_id,
-                    wifi_id=wifi_id,
-                    wifi_data=wifi_data,
-                )
-            )
+        current_client_control = entry.options.get(
+            CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
+        )
+        entities: list[SwitchEntity] = []
 
-    # Add firewall policy enable/disable switches for user-defined rules.
-    # System-defined rules (auto-generated by UniFi features like port forwarding
-    # or mDNS) cannot be toggled via the Integration API and are excluded.
-    skipped_system_rules = 0
-    for site_id, firewall_rules in coordinator.data.get("firewall_rules", {}).items():
-        for rule_id, rule_data in firewall_rules.items():
-            if not isinstance(rule_data, dict):
-                continue
+        # Add Protect switches if available
+        if coordinator.protect_client:
+            protect = coordinator.data.get("protect", {})
+            if isinstance(protect, dict):
+                cameras = protect.get("cameras", {})
+                if isinstance(cameras, dict):
+                    for camera_id, camera_data in cameras.items():
+                        if not isinstance(camera_data, dict):
+                            continue
+                        # Microphone switch
+                        mic_key = (camera_id, "mic")
+                        if mic_key not in known_switch_keys:
+                            known_switch_keys.add(mic_key)
+                            entities.append(
+                                UnifiProtectMicrophoneSwitch(
+                                    coordinator=coordinator,
+                                    camera_id=camera_id,
+                                )
+                            )
+                        # Privacy mode switch
+                        privacy_key = (camera_id, "privacy")
+                        if privacy_key not in known_switch_keys:
+                            known_switch_keys.add(privacy_key)
+                            entities.append(
+                                UnifiProtectPrivacySwitch(
+                                    coordinator=coordinator,
+                                    camera_id=camera_id,
+                                )
+                            )
+                        # Status light switch
+                        status_light_key = (camera_id, "status_light")
+                        if status_light_key not in known_switch_keys:
+                            known_switch_keys.add(status_light_key)
+                            entities.append(
+                                UnifiProtectStatusLightSwitch(
+                                    coordinator=coordinator,
+                                    camera_id=camera_id,
+                                )
+                            )
+                        # High FPS mode switch (only for cameras that support it).
+                        high_fps_key = (camera_id, "high_fps")
+                        if high_fps_key not in known_switch_keys:
+                            feature_flags = camera_data.get("featureFlags", {})
+                            if isinstance(feature_flags, dict) and (
+                                feature_flags.get("hasHighFpsCapability", False)
+                                or "highFps" in feature_flags.get("videoModes", [])
+                            ):
+                                known_switch_keys.add(high_fps_key)
+                                entities.append(
+                                    UnifiProtectHighFPSSwitch(
+                                        coordinator=coordinator,
+                                        camera_id=camera_id,
+                                    )
+                                )
 
-            if _is_predefined_firewall_rule(rule_data):
-                skipped_system_rules += 1
-                _LOGGER.debug(
-                    "Skipping system-defined firewall rule %s (%s) in site %s",
-                    rule_data.get("name", rule_id),
-                    rule_id,
-                    site_id,
-                )
-                continue
+        # Add client block/allow switches for each connected client (when enabled)
+        if current_client_control:
+            clients_by_site = coordinator.data.get("clients", {})
+            if isinstance(clients_by_site, dict):
+                for site_id, clients in clients_by_site.items():
+                    if not isinstance(clients, dict):
+                        continue
+                    for client_id, client_data in clients.items():
+                        if not isinstance(client_data, dict):
+                            continue
+                        key = (site_id, client_id, "block_switch")
+                        if key in known_switch_keys:
+                            continue
+                        known_switch_keys.add(key)
+                        entities.append(
+                            UnifiClientBlockSwitch(
+                                coordinator=coordinator,
+                                site_id=site_id,
+                                client_id=client_id,
+                            )
+                        )
 
-            rule_name = rule_data.get("name", rule_id)
-            _LOGGER.debug(
-                "Adding enable/disable switch for firewall rule %s",
-                rule_name,
-            )
-            entities.append(
-                UnifiFirewallRuleSwitch(
-                    coordinator=coordinator,
-                    site_id=site_id,
-                    rule_id=rule_id,
-                )
-            )
-
-    # Add PDU outlet relay and power cycle switches
-    for site_id, devices in coordinator.data.get("devices", {}).items():
-        if not isinstance(devices, dict):
-            continue
-        for device_id, device_data in devices.items():
-            if not isinstance(device_data, dict):
-                continue
-            outlet_table = device_data.get("outlet_table", [])
-            if not isinstance(outlet_table, list):
-                continue
-            for outlet in outlet_table:
-                if not isinstance(outlet, dict):
+        # Add WiFi network enable/disable switches
+        wifi_by_site = coordinator.data.get("wifi", {})
+        if isinstance(wifi_by_site, dict):
+            for site_id, wifi_networks in wifi_by_site.items():
+                if not isinstance(wifi_networks, dict):
                     continue
-                idx = outlet.get("index")
-                if idx is None:
-                    idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
-                if idx is None:
-                    continue
-                try:
-                    outlet_idx = int(idx)
-                except TypeError, ValueError:
-                    continue
-
-                entities.append(
-                    UnifiOutletSwitch(
-                        coordinator=coordinator,
-                        site_id=site_id,
-                        device_id=device_id,
-                        outlet_index=outlet_idx,
-                        outlet_data=outlet,
-                    )
-                )
-
-                if outlet.get("cycle_enabled") is not None:
+                for wifi_id, wifi_data in wifi_networks.items():
+                    if not isinstance(wifi_data, dict):
+                        continue
+                    key = (site_id, wifi_id, "wifi_switch")
+                    if key in known_switch_keys:
+                        continue
+                    known_switch_keys.add(key)
                     entities.append(
-                        UnifiOutletCycleSwitch(
+                        UnifiWifiSwitch(
                             coordinator=coordinator,
                             site_id=site_id,
-                            device_id=device_id,
-                            outlet_index=outlet_idx,
-                            outlet_data=outlet,
+                            wifi_id=wifi_id,
+                            wifi_data=wifi_data,
                         )
                     )
 
-    if skipped_system_rules:
-        _LOGGER.info(
-            "Skipped %d system-defined firewall rules (not modifiable via API); "
-            "only user-created policies are exposed as switches",
-            skipped_system_rules,
-        )
+        # Add firewall policy enable/disable switches for user-defined rules.
+        firewall_rules_by_site = coordinator.data.get("firewall_rules", {})
+        if isinstance(firewall_rules_by_site, dict):
+            for site_id, firewall_rules in firewall_rules_by_site.items():
+                if not isinstance(firewall_rules, dict):
+                    continue
+                for rule_id, rule_data in firewall_rules.items():
+                    if not isinstance(rule_data, dict):
+                        continue
+                    if _is_predefined_firewall_rule(rule_data):
+                        continue
+                    key = (site_id, rule_id, "firewall_rule")
+                    if key in known_switch_keys:
+                        continue
+                    known_switch_keys.add(key)
+                    entities.append(
+                        UnifiFirewallRuleSwitch(
+                            coordinator=coordinator,
+                            site_id=site_id,
+                            rule_id=rule_id,
+                        )
+                    )
 
-    # Add policy-based route enable/disable switches
-    for site_id, routes in coordinator.data.get("policy_based_routes", {}).items():
-        for route_id, route_data in routes.items():
-            if not isinstance(route_data, dict):
-                continue
+        # Add PDU outlet relay and power cycle switches
+        devices_by_site = coordinator.data.get("devices", {})
+        if isinstance(devices_by_site, dict):
+            for site_id, devices in devices_by_site.items():
+                if not isinstance(devices, dict):
+                    continue
+                for device_id, device_data in devices.items():
+                    if not isinstance(device_data, dict):
+                        continue
+                    outlet_table = device_data.get("outlet_table", [])
+                    if not isinstance(outlet_table, list):
+                        continue
+                    for outlet in outlet_table:
+                        if not isinstance(outlet, dict):
+                            continue
+                        idx = outlet.get("index")
+                        if idx is None:
+                            idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
+                        if idx is None:
+                            continue
+                        try:
+                            outlet_idx = int(idx)
+                        except (TypeError, ValueError):
+                            continue
 
-            route_name = (
-                route_data.get("description") or route_data.get("name") or route_id
-            )
-            _LOGGER.debug(
-                "Adding enable/disable switch for policy-based route %s",
-                route_name,
-            )
-            entities.append(
-                UnifiInsightsPolicyBasedRouteSwitch(
-                    coordinator=coordinator,
-                    site_id=site_id,
-                    route_id=route_id,
-                )
-            )
+                        switch_key = (site_id, device_id, outlet_idx, "outlet_switch")
+                        if switch_key not in known_switch_keys:
+                            known_switch_keys.add(switch_key)
+                            entities.append(
+                                UnifiOutletSwitch(
+                                    coordinator=coordinator,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                    outlet_index=outlet_idx,
+                                    outlet_data=outlet,
+                                )
+                            )
 
-    # Add VPN client enable/disable switches
-    for site_id, vpn_clients in coordinator.data.get("vpn_clients", {}).items():
-        for client_id, vpn_client_data in vpn_clients.items():
-            if not isinstance(vpn_client_data, dict):
-                continue
+                        if outlet.get("cycle_enabled") is not None:
+                            cycle_key = (
+                                site_id,
+                                device_id,
+                                outlet_idx,
+                                "outlet_cycle_switch",
+                            )
+                            if cycle_key not in known_switch_keys:
+                                known_switch_keys.add(cycle_key)
+                                entities.append(
+                                    UnifiOutletCycleSwitch(
+                                        coordinator=coordinator,
+                                        site_id=site_id,
+                                        device_id=device_id,
+                                        outlet_index=outlet_idx,
+                                        outlet_data=outlet,
+                                    )
+                                )
 
-            client_name = vpn_client_data.get("name") or client_id
-            _LOGGER.debug(
-                "Adding enable/disable switch for VPN client %s",
-                client_name,
-            )
-            entities.append(
-                UnifiInsightsVpnClientSwitch(
-                    coordinator=coordinator,
-                    site_id=site_id,
-                    client_id=client_id,
-                )
-            )
+        # Add policy-based route enable/disable switches
+        routes_by_site = coordinator.data.get("policy_based_routes", {})
+        if isinstance(routes_by_site, dict):
+            for site_id, routes in routes_by_site.items():
+                if not isinstance(routes, dict):
+                    continue
+                for route_id, route_data in routes.items():
+                    if not isinstance(route_data, dict):
+                        continue
+                    key = (site_id, route_id, "pbr_switch")
+                    if key in known_switch_keys:
+                        continue
+                    known_switch_keys.add(key)
+                    entities.append(
+                        UnifiInsightsPolicyBasedRouteSwitch(
+                            coordinator=coordinator,
+                            site_id=site_id,
+                            route_id=route_id,
+                        )
+                    )
 
-    _LOGGER.info("Adding %d UniFi switches", len(entities))
-    async_add_entities(entities)
+        # Add VPN client enable/disable switches
+        vpn_clients_by_site = coordinator.data.get("vpn_clients", {})
+        if isinstance(vpn_clients_by_site, dict):
+            for site_id, vpn_clients in vpn_clients_by_site.items():
+                if not isinstance(vpn_clients, dict):
+                    continue
+                for client_id, vpn_client_data in vpn_clients.items():
+                    if not isinstance(vpn_client_data, dict):
+                        continue
+                    key = (site_id, client_id, "vpn_switch")
+                    if key in known_switch_keys:
+                        continue
+                    known_switch_keys.add(key)
+                    entities.append(
+                        UnifiInsightsVpnClientSwitch(
+                            coordinator=coordinator,
+                            site_id=site_id,
+                            client_id=client_id,
+                        )
+                    )
+
+        if entities or first_setup:
+            _LOGGER.info("Adding %d UniFi switches", len(entities))
+            async_add_entities(entities)
+        first_setup = False
+
+    async_discover_switches()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_switches))
 
 
 class UnifiFirewallRuleSwitch(
@@ -1429,7 +1453,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except TypeError, ValueError:
+                except (TypeError, ValueError):
                     continue
         return None
 
@@ -1460,7 +1484,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                                 if cycle_enabled is not None:
                                     outlet["cycle_enabled"] = cycle_enabled
                                 break
-                        except TypeError, ValueError:
+                        except (TypeError, ValueError):
                             continue
 
     @property
@@ -1639,7 +1663,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except TypeError, ValueError:
+                except (TypeError, ValueError):
                     continue
         return None
 
@@ -1666,7 +1690,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                             if int(idx) == self._outlet_index:
                                 outlet["cycle_enabled"] = cycle_enabled
                                 break
-                        except TypeError, ValueError:
+                        except (TypeError, ValueError):
                             continue
 
     @property

@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING, ClassVar
 
 from homeassistant.components.select import SelectEntity
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 
@@ -70,70 +71,118 @@ async def async_setup_entry(
         _LOGGER.debug("Skipping select setup - Protect API not available")
         return
 
-    entities: list[SelectEntity] = []
+    known_select_keys: set[tuple[str, str]] = set()
 
-    # Add camera HDR mode selects
-    for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-        _LOGGER.debug(
-            "Adding HDR mode select for camera %s", camera_data.get("name", camera_id)
-        )
-        entities.append(
-            UnifiProtectHDRModeSelect(
-                coordinator=coordinator,
-                camera_id=camera_id,
-            )
-        )
+    @callback
+    def async_discover_selects() -> None:
+        """Discover and add new select entities."""
+        if (
+            not coordinator.data
+            or not isinstance(coordinator.data, dict)
+            or "protect" not in coordinator.data
+            or not isinstance(coordinator.data["protect"], dict)
+        ):
+            return
 
-        _LOGGER.debug(
-            "Adding video mode select for camera %s", camera_data.get("name", camera_id)
-        )
-        entities.append(
-            UnifiProtectVideoModeSelect(
-                coordinator=coordinator,
-                camera_id=camera_id,
-            )
-        )
+        protect = coordinator.data["protect"]
+        entities: list[SelectEntity] = []
 
-    # Add chime ringtone selects
-    for chime_id, chime_data in coordinator.data["protect"]["chimes"].items():
-        _LOGGER.debug(
-            "Adding ringtone select for chime %s", chime_data.get("name", chime_id)
-        )
-        entities.append(
-            UnifiProtectChimeRingtoneSelect(
-                coordinator=coordinator,
-                chime_id=chime_id,
-            )
-        )
+        # Add camera HDR and video mode selects
+        cameras = protect.get("cameras", {})
+        if isinstance(cameras, dict):
+            for camera_id, camera_data in cameras.items():
+                if not isinstance(camera_data, dict):
+                    continue
+                hdr_key = (camera_id, "hdr_mode")
+                if hdr_key not in known_select_keys:
+                    known_select_keys.add(hdr_key)
+                    _LOGGER.debug(
+                        "Adding HDR mode select for camera %s",
+                        camera_data.get("name", camera_id),
+                    )
+                    entities.append(
+                        UnifiProtectHDRModeSelect(
+                            coordinator=coordinator,
+                            camera_id=camera_id,
+                        )
+                    )
 
-    # Add PTZ preset selects for cameras with PTZ support
-    for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-        if camera_supports_ptz(camera_data):
-            _LOGGER.debug(
-                "Adding PTZ preset select for camera %s",
-                camera_data.get("name", camera_id),
-            )
-            entities.append(
-                UnifiProtectPTZPresetSelect(
-                    coordinator=coordinator,
-                    camera_id=camera_id,
-                )
-            )
+                video_key = (camera_id, "video_mode")
+                if video_key not in known_select_keys:
+                    known_select_keys.add(video_key)
+                    _LOGGER.debug(
+                        "Adding video mode select for camera %s",
+                        camera_data.get("name", camera_id),
+                    )
+                    entities.append(
+                        UnifiProtectVideoModeSelect(
+                            coordinator=coordinator,
+                            camera_id=camera_id,
+                        )
+                    )
 
-    # Add liveview selects for viewers
-    for viewer_id, viewer_data in coordinator.data["protect"]["viewers"].items():
-        _LOGGER.debug(
-            "Adding liveview select for viewer %s", viewer_data.get("name", viewer_id)
-        )
-        entities.append(
-            UnifiProtectViewerLiveviewSelect(
-                coordinator=coordinator,
-                viewer_id=viewer_id,
-            )
-        )
+                # Add PTZ preset selects for cameras with PTZ support
+                if camera_supports_ptz(camera_data):
+                    ptz_key = (camera_id, "ptz_preset")
+                    if ptz_key not in known_select_keys:
+                        known_select_keys.add(ptz_key)
+                        _LOGGER.debug(
+                            "Adding PTZ preset select for camera %s",
+                            camera_data.get("name", camera_id),
+                        )
+                        entities.append(
+                            UnifiProtectPTZPresetSelect(
+                                coordinator=coordinator,
+                                camera_id=camera_id,
+                            )
+                        )
 
-    _LOGGER.info("Adding %d UniFi Protect select entities", len(entities))
-    async_add_entities(entities)
+        # Add chime ringtone selects
+        chimes = protect.get("chimes", {})
+        if isinstance(chimes, dict):
+            for chime_id, chime_data in chimes.items():
+                if not isinstance(chime_data, dict):
+                    continue
+                ring_key = (chime_id, "ringtone")
+                if ring_key not in known_select_keys:
+                    known_select_keys.add(ring_key)
+                    _LOGGER.debug(
+                        "Adding ringtone select for chime %s",
+                        chime_data.get("name", chime_id),
+                    )
+                    entities.append(
+                        UnifiProtectChimeRingtoneSelect(
+                            coordinator=coordinator,
+                            chime_id=chime_id,
+                        )
+                    )
+
+        # Add liveview selects for viewers
+        viewers = protect.get("viewers", {})
+        if isinstance(viewers, dict):
+            for viewer_id, viewer_data in viewers.items():
+                if not isinstance(viewer_data, dict):
+                    continue
+                lv_key = (viewer_id, "liveview")
+                if lv_key not in known_select_keys:
+                    known_select_keys.add(lv_key)
+                    _LOGGER.debug(
+                        "Adding liveview select for viewer %s",
+                        viewer_data.get("name", viewer_id),
+                    )
+                    entities.append(
+                        UnifiProtectViewerLiveviewSelect(
+                            coordinator=coordinator,
+                            viewer_id=viewer_id,
+                        )
+                    )
+
+        if entities:
+            _LOGGER.info("Adding %d UniFi Protect select entities", len(entities))
+            async_add_entities(entities)
+
+    async_discover_selects()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_selects))
 
 
 class UnifiProtectHDRModeSelect(UnifiProtectEntity, SelectEntity):
@@ -409,7 +458,7 @@ class UnifiProtectViewerLiveviewSelect(UnifiProtectEntity, SelectEntity):
         viewer_data = self.coordinator.data["protect"]["viewers"].get(
             self._device_id, {}
         )
-        liveviews = self.coordinator.data["protect"]["liveviews"]
+        liveviews = self.coordinator.data["protect"].get("liveviews", {})
 
         # Set options from available liveviews
         self._attr_options = [lv.get("name", lv_id) for lv_id, lv in liveviews.items()]
@@ -432,7 +481,7 @@ class UnifiProtectViewerLiveviewSelect(UnifiProtectEntity, SelectEntity):
         """Change the selected option."""
         _LOGGER.debug("Setting liveview to %s for viewer %s", option, self._device_id)
 
-        liveviews = self.coordinator.data["protect"]["liveviews"]
+        liveviews = self.coordinator.data["protect"].get("liveviews", {})
         liveview_id = None
         for lv_id, lv in liveviews.items():
             if lv.get("name") == option:

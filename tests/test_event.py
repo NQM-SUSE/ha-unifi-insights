@@ -215,6 +215,38 @@ class TestAsyncSetupEntry:
         assert len(entities) == 1
         assert isinstance(entities[0], UnifiProtectSensorEventEntity)
 
+    @pytest.mark.asyncio
+    async def test_setup_entry_rediscovery_dedupes_doorbell_and_smart_detect(
+        self, hass, mock_coordinator
+    ) -> None:
+        """Re-running discovery on the same doorbell camera adds no duplicates."""
+        mock_coordinator.data["protect"]["cameras"] = {
+            "camera1": {
+                "id": "camera1",
+                "name": "Front Doorbell",
+                "state": "CONNECTED",
+                "type": "G4-Doorbell",
+                "smartDetectTypes": ["person"],
+            }
+        }
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        assert async_add_entities.call_count == 1
+        assert len(async_add_entities.call_args[0][0]) == 2
+
+        # Re-running discovery with the same camera data must not add anything.
+        listener()
+
+        assert async_add_entities.call_count == 1
+
 
 class TestUnifiProtectDoorbellEventEntity:
     """Tests for UnifiProtectDoorbellEventEntity."""

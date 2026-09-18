@@ -1,0 +1,729 @@
+"""Tests for dynamic entity discovery across UniFi Insights platforms."""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from custom_components.unifi_insights.binary_sensor import (
+    async_setup_entry as async_setup_binary_sensor,
+)
+from custom_components.unifi_insights.button import (
+    async_setup_entry as async_setup_button,
+)
+from custom_components.unifi_insights.camera import (
+    async_setup_entry as async_setup_camera,
+)
+from custom_components.unifi_insights.const import (
+    CONF_CLIENT_CONTROL,
+)
+from custom_components.unifi_insights.event import (
+    async_setup_entry as async_setup_event,
+)
+from custom_components.unifi_insights.image import (
+    async_setup_entry as async_setup_image,
+)
+from custom_components.unifi_insights.light import (
+    async_setup_entry as async_setup_light,
+)
+from custom_components.unifi_insights.number import (
+    async_setup_entry as async_setup_number,
+)
+from custom_components.unifi_insights.select import (
+    async_setup_entry as async_setup_select,
+)
+from custom_components.unifi_insights.sensor import (
+    async_setup_entry as async_setup_sensor,
+)
+from custom_components.unifi_insights.switch import (
+    async_setup_entry as async_setup_switch,
+)
+from custom_components.unifi_insights.update import (
+    async_setup_entry as async_setup_update,
+)
+
+
+@pytest.fixture
+def mock_coordinator() -> MagicMock:
+    """Create a mock coordinator with empty data."""
+    coordinator = MagicMock()
+    coordinator.protect_client = MagicMock()
+    coordinator.network_client = MagicMock()
+    coordinator.network_client.base_url = "https://192.168.1.1"
+    coordinator.data = {
+        "devices": {
+            "site1": {},
+        },
+        "protect": {
+            "cameras": {},
+            "lights": {},
+            "sensors": {},
+            "nvrs": {},
+            "viewers": {},
+            "chimes": {},
+            "liveviews": {},
+        },
+        "wifi": {
+            "site1": {},
+        },
+        "clients": {
+            "site1": {},
+        },
+        "firewall_rules": {
+            "site1": {},
+        },
+        "policy_based_routes": {
+            "site1": {},
+        },
+        "vpn_clients": {
+            "site1": {},
+        },
+    }
+    return coordinator
+
+
+@pytest.fixture
+def mock_config_entry(mock_coordinator: MagicMock) -> MagicMock:
+    """Create a mock config entry."""
+    entry = MagicMock()
+    entry.entry_id = "test_entry_id"
+    entry.runtime_data = MagicMock()
+    entry.runtime_data.coordinator = mock_coordinator
+    entry.runtime_data.device_coordinator = MagicMock()
+    entry.options = {CONF_CLIENT_CONTROL: True}
+    entry.async_on_unload = MagicMock()
+    return entry
+
+
+class TestDynamicNetworkDeviceDiscovery:
+    """Test dynamic discovery of network devices across platforms without reload."""
+
+    @pytest.mark.asyncio
+    async def test_dynamic_network_device_creation(
+        self, hass: Any, mock_coordinator: MagicMock, mock_config_entry: MagicMock
+    ) -> None:
+        """Adopting a new network device creates entities on coordinator update."""
+        platforms = [
+            ("update", async_setup_update),
+            ("binary_sensor", async_setup_binary_sensor),
+            ("sensor", async_setup_sensor),
+            ("button", async_setup_button),
+            ("switch", async_setup_switch),
+        ]
+
+        callbacks = {}
+        add_mocks = {}
+
+        for name, setup_fn in platforms:
+            mock_coordinator.async_add_listener.reset_mock()
+            add_entities = MagicMock()
+            add_mocks[name] = add_entities
+            await setup_fn(hass, mock_config_entry, add_entities)
+            assert mock_coordinator.async_add_listener.call_count == 1
+            callbacks[name] = mock_coordinator.async_add_listener.call_args[0][0]
+
+        # Initially, platforms were either called with 0 entities or not called
+        initial_call_counts = {k: m.call_count for k, m in add_mocks.items()}
+
+        # Now adopt a new network switch with ports and outlets
+        mock_coordinator.data["devices"]["site1"]["device_switch_1"] = {
+            "id": "device_switch_1",
+            "name": "Core Switch 24",
+            "model": "USW-24-POE",
+            "state": "ONLINE",
+            "firmwareVersion": "6.5.55",
+            "upgradeAvailable": False,
+            "system-stats": {"cpu": 15.2, "mem": 42.1, "uptime": 12345},
+            "interfaces": {
+                "ports": [
+                    {
+                        "idx": 1,
+                        "name": "Port 1",
+                        "state": "up",
+                        "poe": {"power": 5.4, "good": True},
+                        "speed": 1000,
+                        "media": "copper",
+                    },
+                    {
+                        "idx": 25,
+                        "name": "SFP 1",
+                        "state": "up",
+                        "media": "sfp",
+                        "sfp": {"present": True, "vendor": "Ubiquiti"},
+                    },
+                ]
+            },
+            "outlet_table": [
+                {
+                    "index": 1,
+                    "name": "Outlet 1",
+                    "relay_state": True,
+                    "power": 12.0,
+                    "voltage": 120.0,
+                    "current": 0.1,
+                    "power_factor": 0.95,
+                }
+            ],
+            "features": {"switching": True},
+        }
+
+        # Trigger coordinator listeners for each platform without reload
+        for callback in callbacks.values():
+            callback()
+
+        # Verify new entities were discovered and added
+        for name, add_mock in add_mocks.items():
+            assert add_mock.call_count > initial_call_counts[name], (
+                f"Platform {name} did not discover new entities on update"
+            )
+            latest_entities = add_mock.call_args[0][0]
+            assert len(latest_entities) > 0, (
+                f"Platform {name} received empty list on update"
+            )
+
+        # Triggering update again with no new devices must not add duplicates
+        post_adoption_counts = {k: m.call_count for k, m in add_mocks.items()}
+        for callback in callbacks.values():
+            callback()
+
+        for name, add_mock in add_mocks.items():
+            assert add_mock.call_count == post_adoption_counts[name], (
+                f"Platform {name} added duplicate entities"
+            )
+
+
+class TestDynamicProtectDeviceDiscovery:
+    """Test dynamic discovery of Protect devices across platforms without reload."""
+
+    @pytest.mark.asyncio
+    async def test_dynamic_protect_device_creation(
+        self, hass: Any, mock_coordinator: MagicMock, mock_config_entry: MagicMock
+    ) -> None:
+        """Adopting a new Protect camera and sensor creates entities without reload."""
+        platforms = [
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("binary_sensor", async_setup_binary_sensor),
+            ("sensor", async_setup_sensor),
+            ("number", async_setup_number),
+            ("select", async_setup_select),
+            ("event", async_setup_event),
+            ("button", async_setup_button),
+            ("switch", async_setup_switch),
+        ]
+
+        callbacks = {}
+        add_mocks = {}
+
+        for name, setup_fn in platforms:
+            mock_coordinator.async_add_listener.reset_mock()
+            add_entities = MagicMock()
+            add_mocks[name] = add_entities
+            await setup_fn(hass, mock_config_entry, add_entities)
+            assert mock_coordinator.async_add_listener.call_count == 1
+            callbacks[name] = mock_coordinator.async_add_listener.call_args[0][0]
+
+        initial_call_counts = {k: m.call_count for k, m in add_mocks.items()}
+
+        # Dynamically discover a camera, light, sensor, and chime in Protect
+        mock_coordinator.data["protect"]["cameras"]["cam_1"] = {
+            "id": "cam_1",
+            "name": "Front Door Camera",
+            "state": "CONNECTED",
+            "type": "camera",
+            "modelKey": "camera",
+            "featureFlags": {
+                "hasMic": True,
+                "hasSpeaker": True,
+                "hasHdr": True,
+                "hasPtz": True,
+                "isDoorbell": True,
+                "smartDetectTypes": ["person", "vehicle"],
+            },
+            "micVolume": 80,
+            "hdrMode": "auto",
+            "videoMode": "default",
+            "ptz": {"presets": [{"id": 1, "name": "Entrance"}]},
+            "isMicEnabled": True,
+            "isLedEnabled": True,
+        }
+        mock_coordinator.data["protect"]["lights"]["light_1"] = {
+            "id": "light_1",
+            "name": "Porch Floodlight",
+            "state": "CONNECTED",
+            "isLedEnabled": True,
+            "lightDeviceSettings": {"ledLevel": 6},
+        }
+        mock_coordinator.data["protect"]["sensors"]["sensor_1"] = {
+            "id": "sensor_1",
+            "name": "Front Door Sensor",
+            "state": "CONNECTED",
+            "type": "sensor",
+            "modelKey": "sensor",
+            "stats": {
+                "temperature": {"value": 21.5},
+                "humidity": {"value": 45.0},
+                "light": {"value": 150.0},
+            },
+            "batteryStatus": {"percentage": 92},
+            "isOpened": False,
+            "isTamperingDetected": False,
+        }
+        mock_coordinator.data["protect"]["chimes"]["chime_1"] = {
+            "id": "chime_1",
+            "name": "Hallway Chime",
+            "state": "CONNECTED",
+            "ringSettings": [
+                {
+                    "volume": 70,
+                    "repeatTimes": 2,
+                    "ringtone": "dingdong",
+                }
+            ],
+        }
+
+        # Trigger listener updates across all platforms
+        for callback in callbacks.values():
+            callback()
+
+        # All Protect platforms should have added their respective entities
+        for name, add_mock in add_mocks.items():
+            assert add_mock.call_count > initial_call_counts[name], (
+                f"Platform {name} did not discover new Protect entities"
+            )
+            entities = add_mock.call_args[0][0]
+            assert len(entities) > 0, (
+                f"Platform {name} added empty entity list on Protect update"
+            )
+
+        # Subsequent updates must not add duplicate entities
+        post_counts = {k: m.call_count for k, m in add_mocks.items()}
+        for callback in callbacks.values():
+            callback()
+
+        for name, add_mock in add_mocks.items():
+            assert add_mock.call_count == post_counts[name], (
+                f"Platform {name} added duplicate Protect entities"
+            )
+
+
+class TestDynamicOptionsAndCapabilities:
+    """Test dynamic additions respecting user configuration and options."""
+
+    @pytest.mark.asyncio
+    async def test_client_control_option_toggle(
+        self, hass: Any, mock_coordinator: MagicMock, mock_config_entry: MagicMock
+    ) -> None:
+        """Buttons and switches for client control dynamically respect options."""
+        mock_config_entry.options = {CONF_CLIENT_CONTROL: False}
+
+        mock_coordinator.data["clients"]["site1"]["client_mac_1"] = {
+            "id": "client_mac_1",
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "name": "Guest Phone",
+            "blocked": False,
+        }
+
+        button_add = MagicMock()
+        await async_setup_button(hass, mock_config_entry, button_add)
+        button_listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        switch_add = MagicMock()
+        await async_setup_switch(hass, mock_config_entry, switch_add)
+        switch_listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        # With client_control=False, no client buttons or switches created
+        assert button_add.call_count == 0 or len(button_add.call_args[0][0]) == 0
+        assert switch_add.call_count == 1
+        assert len(switch_add.call_args[0][0]) == 0
+
+        # Now enable client_control in options and trigger coordinator update
+        mock_config_entry.options = {CONF_CLIENT_CONTROL: True}
+        button_listener()
+        switch_listener()
+
+        assert button_add.call_count == 1
+        assert len(button_add.call_args[0][0]) == 1
+        assert button_add.call_args[0][0][0].unique_id == "site1_client_mac_1_reconnect"
+
+        assert switch_add.call_count == 2
+        assert len(switch_add.call_args[0][0]) == 1
+        assert (
+            switch_add.call_args[0][0][0].unique_id == "site1_client_mac_1_block_switch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dynamic_wifi_qr_and_sensor(
+        self, hass: Any, mock_coordinator: MagicMock, mock_config_entry: MagicMock
+    ) -> None:
+        """Adding a new WiFi network dynamically adds QR code image and sensor."""
+        image_add = MagicMock()
+        await async_setup_image(hass, mock_config_entry, image_add)
+        image_listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        sensor_add = MagicMock()
+        await async_setup_sensor(hass, mock_config_entry, sensor_add)
+        sensor_listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        # Now add a new WiFi network
+        mock_coordinator.data["wifi"]["site1"]["wifi_guest"] = {
+            "id": "wifi_guest",
+            "name": "Guest WiFi",
+            "qr_code": "WIFI:S:Guest WiFi;T:WPA;P:secret;;",
+            "num_sta": 5,
+        }
+
+        image_listener()
+        sensor_listener()
+
+        assert image_add.call_count == 1
+        image_entities = image_add.call_args[0][0]
+        assert len(image_entities) == 1
+        assert image_entities[0].unique_id == "site1_wifi_guest_qr_code"
+
+        sensor_entities = sensor_add.call_args[0][0]
+        wifi_sensors = [
+            e
+            for e in sensor_entities
+            if getattr(e, "unique_id", "").startswith("site1_wifi_guest_client_count")
+        ]
+        assert len(wifi_sensors) == 1
+
+
+class TestDynamicDiscoveryResilience:
+    """Test resilience against empty payloads, missing keys, and disconnections."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "setup_fn"),
+        [
+            ("update", async_setup_update),
+            ("binary_sensor", async_setup_binary_sensor),
+            ("sensor", async_setup_sensor),
+            ("button", async_setup_button),
+            ("switch", async_setup_switch),
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("number", async_setup_number),
+            ("select", async_setup_select),
+            ("event", async_setup_event),
+            ("image", async_setup_image),
+        ],
+    )
+    async def test_listener_resilience_empty_or_none_data(
+        self,
+        name: str,
+        setup_fn: Any,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Listeners handle None, empty, or malformed data gracefully."""
+        add_entities = MagicMock()
+        await setup_fn(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        # Test various disconnected or malformed states
+        test_payloads = [
+            None,
+            {},
+            {"devices": None, "protect": None},
+            {"devices": {"site1": None}, "protect": {"cameras": None}},
+            {"devices": {"site1": {"bad_dev": None}}},
+            {"protect": {"cameras": {"bad_cam": None}, "lights": {"bad_light": None}}},
+        ]
+
+        for payload in test_payloads:
+            mock_coordinator.data = payload
+            # Must execute without throwing exceptions
+            listener()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "setup_fn"),
+        [
+            ("update", async_setup_update),
+            ("binary_sensor", async_setup_binary_sensor),
+            ("sensor", async_setup_sensor),
+            ("button", async_setup_button),
+            ("switch", async_setup_switch),
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("number", async_setup_number),
+            ("select", async_setup_select),
+            ("event", async_setup_event),
+            ("image", async_setup_image),
+        ],
+    )
+    async def test_listeners_unregistered_on_unload(
+        self,
+        name: str,
+        setup_fn: Any,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Every platform registers its listener with entry.async_on_unload."""
+        add_entities = MagicMock()
+        mock_config_entry.async_on_unload.reset_mock()
+        mock_coordinator.async_add_listener.reset_mock()
+
+        await setup_fn(hass, mock_config_entry, add_entities)
+
+        assert mock_coordinator.async_add_listener.call_count == 1
+        assert mock_config_entry.async_on_unload.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "setup_fn"),
+        [
+            ("update", async_setup_update),
+            ("binary_sensor", async_setup_binary_sensor),
+            ("sensor", async_setup_sensor),
+            ("button", async_setup_button),
+            ("switch", async_setup_switch),
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("number", async_setup_number),
+            ("select", async_setup_select),
+            ("event", async_setup_event),
+            ("image", async_setup_image),
+        ],
+    )
+    async def test_listener_malformed_records_and_collections(
+        self,
+        name: str,
+        setup_fn: Any,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Listeners handle malformed collections and records in coordinator data."""
+        add_entities = MagicMock()
+        await setup_fn(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        malformed_payloads = [
+            # Collections are not dicts
+            {
+                "devices": {"site1": "not-a-dict"},
+                "clients": {"site1": "not-a-dict"},
+                "wifi": {"site1": "not-a-dict"},
+                "firewall_rules": {"site1": "not-a-dict"},
+                "policy_based_routes": {"site1": "not-a-dict"},
+                "vpn_clients": {"site1": "not-a-dict"},
+                "protect": {
+                    "cameras": "not-a-dict",
+                    "lights": "not-a-dict",
+                    "sensors": "not-a-dict",
+                    "chimes": "not-a-dict",
+                    "viewers": "not-a-dict",
+                },
+                "stats": {"site1": "not-a-dict"},
+            },
+            # Records within collections are not dicts or missing fields
+            {
+                "devices": {
+                    "site1": {
+                        "dev_str": "not-a-dict",
+                        "dev_bad_outlets": {
+                            "id": "dev_bad_outlets",
+                            "name": "PDU",
+                            "features": ["switching"],
+                            "outlet_table": "not-a-list",
+                            "interfaces": {"ports": "not-a-list"},
+                        },
+                        "dev_bad_outlets_list": {
+                            "id": "dev_bad_outlets_list",
+                            "name": "PDU2",
+                            "features": ["switching"],
+                            "outlet_table": [
+                                "not-a-dict",
+                                {},
+                                {"index": "not-an-int"},
+                            ],
+                            "interfaces": {
+                                "ports": ["not-a-dict", {}],
+                            },
+                        },
+                    }
+                },
+                "clients": {"site1": {"c_str": "not-a-dict"}},
+                "wifi": {
+                    "site1": {
+                        "w_str": "not-a-dict",
+                        "w_no_qr": {"name": "WiFi", "qr_code": None},
+                        "w_valid": {"name": "Guest", "qr_code": "WIFI:S:Guest;;"},
+                    }
+                },
+                "firewall_rules": {"site1": {"r_str": "not-a-dict"}},
+                "policy_based_routes": {"site1": {"pr_str": "not-a-dict"}},
+                "vpn_clients": {"site1": {"vpn_str": "not-a-dict"}},
+                "protect": {
+                    "cameras": {"cam_str": "not-a-dict"},
+                    "lights": {"light_str": "not-a-dict"},
+                    "sensors": {"sensor_str": "not-a-dict"},
+                    "chimes": {"chime_str": "not-a-dict"},
+                    "viewers": {"viewer_str": "not-a-dict"},
+                },
+                "stats": {
+                    "site1": {
+                        "dev_bad_outlets": "not-a-dict",
+                    }
+                },
+            },
+        ]
+
+        for payload in malformed_payloads:
+            mock_coordinator.data = payload
+            listener()
+
+        # Run again with same payload to trigger duplicate skips
+        listener()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "setup_fn"),
+        [
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("number", async_setup_number),
+        ],
+    )
+    async def test_protect_platforms_skip_when_no_protect_client(
+        self,
+        name: str,
+        setup_fn: Any,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Protect platforms return early when protect_client is None."""
+        mock_coordinator.protect_client = None
+        add_entities = MagicMock()
+        await setup_fn(hass, mock_config_entry, add_entities)
+        add_entities.assert_not_called()
+
+
+class TestDiscoveryRegressions:
+    """Regressions for payload shapes discovery used to mishandle."""
+
+    @pytest.mark.asyncio
+    async def test_light_retried_after_a_failed_construction(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """A light that fails to construct is retried on the next update."""
+        add_entities = MagicMock()
+        await async_setup_light(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["protect"]["lights"] = {
+            "light1": {"id": "light1", "name": "Porch"}
+        }
+
+        with patch(
+            "custom_components.unifi_insights.light.UnifiProtectLight",
+            side_effect=ValueError("bad ledLevel"),
+        ):
+            listener()
+        add_entities.assert_not_called()
+
+        # Payload is fine now; the light must not stay hidden.
+        listener()
+        add_entities.assert_called_once()
+        assert len(add_entities.call_args[0][0]) == 1
+
+    @pytest.mark.asyncio
+    async def test_wan_status_skipped_when_model_is_none(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """A device reporting model=None does not crash WAN status discovery."""
+        add_entities = MagicMock()
+        await async_setup_binary_sensor(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["devices"]["site1"] = {
+            "dev1": {"id": "dev1", "name": "Mesh AP", "model": None}
+        }
+
+        listener()
+
+        added = [e for call in add_entities.call_args_list for e in call[0][0]]
+        assert not any(
+            getattr(e, "entity_description", None) is not None
+            and e.entity_description.key == "wan_status"
+            for e in added
+        )
+
+    @pytest.mark.asyncio
+    async def test_mapping_shaped_features_still_create_sensors(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Devices reporting features as a mapping get feature-gated sensors."""
+        add_entities = MagicMock()
+        await async_setup_sensor(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["devices"]["site1"] = {
+            "dev1": {
+                "id": "dev1",
+                "name": "Switch",
+                "model": "USW-24",
+                "features": {"switching": True},
+            }
+        }
+        mock_coordinator.data["stats"] = {"site1": {"dev1": {"poe_total_w": 12.0}}}
+
+        listener()
+
+        added = [e for call in add_entities.call_args_list for e in call[0][0]]
+        keys = {
+            e.entity_description.key
+            for e in added
+            if getattr(e, "entity_description", None) is not None
+        }
+        assert "poe_total_power" in keys
+
+    @pytest.mark.asyncio
+    async def test_string_port_index_does_not_duplicate_a_port_sensor(
+        self,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """A string port index dedupes against the int-keyed stats fallback."""
+        add_entities = MagicMock()
+        await async_setup_sensor(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        mock_coordinator.data["devices"]["site1"] = {
+            "dev1": {
+                "id": "dev1",
+                "name": "Switch",
+                "model": "USW-24",
+                "features": {"switching": True},
+                "interfaces": {
+                    "ports": [
+                        {"idx": "1", "state": "UP", "poe": {"good": True}},
+                    ]
+                },
+            }
+        }
+        mock_coordinator.data["stats"] = {"site1": {"dev1": {"poe_ports": {"1": 5.0}}}}
+
+        listener()
+
+        added = [e for call in add_entities.call_args_list for e in call[0][0]]
+        unique_ids = [e.unique_id for e in added if getattr(e, "unique_id", None)]
+        assert len(unique_ids) == len(set(unique_ids))

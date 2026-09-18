@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -51,6 +52,7 @@ from .coordinators import UnifiFacadeCoordinator
 from .entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
+    device_has_feature,
     get_field,
 )
 from .entity import (
@@ -636,7 +638,7 @@ def _outlet_has_metering(outlet: dict[str, Any]) -> bool:
         try:
             if int(caps) & 2:
                 return True
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             pass
     for key in (
         "outlet_power",
@@ -941,6 +943,410 @@ def _migrate_sensor_units(
         )
 
 
+def _discover_device_sensors(
+    coordinator: UnifiFacadeCoordinator,
+    site_id: str,
+    device_id: str,
+    device_data: dict[str, Any],
+    known_sensor_keys: set[tuple[Any, ...]],
+    entities: list[SensorEntity],
+) -> None:
+    """Discover standard network device sensors."""
+    for description in SENSOR_TYPES:
+        if description.required_feature is not None and not device_has_feature(
+            device_data, description.required_feature
+        ):
+            continue
+
+        if (
+            description.key == "general_temperature"
+            and get_network_device_temperature(device_data) is None
+            and not get_field(
+                device_data,
+                "hasTemperature",
+                "has_temperature",
+                default=False,
+            )
+        ):
+            continue
+
+        # Only create uplink rate sensors if uplink data exists
+        if description.key in ("tx_rate", "rx_rate"):
+            stats = ((coordinator.data.get("stats") or {}).get(site_id) or {}).get(
+                device_id, {}
+            )
+            if not isinstance(stats, dict):
+                continue
+            uplink = get_field(stats, "uplink", "uplink_stats", default=None)
+            has_uplink = isinstance(uplink, dict) and bool(uplink)
+            has_top_level = any(
+                stats.get(k) is not None
+                for k in (
+                    "txRateBps",
+                    "tx_rate_bps",
+                    "rxRateBps",
+                    "rx_rate_bps",
+                    "tx_bytes_per_sec",
+                    "rx_bytes_per_sec",
+                )
+            )
+            if not has_uplink and not has_top_level:
+                continue
+
+        # Only create Total PoE Power sensor if coordinator
+        if description.key == "poe_total_power":
+            stats = ((coordinator.data.get("stats") or {}).get(site_id) or {}).get(
+                device_id, {}
+            )
+            if not isinstance(stats, dict):
+                continue
+            poe_keys = (
+                "poe_total_w",
+                "poeTotalW",
+                "total_used_power",
+                "totalUsedPower",
+            )
+            has_any_total = any(stats.get(k) is not None for k in poe_keys)
+            has_ports = isinstance(stats.get("poe_ports"), dict)
+            if not has_any_total and not has_ports:
+                continue
+
+        # Only create AC power sensors if data is present on the device
+        if description.key in (
+            "ac_power_consumption",
+            "ac_power_budget",
+        ):
+            val = description.value_fn(device_data) if description.value_fn else None
+            if val is None:
+                continue
+
+        key = (site_id, device_id, description.key)
+        if key in known_sensor_keys:
+            continue
+        known_sensor_keys.add(key)
+        entities.append(
+            UnifiInsightsSensor(
+                coordinator=coordinator,
+                description=description,
+                site_id=site_id,
+                device_id=device_id,
+            )
+        )
+
+    # Add WAN sensors for gateway devices
+    features = get_field(device_data, "features", default={})
+    model = get_field(device_data, "model", default="")
+    if ("switching" in features or "gateway" in features or "router" in features) and (
+        model.startswith(("UDM", "USG")) or "gateway" in model.lower()
+    ):
+        for wan_desc in WAN_SENSOR_TYPES:
+            wan_key = (site_id, device_id, wan_desc.key)
+            if wan_key not in known_sensor_keys:
+                known_sensor_keys.add(wan_key)
+                entities.append(
+                    UnifiInsightsSensor(
+                        coordinator=coordinator,
+                        description=wan_desc,
+                        site_id=site_id,
+                        device_id=device_id,
+                    )
+                )
+
+
+def _discover_port_sensors(
+    coordinator: UnifiFacadeCoordinator,
+    site_id: str,
+    device_id: str,
+    device_data: dict[str, Any],
+    known_sensor_keys: set[tuple[Any, ...]],
+    entities: list[SensorEntity],
+) -> None:
+    """Discover port sensors for a network device."""
+    ports = device_data.get("ports", [])
+    if not ports:
+        interfaces = get_field(device_data, "interfaces", default={})
+        if isinstance(interfaces, dict):
+            ports = get_field(interfaces, "ports", default=[])
+    if not ports or not isinstance(ports, list):
+        return
+
+    active_port_indices: set[int] = set()
+    for port in ports:
+        if not isinstance(port, dict):
+            continue
+        port_idx = get_field(port, "idx", "index", "port_idx")
+        if port_idx is None:
+            continue
+        # The legacy device path copies the raw index straight from the
+        # payload, so it can still be a string here. _create_port_stats_fallback
+        # keys its ports on int, and both paths feed the same UnifiPortSensor
+        # unique ID, so normalise before the dedupe keys are built.
+        with contextlib.suppress(ValueError, TypeError):
+            port_idx = int(port_idx)
+
+        port_state = get_field(port, "state", "status", default="DOWN")
+        if str(port_state).upper() != "UP":
+            continue
+
+        with contextlib.suppress(ValueError, TypeError):
+            active_port_indices.add(int(port_idx))
+
+        port_label = _get_port_label(port, port_idx)
+        is_sfp = str(port.get("media", "")).startswith("SFP")
+
+        poe_data = get_field(port, "poe", default={})
+        poe_marker = False
+        if isinstance(poe_data, dict):
+            if poe_data.get("good"):
+                poe_marker = True
+            else:
+                for pw_key in ("power", "watts"):
+                    pw = poe_data.get(pw_key)
+                    try:
+                        if pw is not None and float(pw) > 0:
+                            poe_marker = True
+                            break
+                    except (ValueError, TypeError):
+                        pass
+
+        if not poe_marker:
+            norm = get_field(port, "poe_power_w")
+            try:
+                poe_marker = norm is not None and float(norm) > 0
+            except (ValueError, TypeError):
+                poe_marker = False
+
+        if poe_marker:
+            poe_desc = PORT_SENSOR_TYPES[0]
+            poe_key = (site_id, device_id, port_idx, poe_desc.key)
+            if poe_key not in known_sensor_keys:
+                known_sensor_keys.add(poe_key)
+                entities.append(
+                    UnifiPortSensor(
+                        coordinator=coordinator,
+                        description=poe_desc,
+                        site_id=site_id,
+                        device_id=device_id,
+                        port_idx=port_idx,
+                        port_label=port_label,
+                    )
+                )
+
+        for desc in (
+            PORT_SENSOR_TYPES[1],  # speed
+            PORT_SENSOR_TYPES[2],  # tx
+            PORT_SENSOR_TYPES[3],  # rx
+            PORT_RATE_SENSOR_TYPES[0],  # tx_rate
+            PORT_RATE_SENSOR_TYPES[1],  # rx_rate
+        ):
+            p_key = (site_id, device_id, port_idx, desc.key)
+            if p_key not in known_sensor_keys:
+                known_sensor_keys.add(p_key)
+                entities.append(
+                    UnifiPortSensor(
+                        coordinator=coordinator,
+                        description=desc,
+                        site_id=site_id,
+                        device_id=device_id,
+                        port_idx=port_idx,
+                        port_label=port_label,
+                    )
+                )
+
+        if is_sfp and port.get("sfp_found"):
+            for sfp_desc in SFP_SENSOR_TYPES:
+                sfp_key = (site_id, device_id, port_idx, sfp_desc.key)
+                if sfp_key not in known_sensor_keys:
+                    known_sensor_keys.add(sfp_key)
+                    entities.append(
+                        UnifiPortSensor(
+                            coordinator=coordinator,
+                            description=sfp_desc,
+                            site_id=site_id,
+                            device_id=device_id,
+                            port_idx=port_idx,
+                            port_label=port_label,
+                        )
+                    )
+
+    # Fallback: create per-port sensors from stats
+    if device_has_feature(device_data, "switching"):
+        stats = ((coordinator.data.get("stats") or {}).get(site_id) or {}).get(
+            device_id, {}
+        )
+        if isinstance(stats, dict):
+            _create_port_stats_fallback(
+                coordinator,
+                stats,
+                site_id,
+                device_id,
+                active_port_indices,
+                known_sensor_keys,
+                entities,
+            )
+
+
+def _create_port_stats_fallback(
+    coordinator: UnifiFacadeCoordinator,
+    stats: dict[str, Any],
+    site_id: str,
+    device_id: str,
+    active_ports: set[int],
+    known_sensor_keys: set[tuple[Any, ...]],
+    entities: list[SensorEntity],
+) -> None:
+    """Create port sensors from stats when interfaces.ports is missing."""
+    poe_stats = stats.get("poe_ports")
+    if isinstance(poe_stats, dict) and poe_stats:
+        for k, val in poe_stats.items():
+            if not isinstance(k, int) and not (isinstance(k, str) and k.isdigit()):
+                continue
+            port_idx = int(k)
+            if active_ports and port_idx not in active_ports:
+                continue
+            try:
+                if val is not None and float(val) <= 0:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            desc = PORT_SENSOR_TYPES[0]
+            key = (site_id, device_id, port_idx, desc.key)
+            if key not in known_sensor_keys:
+                known_sensor_keys.add(key)
+                entities.append(
+                    UnifiPortSensor(
+                        coordinator=coordinator,
+                        description=desc,
+                        site_id=site_id,
+                        device_id=device_id,
+                        port_idx=port_idx,
+                    )
+                )
+
+    byte_stats = stats.get("port_bytes")
+    if isinstance(byte_stats, dict) and byte_stats:
+        for k in byte_stats:
+            if not isinstance(k, int) and not (isinstance(k, str) and k.isdigit()):
+                continue
+            port_idx = int(k)
+            if active_ports and port_idx not in active_ports:
+                continue
+            for desc in (PORT_SENSOR_TYPES[2], PORT_SENSOR_TYPES[3]):
+                key = (site_id, device_id, port_idx, desc.key)
+                if key not in known_sensor_keys:
+                    known_sensor_keys.add(key)
+                    entities.append(
+                        UnifiPortSensor(
+                            coordinator=coordinator,
+                            description=desc,
+                            site_id=site_id,
+                            device_id=device_id,
+                            port_idx=port_idx,
+                        )
+                    )
+
+
+def _discover_outlet_sensors(
+    coordinator: UnifiFacadeCoordinator,
+    site_id: str,
+    device_id: str,
+    device_data: dict[str, Any],
+    known_sensor_keys: set[tuple[Any, ...]],
+    entities: list[SensorEntity],
+) -> None:
+    """Discover outlet sensors for PDUs and smart power strips."""
+    outlets = device_data.get("outlet_table", [])
+    if not isinstance(outlets, list) or not outlets:
+        return
+
+    for outlet in outlets:
+        if not isinstance(outlet, dict):
+            continue
+        idx = outlet.get("index")
+        if idx is None:
+            idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
+        if idx is None:
+            continue
+        try:
+            outlet_idx = int(idx)
+        except (TypeError, ValueError):
+            continue
+
+        if not _outlet_has_metering(outlet):
+            continue
+
+        outlet_label = outlet.get("name") or f"Outlet {outlet_idx}"
+        for outlet_desc in OUTLET_SENSOR_TYPES:
+            o_key = (site_id, device_id, outlet_idx, outlet_desc.key)
+            if o_key not in known_sensor_keys:
+                known_sensor_keys.add(o_key)
+                entities.append(
+                    UnifiOutletSensor(
+                        coordinator=coordinator,
+                        description=outlet_desc,
+                        site_id=site_id,
+                        device_id=device_id,
+                        outlet_index=outlet_idx,
+                        outlet_name=outlet_label,
+                    )
+                )
+
+
+def _discover_protect_sensors(
+    coordinator: UnifiFacadeCoordinator,
+    known_sensor_keys: set[tuple[Any, ...]],
+    entities: list[SensorEntity],
+) -> None:
+    """Discover sensors for UniFi Protect."""
+    if not coordinator.protect_client:
+        return
+
+    protect = coordinator.data.get("protect", {})
+    if not isinstance(protect, dict):
+        return
+
+    sensors = protect.get("sensors", {})
+    if isinstance(sensors, dict):
+        for sensor_id, sensor_data in sensors.items():
+            if not isinstance(sensor_data, dict):
+                continue
+            for protect_desc in PROTECT_SENSOR_TYPES:
+                if protect_desc.device_type == DEVICE_TYPE_SENSOR and (
+                    protect_desc.capability_fn is None
+                    or protect_desc.capability_fn(sensor_data)
+                ):
+                    prot_key = (sensor_id, protect_desc.key)
+                    if prot_key not in known_sensor_keys:
+                        known_sensor_keys.add(prot_key)
+                        entities.append(
+                            UnifiProtectSensor(
+                                coordinator=coordinator,
+                                description=protect_desc,
+                                device_id=sensor_id,
+                            )
+                        )
+
+    nvrs = protect.get("nvrs", {})
+    if isinstance(nvrs, dict):
+        for nvr_id, nvr_data in nvrs.items():
+            if not isinstance(nvr_data, dict):
+                continue
+            has_storage = _has_storage_info(nvr_data)
+            for nvr_desc in NVR_SENSOR_TYPES:
+                if nvr_desc.key.startswith("storage_") and not has_storage:
+                    continue
+                nvr_key = (nvr_id, nvr_desc.key)
+                if nvr_key not in known_sensor_keys:
+                    known_sensor_keys.add(nvr_key)
+                    entities.append(
+                        UnifiProtectNVRSensor(
+                            coordinator=coordinator,
+                            description=nvr_desc,
+                            device_id=nvr_id,
+                        )
+                    )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: UnifiInsightsConfigEntry,
@@ -954,540 +1360,106 @@ async def async_setup_entry(
     _migrate_sensor_units(hass, config_entry)
 
     coordinator: UnifiFacadeCoordinator = config_entry.runtime_data.coordinator
-    entities: list[SensorEntity] = []
+    known_sensor_keys: set[tuple[Any, ...]] = set()
+    initial_entities: list[SensorEntity] = []
+    # Only the first pass feeds the stale-entity sweep below. Without this the
+    # list would keep every entity discovered for the lifetime of the entry,
+    # long after the one sweep that reads it has run.
+    setup_complete = False
 
-    # Add sensors for each device in each site
-    for site_id, devices in coordinator.data["devices"].items():
-        _LOGGER.debug("Processing site %s with %d devices", site_id, len(devices))
-        site_data = coordinator.get_site(site_id)
-        site_name = (
-            site_data.get("meta", {}).get("name", site_id) if site_data else site_id
-        )
+    @callback
+    def async_discover_sensors() -> None:
+        """Discover and add new sensors."""
+        if not coordinator.data or not isinstance(coordinator.data, dict):
+            return
 
-        for device_id in devices:
-            device_data = (
-                coordinator.data.get("devices", {}).get(site_id, {}).get(device_id, {})
-            )
-            device_name = device_data.get("name", device_id)
-            # Get device features for filtering (e.g., ['switching'], ['accessPoint'])
-            device_features = device_data.get("features", [])
-            if not isinstance(device_features, list):
-                device_features = []
+        entities: list[SensorEntity] = []
 
-            _LOGGER.debug(
-                "Creating sensors for device %s (%s) in site %s (%s), features: %s",
-                device_id,
-                device_name,
-                site_id,
-                site_name,
-                device_features,
-            )
-
-            for description in SENSOR_TYPES:
-                # Skip sensor if it requires a specific feature the device doesn't have
-                if (
-                    description.required_feature is not None
-                    and description.required_feature not in device_features
-                ):
-                    _LOGGER.debug(
-                        "Skipping sensor %s for %s - needs feature %s",
-                        description.key,
-                        device_name,
-                        description.required_feature,
-                    )
+        # Add sensors for each device in each site
+        devices_by_site = coordinator.data.get("devices", {})
+        if isinstance(devices_by_site, dict):
+            for site_id, devices in devices_by_site.items():
+                if not isinstance(devices, dict):
                     continue
-
-                if (
-                    description.key == "general_temperature"
-                    and get_network_device_temperature(device_data) is None
-                    and not get_field(
+                for device_id, device_data in devices.items():
+                    if not isinstance(device_data, dict):
+                        continue
+                    _discover_device_sensors(
+                        coordinator,
+                        site_id,
+                        device_id,
                         device_data,
-                        "hasTemperature",
-                        "has_temperature",
-                        default=False,
+                        known_sensor_keys,
+                        entities,
                     )
-                ):
-                    _LOGGER.debug(
-                        "Skipping sensor %s for %s - no temperature data",
-                        description.key,
-                        device_name,
+                    _discover_port_sensors(
+                        coordinator,
+                        site_id,
+                        device_id,
+                        device_data,
+                        known_sensor_keys,
+                        entities,
                     )
-                    continue
-
-                # Only create uplink rate sensors if uplink data exists
-                if description.key in ("tx_rate", "rx_rate"):
-                    stats = (
-                        coordinator.data.get("stats", {})
-                        .get(site_id, {})
-                        .get(device_id, {})
+                    _discover_outlet_sensors(
+                        coordinator,
+                        site_id,
+                        device_id,
+                        device_data,
+                        known_sensor_keys,
+                        entities,
                     )
-                    if not isinstance(stats, dict):
-                        continue
-                    uplink = get_field(stats, "uplink", "uplink_stats", default=None)
-                    has_uplink = isinstance(uplink, dict) and bool(uplink)
-                    has_top_level = any(
-                        stats.get(k) is not None
-                        for k in (
-                            "txRateBps",
-                            "tx_rate_bps",
-                            "rxRateBps",
-                            "rx_rate_bps",
-                            "tx_bytes_per_sec",
-                            "rx_bytes_per_sec",
-                        )
-                    )
-                    if not has_uplink and not has_top_level:
-                        _LOGGER.debug(
-                            "Skipping sensor %s for %s - no uplink rate data",
-                            description.key,
-                            device_name,
-                        )
-                        continue
 
-                # Only create Total PoE Power sensor if coordinator
-                if description.key == "poe_total_power":
-                    stats = (
-                        coordinator.data.get("stats", {})
-                        .get(site_id, {})
-                        .get(device_id, {})
-                    )
-                    if not isinstance(stats, dict):
-                        continue
-                    poe_keys = (
-                        "poe_total_w",
-                        "poeTotalW",
-                        "total_used_power",
-                        "totalUsedPower",
-                    )
-                    has_any_total = any(stats.get(k) is not None for k in poe_keys)
-                    has_ports = isinstance(stats.get("poe_ports"), dict)
-                    if not has_any_total and not has_ports:
-                        continue
-
-                # Only create AC power sensors if data is present on the device
-                if description.key in (
-                    "ac_power_consumption",
-                    "ac_power_budget",
-                ):
-                    val = (
-                        description.value_fn(device_data)
-                        if description.value_fn
-                        else None
-                    )
-                    if val is None:
-                        continue
-
-                entities.append(
-                    UnifiInsightsSensor(
-                        coordinator=coordinator,
-                        description=description,
-                        site_id=site_id,
-                        device_id=device_id,
-                    )
-                )
-
-            # Add port sensors for switches with port interfaces
-            # Port data can come from:
-            # 1. device_data["ports"] - merged from legacy port_table by coordinator
-            # 2. device_data["interfaces"]["ports"] - new API format (dict)
-            ports = device_data.get("ports", [])
-            if not ports:
-                interfaces = get_field(device_data, "interfaces", default={})
-                if isinstance(interfaces, dict):
-                    ports = get_field(interfaces, "ports", default=[])
-            if ports:
-                _LOGGER.debug(
-                    "Device %s has %d ports, creating port sensors",
-                    device_name,
-                    len(ports),
-                )
-
-                for port in ports:
-                    port_idx = get_field(port, "idx", "index", "port_idx")
-                    if port_idx is None:
-                        continue
-
-                    # Only create sensors for active ports (state = "UP")
-                    port_state = get_field(port, "state", "status", default="DOWN")
-                    if str(port_state).upper() != "UP":
-                        _LOGGER.debug(
-                            "Skipping port %d on device %s - port state is %s (not UP)",
-                            port_idx,
-                            device_name,
-                            port_state,
-                        )
-                        continue
-
-                    # Determine port label from legacy data
-                    port_label = _get_port_label(port, port_idx)
-                    is_sfp = str(port.get("media", "")).startswith("SFP")
-
-                    # Create PoE power sensor only for ports where a PoE
-                    # device is actually connected and drawing power. Skip
-                    # PoE-capable ports with non-PoE devices attached.
-                    poe_data = get_field(port, "poe", default={})
-                    poe_marker = False
-                    if isinstance(poe_data, dict):
-                        # "good" indicates successful PoE negotiation
-                        if poe_data.get("good"):
-                            poe_marker = True
-                        else:
-                            # Fallback: check actual power draw > 0
-                            for pw_key in ("power", "watts"):
-                                pw = poe_data.get(pw_key)
-                                try:
-                                    if pw is not None and float(pw) > 0:
-                                        poe_marker = True
-                                        break
-                                except ValueError, TypeError:
-                                    pass
-
-                    if not poe_marker:
-                        norm = get_field(port, "poe_power_w")
-                        try:
-                            poe_marker = norm is not None and float(norm) > 0
-                        except ValueError, TypeError:
-                            poe_marker = False
-
-                    if poe_marker:
-                        poe_desc = PORT_SENSOR_TYPES[0]  # PoE power sensor
+        # Add site-level client count sensors
+        clients_by_site = coordinator.data.get("clients", {})
+        if isinstance(clients_by_site, dict):
+            for site_id in clients_by_site:
+                for site_desc in SITE_CLIENT_SENSOR_TYPES:
+                    site_key = (site_id, site_desc.key)
+                    if site_key not in known_sensor_keys:
+                        known_sensor_keys.add(site_key)
                         entities.append(
-                            UnifiPortSensor(
+                            UnifiSiteClientSensor(
                                 coordinator=coordinator,
-                                description=poe_desc,
+                                description=site_desc,
                                 site_id=site_id,
-                                device_id=device_id,
-                                port_idx=port_idx,
-                                port_label=port_label,
                             )
                         )
 
-                    # Create speed sensor for all active ports
-                    speed_desc = PORT_SENSOR_TYPES[1]  # Port speed sensor
-                    entities.append(
-                        UnifiPortSensor(
-                            coordinator=coordinator,
-                            description=speed_desc,
-                            site_id=site_id,
-                            device_id=device_id,
-                            port_idx=port_idx,
-                            port_label=port_label,
-                        )
-                    )
-
-                    # Create TX/RX sensors for all active ports
-                    tx_desc = PORT_SENSOR_TYPES[2]  # TX sensor
-                    rx_desc = PORT_SENSOR_TYPES[3]  # RX sensor
-                    entities.append(
-                        UnifiPortSensor(
-                            coordinator=coordinator,
-                            description=tx_desc,
-                            site_id=site_id,
-                            device_id=device_id,
-                            port_idx=port_idx,
-                            port_label=port_label,
-                        )
-                    )
-                    entities.append(
-                        UnifiPortSensor(
-                            coordinator=coordinator,
-                            description=rx_desc,
-                            site_id=site_id,
-                            device_id=device_id,
-                            port_idx=port_idx,
-                            port_label=port_label,
-                        )
-                    )
-
-                    # Create TX/RX rate sensors for all active ports
-                    tx_rate_desc = PORT_RATE_SENSOR_TYPES[0]
-                    rx_rate_desc = PORT_RATE_SENSOR_TYPES[1]
-                    entities.append(
-                        UnifiPortSensor(
-                            coordinator=coordinator,
-                            description=tx_rate_desc,
-                            site_id=site_id,
-                            device_id=device_id,
-                            port_idx=port_idx,
-                            port_label=port_label,
-                        )
-                    )
-                    entities.append(
-                        UnifiPortSensor(
-                            coordinator=coordinator,
-                            description=rx_rate_desc,
-                            site_id=site_id,
-                            device_id=device_id,
-                            port_idx=port_idx,
-                            port_label=port_label,
-                        )
-                    )
-
-                    # Create SFP module sensors for SFP/SFP+ ports
-                    if is_sfp and port.get("sfp_found"):
-                        entities.extend(
-                            UnifiPortSensor(
-                                coordinator=coordinator,
-                                description=sfp_desc,
-                                site_id=site_id,
-                                device_id=device_id,
-                                port_idx=port_idx,
-                                port_label=port_label,
-                            )
-                            for sfp_desc in SFP_SENSOR_TYPES
-                        )
-
-            # Build set of active (UP) port indices for filtering
-            active_port_indices: set[int] = set()
-            for port in ports:
-                p_idx = get_field(port, "idx", "index", "port_idx")
-                if p_idx is None:
+        # Add per-WiFi-network connected client count sensors
+        wifi_by_site = coordinator.data.get("wifi", {})
+        if isinstance(wifi_by_site, dict):
+            for site_id, wifi_networks in wifi_by_site.items():
+                if not isinstance(wifi_networks, dict):
                     continue
-                p_state = get_field(port, "state", "status", default="DOWN")
-                if str(p_state).upper() == "UP":
-                    active_port_indices.add(int(p_idx))
-
-            # Fallback: create PoE power sensors from stats
-            # when interfaces.ports is unavailable
-            def _create_port_sensors_from_stats(
-                stat_key: str,
-                sensor_descriptions: tuple[UnifiInsightsSensorEntityDescription, ...]
-                | list[UnifiInsightsSensorEntityDescription],
-                port_filter: Callable[[UnifiInsightsSensorEntityDescription], bool],
-                *,
-                _site_id: str = site_id,
-                _device_id: str = device_id,
-                _device_features: list[Any] | set[Any] = device_features,
-                _active_ports: set[int] = active_port_indices,
-            ) -> None:
-                """Create per-port sensors from stats."""
-                if "switching" not in _device_features:
-                    return
-
-                stats = (
-                    coordinator.data.get("stats", {})
-                    .get(_site_id, {})
-                    .get(_device_id, {})
-                )
-                if not isinstance(stats, dict):
-                    return
-
-                per_port_stats = stats.get(stat_key)
-                if not isinstance(per_port_stats, dict) or not per_port_stats:
-                    return
-
-                existing_uids = {getattr(e, "unique_id", None) for e in entities}
-                normalised_ports = {
-                    int(k)
-                    for k in per_port_stats
-                    if isinstance(k, int) or (isinstance(k, str) and k.isdigit())
-                }
-
-                for port_idx_int in normalised_ports:
-                    # Only create sensors for active ports
-                    if _active_ports and port_idx_int not in _active_ports:
+                for wifi_id, wifi_data in wifi_networks.items():
+                    if not isinstance(wifi_data, dict):
                         continue
-
-                    # For PoE stats, skip ports with zero power draw
-                    # (non-PoE device connected to a PoE-capable port)
-                    if stat_key == "poe_ports":
-                        try:
-                            val = per_port_stats.get(port_idx_int)
-                            if val is None:
-                                val = per_port_stats.get(str(port_idx_int))
-                            if val is not None and float(val) <= 0:
-                                continue
-                        except ValueError, TypeError:
-                            pass
-
-                    for desc in sensor_descriptions:
-                        if not port_filter(desc):
-                            continue
-
-                        uid = f"{_device_id}_{desc.key}_{port_idx_int}"
-                        if uid in existing_uids:
-                            continue
-
+                    w_key = (site_id, wifi_id, "wifi_clients")
+                    if w_key not in known_sensor_keys:
+                        known_sensor_keys.add(w_key)
                         entities.append(
-                            UnifiPortSensor(
+                            UnifiWifiClientCountSensor(
                                 coordinator=coordinator,
-                                description=desc,
-                                site_id=_site_id,
-                                device_id=_device_id,
-                                port_idx=port_idx_int,
+                                site_id=site_id,
+                                wifi_id=wifi_id,
                             )
                         )
-                        existing_uids.add(uid)
 
-            # Fallback: create port PoE sensors from stats
-            _create_port_sensors_from_stats(
-                stat_key="poe_ports",
-                sensor_descriptions=[PORT_SENSOR_TYPES[0]],
-                port_filter=lambda _desc: True,
-            )
+        # Add UniFi Protect sensors
+        _discover_protect_sensors(coordinator, known_sensor_keys, entities)
 
-            # Fallback: create port TX/RX sensors from stats
-            _create_port_sensors_from_stats(
-                stat_key="port_bytes",
-                sensor_descriptions=PORT_SENSOR_TYPES,
-                port_filter=lambda desc: desc.key in ("port_tx_bytes", "port_rx_bytes"),
-            )
-            # Add WAN sensors for gateway devices
-            features = get_field(device_data, "features", default={})
-            model = get_field(device_data, "model", default="")
-            if (
-                "switching" in features or "gateway" in features or "router" in features
-            ) and (model.startswith(("UDM", "USG")) or "gateway" in model.lower()):
-                _LOGGER.debug(
-                    "Device %s is a gateway, creating WAN sensors", device_name
-                )
+        if entities:
+            _LOGGER.info("Adding %d UniFi Insights sensors", len(entities))
+            async_add_entities(entities)
+            if not setup_complete:
+                initial_entities.extend(entities)
 
-                entities.extend(
-                    UnifiInsightsSensor(
-                        coordinator=coordinator,
-                        description=description,
-                        site_id=site_id,
-                        device_id=device_id,
-                    )
-                    for description in WAN_SENSOR_TYPES
-                )
-
-            # Add outlet sensors for PDUs and smart power strips with outlet_table
-            outlets = device_data.get("outlet_table", [])
-            if isinstance(outlets, list) and outlets:
-                _LOGGER.debug(
-                    "Device %s has %d outlets, creating outlet sensors",
-                    device_name,
-                    len(outlets),
-                )
-                for outlet in outlets:
-                    if not isinstance(outlet, dict):
-                        continue
-                    idx = outlet.get("index")
-                    if idx is None:
-                        idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
-                    if idx is None:
-                        continue
-                    try:
-                        outlet_idx = int(idx)
-                    except TypeError, ValueError:
-                        continue
-
-                    # Only create metering sensors for outlets that meter
-                    if not _outlet_has_metering(outlet):
-                        _LOGGER.debug(
-                            "Skipping metering sensors for outlet %d on %s (unmetered)",
-                            outlet_idx,
-                            device_name,
-                        )
-                        continue
-
-                    outlet_label = outlet.get("name") or f"Outlet {outlet_idx}"
-                    entities.extend(
-                        UnifiOutletSensor(
-                            coordinator=coordinator,
-                            description=outlet_desc,
-                            site_id=site_id,
-                            device_id=device_id,
-                            outlet_index=outlet_idx,
-                            outlet_name=outlet_label,
-                        )
-                        for outlet_desc in OUTLET_SENSOR_TYPES
-                    )
-
-    # Add site-level client count sensors
-    for site_id in coordinator.data.get("clients", {}):
-        _LOGGER.debug("Creating site-level client count sensors for site %s", site_id)
-        entities.extend(
-            UnifiSiteClientSensor(
-                coordinator=coordinator,
-                description=description,
-                site_id=site_id,
-            )
-            for description in SITE_CLIENT_SENSOR_TYPES
-        )
-
-    # Add per-WiFi-network connected client count sensors
-    for site_id, wifi_networks in coordinator.data.get("wifi", {}).items():
-        for wifi_id, wifi_data in wifi_networks.items():
-            wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
-            _LOGGER.debug(
-                "Creating WiFi client count sensor for %s (%s)", wifi_name, wifi_id
-            )
-            entities.append(
-                UnifiWifiClientCountSensor(
-                    coordinator=coordinator,
-                    site_id=site_id,
-                    wifi_id=wifi_id,
-                )
-            )
-
-    # Add UniFi Protect sensors if API is available
-    if coordinator.protect_client:
-        # Add sensors for UniFi Protect sensors
-        for sensor_id, sensor_data in coordinator.data["protect"]["sensors"].items():
-            sensor_name = sensor_data.get("name", f"Sensor {sensor_id}")
-
-            _LOGGER.debug(
-                "Creating sensors for UniFi Protect sensor %s (%s)",
-                sensor_id,
-                sensor_name,
-            )
-
-            entities.extend(
-                UnifiProtectSensor(
-                    coordinator=coordinator,
-                    description=description,
-                    device_id=sensor_id,
-                )
-                for description in PROTECT_SENSOR_TYPES
-                if description.device_type == DEVICE_TYPE_SENSOR
-                and (
-                    description.capability_fn is None
-                    or description.capability_fn(sensor_data)
-                )
-            )
-
-        # Add sensors for UniFi Protect NVRs
-        for nvr_id, nvr_data in coordinator.data["protect"]["nvrs"].items():
-            nvr_name = nvr_data.get("name", f"NVR {nvr_id}")
-
-            _LOGGER.debug(
-                "Creating sensors for UniFi Protect NVR %s (%s)",
-                nvr_id,
-                nvr_name,
-            )
-
-            # Check if storage information is available
-            # Note: The UniFi Protect Integration API v1 (public API) does not
-            # expose storage information. Storage sensors are only created when
-            # the data is actually available.
-            has_storage = _has_storage_info(nvr_data)
-            if not has_storage:
-                _LOGGER.debug(
-                    "NVR %s: Storage information not available via API, "
-                    "skipping storage sensors",
-                    nvr_name,
-                )
-
-            for nvr_desc in NVR_SENSOR_TYPES:
-                if nvr_desc.device_type == DEVICE_TYPE_NVR:
-                    # Skip storage sensors if storage info is not available
-                    if nvr_desc.key.startswith("storage_") and not has_storage:
-                        continue
-                    entities.append(
-                        UnifiProtectNVRSensor(
-                            coordinator=coordinator,
-                            description=nvr_desc,
-                            device_id=nvr_id,
-                        )
-                    )
-
-    _LOGGER.info("Adding %d UniFi Insights sensors", len(entities))
-    async_add_entities(entities)
+    async_discover_sensors()
+    setup_complete = True
+    config_entry.async_on_unload(coordinator.async_add_listener(async_discover_sensors))
 
     # Clean up stale port entities from previous runs
-    created_uids = {getattr(e, "unique_id", None) for e in entities}
+    created_uids = {getattr(e, "unique_id", None) for e in initial_entities}
     ent_reg = er.async_get(hass)
     stale = [
         entry
@@ -2016,7 +1988,7 @@ class UnifiOutletSensor(UnifiInsightsEntity, SensorEntity):
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except TypeError, ValueError:
+                except (TypeError, ValueError):
                     continue
         return None
 

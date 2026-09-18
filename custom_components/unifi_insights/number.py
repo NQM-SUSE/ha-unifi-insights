@@ -6,6 +6,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.core import callback
 from homeassistant.helpers.entity import EntityCategory
 
 from .const import (
@@ -52,59 +53,104 @@ async def async_setup_entry(
         _LOGGER.debug("Skipping number setup - Protect API not available")
         return
 
-    entities: list[NumberEntity] = []
+    known_number_keys: set[tuple[str, str]] = set()
 
-    # Add camera microphone volume numbers
-    for camera_id, camera_data in coordinator.data["protect"]["cameras"].items():
-        _LOGGER.debug(
-            "Adding microphone volume number for camera %s",
-            camera_data.get("name", camera_id),
-        )
-        entities.append(
-            UnifiProtectMicrophoneVolumeNumber(
-                coordinator=coordinator,
-                camera_id=camera_id,
-            )
-        )
+    @callback
+    def async_discover_numbers() -> None:
+        """Discover and add new number entities."""
+        if (
+            not coordinator.data
+            or not isinstance(coordinator.data, dict)
+            or "protect" not in coordinator.data
+            or not isinstance(coordinator.data["protect"], dict)
+        ):
+            return
 
-    # Add light brightness level numbers
-    for light_id, light_data in coordinator.data["protect"]["lights"].items():
-        _LOGGER.debug(
-            "Adding brightness level number for light %s",
-            light_data.get("name", light_id),
-        )
-        entities.append(
-            UnifiProtectLightLevelNumber(
-                coordinator=coordinator,
-                light_id=light_id,
-            )
-        )
+        protect = coordinator.data["protect"]
+        entities: list[NumberEntity] = []
 
-    # Add chime volume numbers
-    for chime_id, chime_data in coordinator.data["protect"]["chimes"].items():
-        _LOGGER.debug(
-            "Adding volume number for chime %s", chime_data.get("name", chime_id)
-        )
-        entities.append(
-            UnifiProtectChimeVolumeNumber(
-                coordinator=coordinator,
-                chime_id=chime_id,
-            )
-        )
+        # Add camera microphone volume numbers
+        cameras = protect.get("cameras", {})
+        if isinstance(cameras, dict):
+            for camera_id, camera_data in cameras.items():
+                if not isinstance(camera_data, dict):
+                    continue
+                key = (camera_id, "mic_volume")
+                if key in known_number_keys:
+                    continue
+                known_number_keys.add(key)
+                _LOGGER.debug(
+                    "Adding microphone volume number for camera %s",
+                    camera_data.get("name", camera_id),
+                )
+                entities.append(
+                    UnifiProtectMicrophoneVolumeNumber(
+                        coordinator=coordinator,
+                        camera_id=camera_id,
+                    )
+                )
 
-        # Add repeat times number
-        _LOGGER.debug(
-            "Adding repeat times number for chime %s", chime_data.get("name", chime_id)
-        )
-        entities.append(
-            UnifiProtectChimeRepeatTimesNumber(
-                coordinator=coordinator,
-                chime_id=chime_id,
-            )
-        )
+        # Add light brightness level numbers
+        lights = protect.get("lights", {})
+        if isinstance(lights, dict):
+            for light_id, light_data in lights.items():
+                if not isinstance(light_data, dict):
+                    continue
+                key = (light_id, "light_level")
+                if key in known_number_keys:
+                    continue
+                known_number_keys.add(key)
+                _LOGGER.debug(
+                    "Adding brightness level number for light %s",
+                    light_data.get("name", light_id),
+                )
+                entities.append(
+                    UnifiProtectLightLevelNumber(
+                        coordinator=coordinator,
+                        light_id=light_id,
+                    )
+                )
 
-    _LOGGER.info("Adding %d UniFi Protect number entities", len(entities))
-    async_add_entities(entities)
+        # Add chime volume and repeat times numbers
+        chimes = protect.get("chimes", {})
+        if isinstance(chimes, dict):
+            for chime_id, chime_data in chimes.items():
+                if not isinstance(chime_data, dict):
+                    continue
+                vol_key = (chime_id, "chime_volume")
+                if vol_key not in known_number_keys:
+                    known_number_keys.add(vol_key)
+                    _LOGGER.debug(
+                        "Adding volume number for chime %s",
+                        chime_data.get("name", chime_id),
+                    )
+                    entities.append(
+                        UnifiProtectChimeVolumeNumber(
+                            coordinator=coordinator,
+                            chime_id=chime_id,
+                        )
+                    )
+
+                rep_key = (chime_id, "repeat_times")
+                if rep_key not in known_number_keys:
+                    known_number_keys.add(rep_key)
+                    _LOGGER.debug(
+                        "Adding repeat times number for chime %s",
+                        chime_data.get("name", chime_id),
+                    )
+                    entities.append(
+                        UnifiProtectChimeRepeatTimesNumber(
+                            coordinator=coordinator,
+                            chime_id=chime_id,
+                        )
+                    )
+
+        if entities:
+            _LOGGER.info("Adding %d UniFi Protect number entities", len(entities))
+            async_add_entities(entities)
+
+    async_discover_numbers()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_numbers))
 
 
 class UnifiProtectMicrophoneVolumeNumber(UnifiProtectEntity, NumberEntity):

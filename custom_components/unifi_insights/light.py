@@ -10,6 +10,7 @@ from homeassistant.components.light import (
     ColorMode,
     LightEntity,
 )
+from homeassistant.core import callback
 
 from .const import (
     ATTR_LIGHT_DARK,
@@ -52,32 +53,57 @@ async def async_setup_entry(
         _LOGGER.debug("Skipping light setup - Protect API not available")
         return
 
-    entities: list[LightEntity] = []
+    known_light_ids: set[str] = set()
 
-    # Add lights
-    for light_id, light_data in coordinator.data["protect"]["lights"].items():
-        # Skip malformed entries to avoid crashing the entire setup
-        if not isinstance(light_data, dict) or (
-            "name" not in light_data and "id" not in light_data
+    @callback
+    def async_discover_lights() -> None:
+        """Discover and add new lights."""
+        if (
+            not coordinator.data
+            or not isinstance(coordinator.data, dict)
+            or "protect" not in coordinator.data
+            or not isinstance(coordinator.data["protect"], dict)
         ):
-            _LOGGER.warning("Skipping malformed light entry: %s", light_id)
-            continue
-        try:
-            _LOGGER.debug(
-                "Adding light entity for %s", light_data.get("name", light_id)
-            )
-            entities.append(
-                UnifiProtectLight(
+            return
+
+        lights = coordinator.data["protect"].get("lights", {})
+        if not isinstance(lights, dict):
+            return
+
+        new_entities: list[LightEntity] = []
+        for light_id, light_data in lights.items():
+            # Skip malformed entries to avoid crashing
+            if not isinstance(light_data, dict) or (
+                "name" not in light_data and "id" not in light_data
+            ):
+                _LOGGER.warning("Skipping malformed light entry: %s", light_id)
+                continue
+            if light_id in known_light_ids:
+                continue
+            try:
+                _LOGGER.debug(
+                    "Adding light entity for %s", light_data.get("name", light_id)
+                )
+                light = UnifiProtectLight(
                     coordinator=coordinator,
                     light_id=light_id,
                 )
-            )
-        except (KeyError, TypeError, ValueError) as err:
-            _LOGGER.warning("Skipping light %s due to error: %s", light_id, err)
-            continue
+            except (KeyError, TypeError, ValueError) as err:
+                _LOGGER.warning("Skipping light %s due to error: %s", light_id, err)
+                continue
+            else:
+                # Only after construction succeeds, so a light that failed on a
+                # malformed payload is retried on the next coordinator update
+                # instead of being hidden until the entry is reloaded.
+                known_light_ids.add(light_id)
+                new_entities.append(light)
 
-    _LOGGER.info("Adding %d UniFi Protect lights", len(entities))
-    async_add_entities(entities)
+        if new_entities:
+            _LOGGER.info("Adding %d UniFi Protect lights", len(new_entities))
+            async_add_entities(new_entities)
+
+    async_discover_lights()
+    entry.async_on_unload(coordinator.async_add_listener(async_discover_lights))
 
 
 class UnifiProtectLight(UnifiProtectEntity, LightEntity):

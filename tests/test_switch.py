@@ -23,6 +23,7 @@ from custom_components.unifi_insights.const import (
     ATTR_MIC_ENABLED,
     ATTR_PRIVACY_MODE,
     ATTR_STATUS_LIGHT,
+    CONF_CLIENT_CONTROL,
     DEVICE_TYPE_CAMERA,
     DOMAIN,
     VIDEO_MODE_DEFAULT,
@@ -160,6 +161,96 @@ class TestAsyncSetupEntry:
         entities = async_add_entities.call_args[0][0]
         # 3 cameras x 3 switches each = 9 switches
         assert len(entities) == 9
+
+    @pytest.mark.asyncio
+    async def test_setup_entry_top_level_collections_not_dicts_are_skipped(
+        self, hass, mock_coordinator
+    ) -> None:
+        """Malformed (non-dict) top-level collections are skipped without
+        raising, producing no switches for any of them."""
+        mock_coordinator.data["clients"] = "not-a-dict"
+        mock_coordinator.data["wifi"] = "not-a-dict"
+        mock_coordinator.data["firewall_rules"] = "not-a-dict"
+        mock_coordinator.data["policy_based_routes"] = "not-a-dict"
+        mock_coordinator.data["vpn_clients"] = "not-a-dict"
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+        mock_entry.options = {CONF_CLIENT_CONTROL: True}
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+
+        entities = async_add_entities.call_args[0][0]
+        assert entities == []
+
+    @pytest.mark.asyncio
+    async def test_setup_entry_high_fps_dedupe_on_rediscovery(
+        self, hass, mock_coordinator
+    ) -> None:
+        """Re-running discovery for a capable camera does not duplicate the
+        high FPS switch."""
+        mock_coordinator.data["protect"]["cameras"] = {
+            "camera1": {
+                "id": "camera1",
+                "name": "Test Camera",
+                "state": "CONNECTED",
+                "featureFlags": {"hasHighFpsCapability": True},
+            }
+        }
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        entities = async_add_entities.call_args[0][0]
+        high_fps_before = [
+            e for e in entities if isinstance(e, UnifiProtectHighFPSSwitch)
+        ]
+        assert len(high_fps_before) == 1
+
+        # Re-running discovery on unchanged data must not add a duplicate.
+        listener()
+
+        assert async_add_entities.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_setup_entry_client_block_switch_dedupe_on_rediscovery(
+        self, hass, mock_coordinator
+    ) -> None:
+        """Re-running discovery for an unchanged client does not duplicate
+        the block switch."""
+        mock_coordinator.data["clients"]["site1"] = {
+            "client1": {"id": "client1", "mac": "aa:bb:cc:dd:ee:ff", "name": "PC"}
+        }
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+        mock_entry.options = {CONF_CLIENT_CONTROL: True}
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        entities = async_add_entities.call_args[0][0]
+        block_switches_before = [
+            e for e in entities if isinstance(e, UnifiClientBlockSwitch)
+        ]
+        assert len(block_switches_before) == 1
+
+        # Re-running discovery on unchanged data must not add a duplicate.
+        listener()
+
+        assert async_add_entities.call_count == 1
 
 
 class TestUnifiProtectMicrophoneSwitch:
@@ -1019,6 +1110,35 @@ class TestAsyncSetupEntryFirewallRules:
         assert len(firewall_switches) == 2
         assert {entity._rule_id for entity in firewall_switches} == {"rule1", "rule2"}
 
+    @pytest.mark.asyncio
+    async def test_setup_entry_firewall_rules_malformed_record_and_dedupe(
+        self, hass, mock_coordinator
+    ) -> None:
+        """A malformed rule record is skipped, and rediscovery on unchanged
+        data does not duplicate the remaining switches."""
+        mock_coordinator.data["firewall_rules"]["site1"]["bad_rule"] = "not-a-dict"
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        entities = async_add_entities.call_args[0][0]
+        firewall_switches = [
+            entity for entity in entities if isinstance(entity, UnifiFirewallRuleSwitch)
+        ]
+        assert len(firewall_switches) == 2
+        assert all(e._rule_id != "bad_rule" for e in firewall_switches)
+
+        # Re-running discovery on unchanged data must not add duplicates.
+        listener()
+
+        assert async_add_entities.call_count == 1
+
 
 class TestUnifiPolicyBasedRouteSwitch:
     """Tests for policy-based route switches."""
@@ -1583,6 +1703,42 @@ class TestAsyncSetupEntryPolicyBasedRoutes:
         assert len(route_switches) == 2
         assert {entity._route_id for entity in route_switches} == {"route1", "route2"}
 
+    @pytest.mark.asyncio
+    async def test_setup_entry_routes_malformed_site_and_record_and_dedupe(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
+        """Non-dict site collections/route records are skipped, and
+        rediscovery on unchanged data does not duplicate switches."""
+        mock_coordinator.data["policy_based_routes"]["site2"] = "not-a-dict"
+        mock_coordinator.data["policy_based_routes"]["site1"]["bad_route"] = (
+            "not-a-dict"
+        )
+
+        mock_entry = MagicMock()
+        mock_entry.options = {}
+        mock_entry.entry_id = "test_entry_id"
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        entities = async_add_entities.call_args[0][0]
+        route_switches = [
+            entity
+            for entity in entities
+            if isinstance(entity, UnifiPolicyBasedRouteSwitch)
+        ]
+        assert len(route_switches) == 2
+        assert all(e._route_id != "bad_route" for e in route_switches)
+
+        # Re-running discovery on unchanged data must not add duplicates.
+        listener()
+
+        assert async_add_entities.call_count == 1
+
 
 class TestUnifiVpnClientSwitch:
     """Tests for UnifiVpnClientSwitch entity."""
@@ -1914,6 +2070,38 @@ class TestAsyncSetupEntryVpnClients:
         ]
         assert len(vpn_switches) == 2
         assert {entity._client_id for entity in vpn_switches} == {"vpn1", "vpn2"}
+
+    @pytest.mark.asyncio
+    async def test_setup_entry_vpn_clients_malformed_site_and_record_and_dedupe(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
+        """Non-dict site collections/VPN client records are skipped, and
+        rediscovery on unchanged data does not duplicate switches."""
+        mock_coordinator.data["vpn_clients"]["site2"] = "not-a-dict"
+        mock_coordinator.data["vpn_clients"]["site1"]["bad_vpn"] = "not-a-dict"
+
+        mock_entry = MagicMock()
+        mock_entry.options = {}
+        mock_entry.entry_id = "test_entry_id"
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        entities = async_add_entities.call_args[0][0]
+        vpn_switches = [
+            entity for entity in entities if isinstance(entity, UnifiVpnClientSwitch)
+        ]
+        assert len(vpn_switches) == 2
+        assert all(e._client_id != "bad_vpn" for e in vpn_switches)
+
+        # Re-running discovery on unchanged data must not add duplicates.
+        listener()
+
+        assert async_add_entities.call_count == 1
 
 
 class TestUnifiProtectPrivacySwitch:
@@ -3105,6 +3293,42 @@ class TestUnifiOutletSwitch:
         assert len(outlet_switches) == 3
         # Outlets 1 and 2 have cycle_enabled not None; outlet 3 has cycle_enabled None
         assert len(cycle_switches) == 2
+
+    @pytest.mark.asyncio
+    async def test_async_setup_entry_dedupes_outlet_and_cycle_switches(
+        self, mock_coordinator
+    ) -> None:
+        """Re-running discovery on unchanged PDU data does not duplicate
+        outlet or outlet-cycle switches."""
+        mock_entry = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+        entities = []
+
+        def async_add_entities(new_entities):
+            entities.extend(new_entities)
+
+        await async_setup_entry(
+            MagicMock(),
+            mock_entry,
+            async_add_entities,
+        )
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        outlet_before = len([e for e in entities if isinstance(e, UnifiOutletSwitch)])
+        cycle_before = len(
+            [e for e in entities if isinstance(e, UnifiOutletCycleSwitch)]
+        )
+        assert outlet_before == 3
+        assert cycle_before == 2
+
+        listener()
+
+        outlet_after = len([e for e in entities if isinstance(e, UnifiOutletSwitch)])
+        cycle_after = len(
+            [e for e in entities if isinstance(e, UnifiOutletCycleSwitch)]
+        )
+        assert outlet_after == outlet_before
+        assert cycle_after == cycle_before
 
     def test_outlet_switch_properties(self, mock_coordinator) -> None:
         """Test UnifiOutletSwitch properties and unique_id literal."""
