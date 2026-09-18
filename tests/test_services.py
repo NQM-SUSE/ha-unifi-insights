@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.unifi_insights import services
 from custom_components.unifi_insights.services import (
     SERVICE_AUTHORIZE_GUEST,
     SERVICE_PLAY_CHIME_RINGTONE,
@@ -4749,3 +4751,48 @@ async def test_network_device_registry_fallback_for_empty_site(
         "site",
         entry,
     )
+
+
+@pytest.mark.parametrize(
+    ("service", "field", "expected_values", "other_fields"),
+    [
+        ("set_hdr_mode", "mode", ["auto", "on", "off"], {}),
+        (
+            "set_video_mode",
+            "mode",
+            ["default", "highFps", "sport", "slowShutter"],
+            {},
+        ),
+        ("set_light_mode", "mode", ["always", "motion", "off"], {}),
+        ("set_light_level", "level", list(range(101)), {}),
+        ("set_mic_volume", "volume", list(range(101)), {}),
+        ("set_chime_volume", "volume", list(range(101)), {}),
+        ("ptz_move", "preset", list(range(16)), {}),
+        ("ptz_patrol", "slot", list(range(16)), {"action": "start"}),
+    ],
+)
+def test_protect_ui_selectors_match_service_schemas(
+    service: str,
+    field: str,
+    expected_values: list[str | int],
+    other_fields: dict[str, str],
+) -> None:
+    """Every selectable UI value must generate an accepted service payload."""
+    definitions = yaml.safe_load(
+        Path(services.__file__).with_suffix(".yaml").read_text(encoding="utf-8"),
+    )
+    fields = definitions[service]["fields"]
+    selector = fields[field]["selector"]
+    if "select" in selector:
+        values = selector["select"]["options"]
+    else:
+        number = selector["number"]
+        values = list(range(number["min"], number["max"] + 1, number["step"]))
+    assert values == expected_values
+    schema = getattr(services, f"{service.upper()}_SCHEMA")
+    for value in values:
+        payload = {**other_fields, field: value}
+        assert schema(payload)[field] == value
+    if service == "ptz_move":
+        assert fields["preset"]["required"] is True
+        assert "direction" not in fields

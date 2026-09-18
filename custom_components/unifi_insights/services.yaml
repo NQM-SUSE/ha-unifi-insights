@@ -76,14 +76,14 @@ set_hdr_mode:
         text:
     mode:
       name: HDR Mode
-      description: HDR mode (auto, always, never)
+      description: HDR mode (auto, on, off)
       required: true
       selector:
         select:
           options:
             - "auto"
-            - "always"
-            - "never"
+            - "on"
+            - "off"
 
 set_video_mode:
   name: Set Video Mode
@@ -101,14 +101,15 @@ set_video_mode:
         text:
     mode:
       name: Video Mode
-      description: Video mode (high_fps, default, slow)
+      description: Video mode (default, highFps, sport, slowShutter)
       required: true
       selector:
         select:
           options:
-            - "high_fps"
             - "default"
-            - "slow"
+            - "highFps"
+            - "sport"
+            - "slowShutter"
 
 set_mic_volume:
   name: Set Microphone Volume
@@ -136,7 +137,7 @@ set_mic_volume:
 
 ptz_move:
   name: PTZ Move
-  description: Move a PTZ camera in a given direction.
+  description: Move a PTZ camera to a preset.
   target:
     entity:
       integration: unifi_insights
@@ -148,18 +149,15 @@ ptz_move:
       required: false
       selector:
         text:
-    direction:
-      name: Direction
-      description: Movement direction
+    preset:
+      name: Preset
+      description: Preset number (0-15)
       required: true
       selector:
-        select:
-          options:
-            - "up"
-            - "down"
-            - "left"
-            - "right"
-            - "home"
+        number:
+          min: 0
+          max: 15
+          step: 1
 
 ptz_patrol:
   name: PTZ Patrol
@@ -191,7 +189,7 @@ ptz_patrol:
       selector:
         number:
           min: 0
-          max: 10
+          max: 15
           step: 1
 
 # UniFi Protect Light services
@@ -211,14 +209,14 @@ set_light_mode:
         text:
     mode:
       name: Mode
-      description: Light mode (motion, when_dark, manual)
+      description: Light mode (always, motion, off)
       required: true
       selector:
         select:
           options:
+            - "always"
             - "motion"
-            - "when_dark"
-            - "manual"
+            - "off"
 
 set_light_level:
   name: Set Light Level
@@ -236,12 +234,12 @@ set_light_level:
         text:
     level:
       name: Brightness Level
-      description: Brightness level (1-6)
+      description: Brightness level (0-100)
       required: true
       selector:
         number:
-          min: 1
-          max: 6
+          min: 0
+          max: 100
           step: 1
 
 # UniFi Protect Chime services
@@ -273,8 +271,10 @@ set_chime_volume:
       name: Camera ID
       description: >-
         Optional camera ID, used only to validate that the camera belongs to
-        the same console as the resolved chime; a mismatch is logged but does
-        not change which console is used. This integration applies the volume
+        the same console as the resolved chime. A camera known to belong to
+        another console causes validation to fail and the action is rejected.
+        Cameras absent from cached Protect data are allowed when no other
+        console ownership is known. This integration applies the volume
         chime-wide.
       required: false
       example: "60e9c8c0e3e4b8001a123456"
@@ -345,8 +345,10 @@ set_chime_ringtone:
       name: Camera ID
       description: >-
         Optional camera ID, used only to validate that the camera belongs to
-        the same console as the resolved chime; a mismatch is logged but does
-        not change which console is used. This integration applies the ringtone
+        the same console as the resolved chime. A camera known to belong to
+        another console causes validation to fail and the action is rejected.
+        Cameras absent from cached Protect data are allowed when no other
+        console ownership is known. This integration applies the ringtone
         chime-wide.
       required: false
       example: "60e9c8c0e3e4b8001a123456"
@@ -381,8 +383,10 @@ set_chime_repeat_times:
       name: Camera ID
       description: >-
         Optional camera ID, used only to validate that the camera belongs to
-        the same console as the resolved chime; a mismatch is logged but does
-        not change which console is used. This integration applies the repeat
+        the same console as the resolved chime. A camera known to belong to
+        another console causes validation to fail and the action is rejected.
+        Cameras absent from cached Protect data are allowed when no other
+        console ownership is known. This integration applies the repeat
         count chime-wide.
       required: false
       example: "60e9c8c0e3e4b8001a123456"
