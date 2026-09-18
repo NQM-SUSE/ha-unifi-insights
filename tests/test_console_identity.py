@@ -1186,3 +1186,571 @@ async def test_console_identity_final_branch_coverage(
         )
         assert result["type"] == FlowResultType.FORM
         assert result["errors"].get(CONF_CONSOLE_ID) == "invalid_console_id"
+
+
+async def test_async_setup_entry_handles_malformed_coordinator_data(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """Malformed nvrs/devices payloads fall back to the site id, not a crash.
+
+    Covers the defensive isinstance() guards around the NVR and device walk:
+    a non-empty ``nvrs`` dict whose first value isn't itself a dict, and a
+    ``devices`` value that isn't a dict at all.
+    """
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Insights (Local)",
+        unique_id="local_api_key_malformed",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.50",
+            CONF_API_KEY: "local_api_key_malformed",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_protect_refresh(coord_self):
+        coord_self.data = {"nvrs": {"nvr_1": "not-a-dict"}}
+
+    async def fake_device_refresh(coord_self):
+        coord_self.data = {"devices": "not-a-dict"}
+
+    async def fake_config_sites(coord_self):
+        coord_self.data = {"sites": {"site_xyz": {"id": "site_xyz"}}}
+
+    with (
+        patch(
+            "custom_components.unifi_insights.async_probe_network",
+            new_callable=AsyncMock,
+        ) as mock_probe_net,
+        patch(
+            "custom_components.unifi_insights.async_probe_protect",
+            new_callable=AsyncMock,
+        ) as mock_probe_prot,
+        patch(
+            "custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh",
+            autospec=True,
+            side_effect=fake_config_sites,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh",
+            autospec=True,
+            side_effect=fake_device_refresh,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiProtectCoordinator.async_config_entry_first_refresh",
+            autospec=True,
+            side_effect=fake_protect_refresh,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiProtectCoordinator.async_start_websocket",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        mock_probe_net.return_value = ProbeResult(
+            ProbeStatus.AVAILABLE, [MagicMock(id="site_xyz")]
+        )
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.AVAILABLE)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        # Neither the NVR nor the device payload yielded a usable mac, so
+        # identity falls back to the config coordinator's site id.
+        assert entry.data.get(CONF_CONSOLE_ID) == "site_xyz"
+        assert entry.unique_id == "site_xyz"
+        await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_async_setup_entry_keeps_preset_console_name_from_nvr(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """An already-known console name is not clobbered by the NVR's name."""
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi - Preset Name",
+        unique_id="local_api_key_preset_name",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.51",
+            CONF_API_KEY: "local_api_key_preset_name",
+            CONF_VERIFY_SSL: False,
+            CONF_CONSOLE_NAME: "Preset Name",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_protect_refresh(coord_self):
+        coord_self.data = {
+            "nvrs": {
+                "nvr_1": {
+                    "mac": "aa:bb:cc:dd:ee:22",
+                    "name": "NVR Reported Name",
+                }
+            }
+        }
+
+    with (
+        patch(
+            "custom_components.unifi_insights.async_probe_network",
+            new_callable=AsyncMock,
+        ) as mock_probe_net,
+        patch(
+            "custom_components.unifi_insights.async_probe_protect",
+            new_callable=AsyncMock,
+        ) as mock_probe_prot,
+        patch(
+            "custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiProtectCoordinator.async_config_entry_first_refresh",
+            autospec=True,
+            side_effect=fake_protect_refresh,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiProtectCoordinator.async_start_websocket",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        mock_probe_net.return_value = ProbeResult(
+            ProbeStatus.AVAILABLE, [MagicMock(id="default")]
+        )
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.AVAILABLE)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        # The mac is still adopted for identity...
+        assert entry.data.get(CONF_CONSOLE_ID) == "aa:bb:cc:dd:ee:22"
+        # ...but the pre-existing console name is left alone.
+        assert entry.data.get(CONF_CONSOLE_NAME) == "Preset Name"
+        await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_async_setup_entry_keeps_preset_console_name_from_device(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """An already-known console name is not clobbered by a discovered gateway's name."""
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi - Preset Device Name",
+        unique_id="local_api_key_preset_device",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.52",
+            CONF_API_KEY: "local_api_key_preset_device",
+            CONF_VERIFY_SSL: False,
+            CONF_CONSOLE_NAME: "Preset Device Name",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_device_refresh(coord_self):
+        coord_self.data = {
+            "devices": {
+                "site_alpha": {
+                    "gw_1": {
+                        "is_gateway": True,
+                        "macAddress": "33-44-55-66-77-88",
+                        "name": "Reported Gateway Name",
+                    }
+                }
+            }
+        }
+
+    with (
+        patch(
+            "custom_components.unifi_insights.async_probe_network",
+            new_callable=AsyncMock,
+        ) as mock_probe_net,
+        patch(
+            "custom_components.unifi_insights.async_probe_protect",
+            new_callable=AsyncMock,
+        ) as mock_probe_prot,
+        patch(
+            "custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh",
+            autospec=True,
+            side_effect=fake_device_refresh,
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        mock_probe_net.return_value = ProbeResult(
+            ProbeStatus.AVAILABLE, [MagicMock(id="site_alpha")]
+        )
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        assert entry.data.get(CONF_CONSOLE_ID) == "33:44:55:66:77:88"
+        assert entry.data.get(CONF_CONSOLE_NAME) == "Preset Device Name"
+        await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_async_setup_entry_leaves_unstable_console_id_when_no_mac_found(
+    hass: HomeAssistant,
+    enable_custom_integrations,
+) -> None:
+    """A console_id that is still the API key is left untouched if no mac is found.
+
+    The fallback to site id/host only fires when console_id was completely
+    unset - an api-key-shaped console_id from an old schema is left as-is
+    rather than being silently replaced, since it is still a better-than-
+    nothing identity that a future refresh may yet resolve to a real mac.
+    """
+    from custom_components.unifi_insights import async_setup_entry
+    from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="local_api_key_unstable",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.53",
+            CONF_API_KEY: "local_api_key_unstable",
+            CONF_VERIFY_SSL: False,
+            CONF_CONSOLE_ID: "local_api_key_unstable",
+        },
+    )
+    entry.add_to_hass(hass)
+
+    async def fake_device_refresh(coord_self):
+        coord_self.data = {"devices": {}}
+
+    with (
+        patch(
+            "custom_components.unifi_insights.async_probe_network",
+            new_callable=AsyncMock,
+        ) as mock_probe_net,
+        patch(
+            "custom_components.unifi_insights.async_probe_protect",
+            new_callable=AsyncMock,
+        ) as mock_probe_prot,
+        patch(
+            "custom_components.unifi_insights.UnifiConfigCoordinator.async_config_entry_first_refresh",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "custom_components.unifi_insights.UnifiDeviceCoordinator.async_config_entry_first_refresh",
+            autospec=True,
+            side_effect=fake_device_refresh,
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        mock_probe_net.return_value = ProbeResult(
+            ProbeStatus.AVAILABLE, [MagicMock(id="default")]
+        )
+        mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
+
+        entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+        res = await async_setup_entry(hass, entry)
+        assert res is True
+        assert entry.data.get(CONF_CONSOLE_ID) == "local_api_key_unstable"
+        assert entry.unique_id == "local_api_key_unstable"
+        await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_migration_skips_v1_block_below_version_one(
+    hass: HomeAssistant,
+) -> None:
+    """A config entry below version 1 (defensive) is left untouched but still succeeds."""
+    entry_v0 = MockConfigEntry(
+        domain=DOMAIN,
+        version=0,
+        minor_version=0,
+        unique_id="some_unique_id",
+        data={CONF_API_KEY: "some_key"},
+    )
+    entry_v0.add_to_hass(hass)
+
+    migrated = await async_migrate_entry(hass, entry_v0)
+    assert migrated is True
+    # The version==1 migration block never ran: nothing was touched.
+    assert entry_v0.version == 0
+    assert entry_v0.unique_id == "some_unique_id"
+    assert dict(entry_v0.data) == {CONF_API_KEY: "some_key"}
+
+
+async def test_local_flow_device_scan_skips_non_console_and_captures_name(
+    hass: HomeAssistant,
+) -> None:
+    """The device scan skips non-console hardware and records a console's name.
+
+    Exercises the loop-continue branch when a device's type/model doesn't
+    match any console token, and the case where a matched console exposes
+    a name but no usable mac - identity then falls back to the site id,
+    matching the device-scan-then-site-id fallback order.
+    """
+    dev_switch = MagicMock()
+    dev_switch.type = None
+    dev_switch.model = "USW Pro Max 24"
+    dev_switch.mac = None
+    dev_switch.macAddress = None
+    dev_switch.name = "Switch 1"
+
+    dev_console = MagicMock()
+    dev_console.type = None
+    dev_console.model = "UniFi Dream Machine PRO SE"
+    dev_console.mac = None
+    dev_console.macAddress = None
+    dev_console.name = "Crestwood"
+
+    net_cm, _ = _make_mock_client(
+        sites=[MagicMock(id="site_gamma", name="Gamma Site")],
+        devices=[dev_switch, dev_console],
+    )
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.60",
+                CONF_API_KEY: "key_device_scan",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+        assert result["type"] == FlowResultType.CREATE_ENTRY
+        # The switch was skipped; the Dream Machine matched by model but
+        # exposed no mac, so identity falls back to the site id.
+        assert result["result"].unique_id == "site_gamma"
+        assert result["data"].get(CONF_CONSOLE_ID) is None
+
+
+async def test_local_flow_protect_probe_without_nvr_attribute(
+    hass: HomeAssistant,
+) -> None:
+    """Protect clients that expose no nvr sub-client skip NVR inspection cleanly."""
+    from custom_components.unifi_insights.api import UniFiResponseError
+
+    net_cm_err, net_client_err = _make_mock_client()
+    net_client_err.sites.get_all = AsyncMock(
+        side_effect=UniFiResponseError("Not Found", status_code=404)
+    )
+
+    class _NvrlessProtectClient:
+        """A Protect client shape that exposes no nvr sub-client at all."""
+
+        def __init__(self) -> None:
+            self.cameras = MagicMock()
+            self.cameras.get_all = AsyncMock(return_value=[MagicMock()])
+            self.close = AsyncMock()
+
+    protect_client = _NvrlessProtectClient()
+    protect_cm = MagicMock()
+    protect_cm.__aenter__ = AsyncMock(return_value=protect_client)
+    protect_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm_err,
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=protect_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.61",
+                CONF_API_KEY: "key_nvrless",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+        assert result["type"] == FlowResultType.CREATE_ENTRY
+        # Falls back to the host-based id since there's no nvr sub-client
+        # to inspect for a mac.
+        assert result["result"].unique_id == "https://192.168.1.61"
+        assert result["data"].get(CONF_CONSOLE_ID) is None
+
+
+async def test_local_flow_protect_probe_nvr_returns_none(
+    hass: HomeAssistant,
+) -> None:
+    """An available Protect API with cameras but no NVR record keeps the host-based id."""
+    from custom_components.unifi_insights.api import UniFiResponseError
+
+    net_cm_err, net_client_err = _make_mock_client()
+    net_client_err.sites.get_all = AsyncMock(
+        side_effect=UniFiResponseError("Not Found", status_code=404)
+    )
+
+    protect_client = MagicMock()
+    protect_client.cameras.get_all = AsyncMock(return_value=[MagicMock()])
+    protect_client.nvr.get = AsyncMock(return_value=None)
+    protect_cm = MagicMock()
+    protect_cm.__aenter__ = AsyncMock(return_value=protect_client)
+    protect_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm_err,
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=protect_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "https://192.168.1.62",
+                CONF_API_KEY: "key_nvr_none",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+        assert result["type"] == FlowResultType.CREATE_ENTRY
+        assert result["result"].unique_id == "https://192.168.1.62"
+        assert result["data"].get(CONF_CONSOLE_ID) is None
+
+
+async def test_local_reconfigure_with_blank_host_yields_no_console_id(
+    hass: HomeAssistant,
+) -> None:
+    """Reconfiguring to a host that normalizes to "" stores no console_id key.
+
+    A host that resolves to a falsy id means `_async_validate_local_connection`
+    never populated `console_info["id"]` with anything usable; the reconfigure
+    step must not write an empty CONF_CONSOLE_ID into the entry.
+    """
+    from custom_components.unifi_insights.api import UniFiResponseError
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="existing_console_id_777",
+        title="UniFi - Existing Console",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.70",
+            CONF_API_KEY: "existing_key",
+            CONF_CONSOLE_ID: "existing_console_id_777",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    net_cm_err, net_client_err = _make_mock_client()
+    net_client_err.sites.get_all = AsyncMock(
+        side_effect=UniFiResponseError("Not Found", status_code=404)
+    )
+    protect_client = MagicMock()
+    protect_client.cameras.get_all = AsyncMock(return_value=[MagicMock()])
+    protect_client.nvr.get = AsyncMock(return_value=None)
+    protect_cm = MagicMock()
+    protect_cm.__aenter__ = AsyncMock(return_value=protect_client)
+    protect_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm_err,
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=protect_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        assert result["step_id"] == "reconfigure"
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "",
+                CONF_API_KEY: "existing_key",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+
+        assert result["type"] == FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        # The unique_id (the real dedup identity) is preserved even though
+        # the id could not be re-derived from this host.
+        assert entry.unique_id == "existing_console_id_777"
+        assert entry.data.get(CONF_CONSOLE_ID) is None
