@@ -49,6 +49,7 @@ from custom_components.unifi_insights.coordinators.protect import (
     STALE_EVENT_TIMEOUT,
     UnifiProtectCoordinator,
 )
+from custom_components.unifi_insights.entity import is_device_online
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -1167,7 +1168,8 @@ class TestUnifiDeviceCoordinator:
             nonlocal clients_call_count
             clients_call_count += 1
             if clients_call_count == 1:
-                raise UniFiResponseError("Service Unavailable", status_code=503)
+                msg = "Service Unavailable"
+                raise UniFiResponseError(msg, status_code=503)
             return [
                 _create_mock_model(
                     {"id": "client1", "name": "Retried Client", "type": "WIRED"}
@@ -1190,6 +1192,10 @@ class TestUnifiDeviceCoordinator:
         legacy_device = devices_dict["60a1b2c3d4e5f67890123456"]
         assert legacy_device["name"] == "Legacy Switch"
         assert legacy_device["macAddress"] == "AA:BB:CC:DD:EE:FF"
+        # Legacy "up": True is mapped to a v1-style string state that
+        # is_device_online() can read.
+        assert legacy_device["state"] == "ONLINE"
+        assert is_device_online(legacy_device)
         # port_table is normalized into the v1-shaped ports list
         assert legacy_device["ports"][0]["idx"] == 1
 
@@ -1205,6 +1211,34 @@ class TestUnifiDeviceCoordinator:
         assert stats_dict["60a1b2c3d4e5f67890123456"]["id"] == (
             "60a1b2c3d4e5f67890123456"
         )
+
+    @pytest.mark.asyncio
+    async def test_legacy_device_to_v1_dict_up_state_mapping(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Legacy bool ``up`` maps to a string ``state`` is_device_online reads."""
+        online = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "mac": "AA:BB:CC:DD:EE:FF", "up": True}
+        )
+        offline = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "mac": "AA:BB:CC:DD:EE:FF", "up": False}
+        )
+        assert online["state"] == "ONLINE"
+        assert is_device_online(online)
+        assert offline["state"] == "OFFLINE"
+        assert not is_device_online(offline)
+
+        # An existing usable string state is preserved, and a non-string
+        # legacy ``state`` (0/1) does not block the conversion.
+        preserved = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "up": True, "state": "ONLINE"}
+        )
+        assert preserved["state"] == "ONLINE"
+        int_state = coordinator._legacy_device_to_v1_dict(
+            {"_id": "abc123", "up": True, "state": 1}
+        )
+        assert int_state["state"] == "ONLINE"
+        assert is_device_online(int_state)
 
     @pytest.mark.asyncio
     async def test_process_site_5xx_fallback_legacy_failure_raises(

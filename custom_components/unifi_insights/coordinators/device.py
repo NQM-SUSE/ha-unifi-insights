@@ -217,6 +217,13 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             if legacy_key in legacy and v1_key not in mapped:
                 mapped[v1_key] = legacy[legacy_key]
 
+        # Legacy "up" (bool) is what ``is_device_online()`` actually needs: it
+        # reads ``state``/``status`` as a string and accepts ONLINE/CONNECTED/UP.
+        # The legacy numeric ``state`` (0/1) is not a string, so it would read
+        # as offline. Only fill the gap when no usable string state exists.
+        if "up" in legacy and not isinstance(mapped.get("state"), str):
+            mapped["state"] = "ONLINE" if legacy["up"] else "OFFLINE"
+
         # Normalize port_table into ports for the sensor pipeline.
         # The sensor pipeline reads device_data["ports"] and falls back to
         # interfaces["ports"]; it does not consume port_table directly.
