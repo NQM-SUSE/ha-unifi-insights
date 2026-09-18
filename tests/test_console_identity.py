@@ -749,7 +749,7 @@ async def test_async_setup_entry_discovers_console_identity_from_nvr(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="default")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="default")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.AVAILABLE)
 
@@ -821,7 +821,7 @@ async def test_async_setup_entry_discovers_console_identity_from_device_gateway(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="site_alpha")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="site_alpha")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
 
@@ -912,7 +912,7 @@ async def test_console_identity_extra_coverage_branches(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="my_custom_site")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="my_custom_site")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
 
@@ -1045,7 +1045,6 @@ async def test_console_identity_final_branch_coverage(
     from custom_components.unifi_insights.coordinators.protect import (
         UnifiProtectCoordinator,
     )
-    from custom_components.unifi_insights.api import UniFiAuthenticationError
 
     # 1. Protect coordinator _start_sensor_reconcile_timer when timer already active
     entry = MockConfigEntry(domain=DOMAIN, data={})
@@ -1257,7 +1256,7 @@ async def test_async_setup_entry_handles_malformed_coordinator_data(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="site_xyz")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="site_xyz")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.AVAILABLE)
 
@@ -1335,7 +1334,7 @@ async def test_async_setup_entry_keeps_preset_console_name_from_nvr(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="default")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="default")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.AVAILABLE)
 
@@ -1408,7 +1407,7 @@ async def test_async_setup_entry_keeps_preset_console_name_from_device(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="site_alpha")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="site_alpha")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
 
@@ -1474,7 +1473,7 @@ async def test_async_setup_entry_leaves_unstable_console_id_when_no_mac_found(
         ),
     ):
         mock_probe_net.return_value = ProbeResult(
-            ProbeStatus.AVAILABLE, [MagicMock(id="default")]
+            ProbeStatus.AVAILABLE, sites=[MagicMock(id="default")]
         )
         mock_probe_prot.return_value = ProbeResult(ProbeStatus.UNSUPPORTED)
 
