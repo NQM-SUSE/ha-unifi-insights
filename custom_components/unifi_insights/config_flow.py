@@ -47,6 +47,7 @@ from .const import (
     CONF_TRACK_WIRED_CLIENTS,
     CONNECTION_TYPE_LOCAL,
     CONNECTION_TYPE_REMOTE,
+    CONSOLE_DEVICE_TOKENS,
     DEFAULT_API_HOST,
     DEFAULT_CLIENT_CONTROL,
     DEFAULT_TRACK_CLIENTS,
@@ -201,19 +202,28 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         console_info: dict[str, str] = {}
 
         # 1. Probe Network API
-        async def _probe_network_and_extract(network_client: UniFiNetworkClient) -> ProbeResult:
+        async def _probe_network_and_extract(
+            network_client: UniFiNetworkClient,
+        ) -> ProbeResult:
             res = await async_probe_network(network_client)
             if res.status is ProbeStatus.AVAILABLE and res.sites:
                 try:
                     first_site_id = getattr(res.sites[0], "id", "default")
-                    devices = await network_client.devices.get_all(site_id=first_site_id)
+                    devices = await network_client.devices.get_all(
+                        site_id=first_site_id
+                    )
                     for dev in devices:
-                        dev_type = getattr(dev, "type", "")
-                        if type(dev_type) is str and any(
-                            x in dev_type.lower()
-                            for x in ("udm", "ucg", "uxg", "ugw", "gateway", "uck")
-                        ):
-                            mac = getattr(dev, "mac", None)
+                        # `type` is unset on every device this API returns, so
+                        # `model` is what actually identifies the hardware.
+                        haystack = " ".join(
+                            value
+                            for key in ("type", "model")
+                            if type(value := getattr(dev, key, "")) is str
+                        ).lower()
+                        if any(x in haystack for x in CONSOLE_DEVICE_TOKENS):
+                            mac = getattr(dev, "mac", None) or getattr(
+                                dev, "macAddress", None
+                            )
                             if type(mac) is str:
                                 console_info["id"] = mac.lower().replace("-", ":")
                                 console_info["mac"] = console_info["id"]
@@ -222,7 +232,9 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                                 console_info["name"] = name
                             break
                 except Exception:
-                    _LOGGER.debug("Could not inspect local network devices", exc_info=True)
+                    _LOGGER.debug(
+                        "Could not inspect local network devices", exc_info=True
+                    )
 
                 if "id" not in console_info:
                     site_id = getattr(res.sites[0], "id", None)
@@ -248,13 +260,16 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
             return True, None, console_info
 
         # 2. Probe Protect API
-        async def _probe_protect_and_extract(protect_client: UniFiProtectClient) -> ProbeResult:
+        async def _probe_protect_and_extract(
+            protect_client: UniFiProtectClient,
+        ) -> ProbeResult:
             res = await async_probe_protect(protect_client)
             if res.status is ProbeStatus.AVAILABLE:
                 console_info["id"] = host.lower()
                 console_info["name"] = "UniFi Protect"
-                if hasattr(protect_client, "nvr") and hasattr(protect_client.nvr, "get"):
-                    import inspect
+                if hasattr(protect_client, "nvr") and hasattr(
+                    protect_client.nvr, "get"
+                ):
                     nvr_call = protect_client.nvr.get()
                     if inspect.isawaitable(nvr_call):
                         try:
@@ -262,13 +277,19 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                             if nvr:
                                 nvr_mac = getattr(nvr, "mac", None)
                                 if type(nvr_mac) is str:
-                                    console_info["id"] = nvr_mac.lower().replace("-", ":")
+                                    console_info["id"] = nvr_mac.lower().replace(
+                                        "-", ":"
+                                    )
                                     console_info["mac"] = console_info["id"]
-                                nvr_name = getattr(nvr, "name", None) or getattr(nvr, "display_name", None)
+                                nvr_name = getattr(nvr, "name", None) or getattr(
+                                    nvr, "display_name", None
+                                )
                                 if type(nvr_name) is str:
                                     console_info["name"] = nvr_name
                         except Exception:
-                            _LOGGER.debug("Could not inspect protect NVR", exc_info=True)
+                            _LOGGER.debug(
+                                "Could not inspect protect NVR", exc_info=True
+                            )
             return res
 
         protect = await async_probe_with_client(

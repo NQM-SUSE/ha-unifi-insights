@@ -12,7 +12,7 @@ Verifies:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,7 +21,11 @@ from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.unifi_insights import async_migrate_entry
+from custom_components.unifi_insights import (
+    _first_site_id,
+    _is_console_device,
+    async_migrate_entry,
+)
 from custom_components.unifi_insights.const import (
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
@@ -588,3 +592,54 @@ async def test_reconfigure_local_account_mismatch(
         )
         assert result["type"] == FlowResultType.ABORT
         assert result["reason"] == "account_mismatch"
+
+
+class TestConsoleDeviceDetection:
+    """Identify the console among the Network devices.
+
+    Pinned to the shape the API actually returns: every device carries a
+    `model` and leaves `type` unset, so matching on `type` alone never fires
+    and the console identity silently degrades to the host address - the
+    exact coupling this separation exists to remove.
+    """
+
+    # Verbatim from a live console's device list.
+    LIVE_DEVICES: ClassVar[list[dict[str, Any]]] = [
+        {"name": "USP PDU Pro", "model": "USP PDU Pro", "type": None},
+        {"name": "Switch Pro Max 24", "model": "USW Pro Max 24", "type": None},
+        {"name": "USW Flex 2.5G 5", "model": "USW Flex 2.5G 5", "type": None},
+        {"name": "USW-Lite-8-PoE", "model": "USW-Lite-8-PoE", "type": None},
+        {"name": "U7 Pro XGS", "model": "U7 Pro XGS", "type": None},
+        {
+            "name": "Crestwood",
+            "model": "UniFi Dream Machine PRO SE",
+            "type": None,
+            "macAddress": "AA:BB:CC:DD:EE:FF",
+        },
+    ]
+
+    def test_console_found_by_model_when_type_is_unset(self):
+        """The Dream Machine is the console; the switches and AP are not."""
+        consoles = [d for d in self.LIVE_DEVICES if _is_console_device(d)]
+
+        assert [d["name"] for d in consoles] == ["Crestwood"]
+
+    def test_is_gateway_flag_still_wins(self):
+        """A device that declares itself a gateway needs no model match."""
+        assert _is_console_device({"model": "Mystery Box", "is_gateway": True})
+
+    def test_plain_switch_is_not_a_console(self):
+        assert not _is_console_device({"model": "USW Pro Max 24", "type": None})
+
+    def test_first_site_id_skips_the_default_placeholder(self):
+        """A real site id is a stable identity; "default" is not."""
+        coordinator = MagicMock()
+        coordinator.data = {"sites": {"default": {}, "88f7af54-98f8": {}}}
+
+        assert _first_site_id(coordinator) == "88f7af54-98f8"
+
+    def test_first_site_id_handles_unloaded_coordinator(self):
+        coordinator = MagicMock()
+        coordinator.data = None
+
+        assert _first_site_id(coordinator) is None

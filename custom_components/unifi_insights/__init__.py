@@ -27,6 +27,7 @@ from .const import (
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
     CONNECTION_TYPE_LOCAL,
+    CONSOLE_DEVICE_TOKENS,
     DEFAULT_API_HOST,
     DOMAIN,
 )
@@ -227,6 +228,30 @@ def _raise_for_setup_probes(
     raise ConfigEntryAuthFailed(msg)
 
 
+def _is_console_device(dev_data: dict[str, Any]) -> bool:
+    """Whether a Network device is the console itself (a gateway or Cloud Key)."""
+    if dev_data.get("is_gateway"):
+        return True
+    haystack = " ".join(
+        str(dev_data.get(key) or "") for key in ("type", "model")
+    ).lower()
+    return any(token in haystack for token in CONSOLE_DEVICE_TOKENS)
+
+
+def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
+    """Return a stable site id to identify a console that exposes no gateway."""
+    data = getattr(config_coordinator, "data", None)
+    if not isinstance(data, dict):
+        return None
+    sites = data.get("sites")
+    if not isinstance(sites, dict):
+        return None
+    for site_id in sites:
+        if isinstance(site_id, str) and site_id and site_id != "default":
+            return site_id
+    return None
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: UnifiInsightsConfigEntry
 ) -> bool:
@@ -403,15 +428,7 @@ async def async_setup_entry(
                 for dev_data in site_devices.values():
                     if not isinstance(dev_data, dict):
                         continue
-                    dev_type = str(dev_data.get("type", "")).lower()
-                    if dev_type in (
-                        "udm",
-                        "udm-pro",
-                        "uck",
-                        "ucg",
-                        "uxg",
-                        "ugw",
-                    ) or dev_data.get("is_gateway"):
+                    if _is_console_device(dev_data):
                         console_mac = dev_data.get("macAddress") or dev_data.get("mac")
                         if not console_name:
                             console_name = dev_data.get("name") or dev_data.get("model")
@@ -423,7 +440,14 @@ async def async_setup_entry(
         if console_mac:
             console_id = console_mac.lower().replace("-", ":")
         elif not console_id:
-            console_id = entry.data.get(CONF_HOST, "local").lower()
+            # The host is an address, not an identity: it changes on a DHCP
+            # renew, which is the problem this separation exists to fix. Fall
+            # back to the site id first and keep the host as a last resort,
+            # matching the order the config flow already uses.
+            console_id = (
+                _first_site_id(config_coordinator)
+                or entry.data.get(CONF_HOST, "local").lower()
+            )
 
     updates: dict[str, Any] = {}
     new_data = dict(entry.data)

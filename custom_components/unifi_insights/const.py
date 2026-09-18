@@ -11,6 +11,25 @@ MANUFACTURER: Final = "Ubiquiti Inc."
 CONF_CONNECTION_TYPE: Final = "connection_type"
 CONF_CONSOLE_ID: Final = "console_id"
 CONF_CONSOLE_NAME: Final = "console_name"
+# Substrings that identify the console itself (gateway or Cloud Key) among the
+# Network devices, so its MAC can be used as the console's stable identity.
+# Matched against both `type` and `model`: this API leaves `type` unset on
+# every device, so `model` ("UniFi Dream Machine PRO SE") is what actually
+# identifies the hardware.
+CONSOLE_DEVICE_TOKENS: Final = (
+    "udm",
+    "ucg",
+    "uck",
+    "udr",
+    "udw",
+    "ugw",
+    "uxg",
+    "cloud key",
+    "dream machine",
+    "dream router",
+    "dream wall",
+    "gateway",
+)
 CONNECTION_TYPE_LOCAL: Final = "local"
 CONNECTION_TYPE_REMOTE: Final = "remote"
 
