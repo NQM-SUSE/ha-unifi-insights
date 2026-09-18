@@ -25,14 +25,21 @@ from custom_components.unifi_insights.coordinators.facade import (
 from custom_components.unifi_insights.services import (
     SERVICE_REFRESH_DATA,
     SERVICE_RESTART_DEVICE,
+    _client_records_match,
     _coord_data,
+    _coord_section,
     _entry_has_client,
     _entry_has_device,
     _entry_has_site,
+    _entry_owns_client,
+    _entry_owns_device,
     _get_coordinator_for_network_resource,
     _get_coordinator_for_protect_resource,
     _get_coordinators,
+    _mac_key,
     _protect_entry_has_resource,
+    _protect_owns_resource,
+    _select_console,
     async_setup_services,
     async_unload_services,
 )
@@ -3058,3 +3065,326 @@ class TestClientMacRouting:
         coord2.async_authorize_guest.assert_called_once()
         coord1.async_authorize_guest.assert_not_called()
         await async_unload_services(hass)
+
+
+class TestConsoleRoutingEdgeCases:
+    """Additional unit tests covering edge cases in console routing helpers."""
+
+    def test_coord_data_and_section_edge_cases(self):
+        """Test _coord_data and _coord_section edge cases."""
+        assert _coord_data(None) is None
+
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _coord_data(entry) is None
+        assert _coord_section(entry, "devices") is None
+
+        entry.runtime_data = MagicMock(coordinator=None)
+        assert _coord_data(entry) is None
+
+        entry.runtime_data.coordinator = MagicMock(data="not-a-dict")
+        assert _coord_data(entry) is None
+
+        entry.runtime_data.coordinator.data = {"devices": "not-a-dict", "sites": {"s1": {}}}
+        assert _coord_section(entry, "devices") is None
+        assert _coord_section(entry, "sites") == {"s1": {}}
+
+    def test_entry_has_and_owns_device_edge_cases(self):
+        """Test device ownership checks under abnormal or non-dict coordinator data."""
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _entry_has_device(entry, "s1", "d1") is True
+        assert _entry_owns_device(entry, "s1", "d1") is False
+
+        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"devices": "invalid"}))
+        assert _entry_has_device(entry, "s1", "d1") is True
+        assert _entry_owns_device(entry, "s1", "d1") is False
+
+        entry.runtime_data.coordinator.data = {"devices": {"s1": "invalid"}}
+        assert _entry_has_device(entry, "s1", "d1") is True
+
+        entry.runtime_data.coordinator.data = {"devices": {"s1": {"d1": {}}}}
+        assert _entry_owns_device(entry, None, "d1") is True
+        assert _entry_owns_device(entry, None, "d2") is False
+
+    def test_entry_has_and_owns_client_edge_cases(self):
+        """Test client ownership checks under abnormal coordinator data."""
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _entry_has_client(entry, "s1", "c1") is True
+        assert _entry_owns_client(entry, "s1", "c1") is False
+
+        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"clients": "invalid"}))
+        assert _entry_has_client(entry, "s1", "c1") is True
+        assert _entry_owns_client(entry, "s1", "c1") is False
+
+        entry.runtime_data.coordinator.data = {"clients": {"s1": "invalid"}}
+        assert _entry_has_client(entry, "s1", "c1") is True
+
+        entry.runtime_data.coordinator.data = {"clients": {"s1": {"c1": {"id": "c1"}}}}
+        assert _entry_has_client(entry, None, "c1") is True
+        assert _entry_owns_client(entry, None, "c1") is True
+        assert _entry_owns_client(entry, None, "nonexistent") is False
+
+    def test_mac_key_and_client_records_match_edge_cases(self):
+        """Test _mac_key and _client_records_match edge cases."""
+        assert _mac_key(123) is None
+        assert _mac_key("") is None
+        assert _mac_key("   ") is None
+        assert _mac_key("AA:BB:CC:DD:EE:FF") == "aabbccddeeff"
+
+        records = {"c1": "not-a-dict", "c2": {"mac": "11:22:33:44:55:66"}}
+        assert _client_records_match(records, "c1") is True
+        assert _client_records_match(records, "unknown_client") is False
+        assert _client_records_match(records, "11-22-33-44-55-66") is True
+
+    def test_protect_owns_resource_edge_cases(self):
+        """Test _protect_owns_resource edge cases."""
+        entry = MagicMock()
+        entry.runtime_data = None
+        assert _protect_owns_resource(entry, "cameras", "cam1") is None
+
+        entry.runtime_data = MagicMock(coordinator=MagicMock(data={"protect": "invalid"}))
+        assert _protect_owns_resource(entry, "cameras", "cam1") is None
+
+        entry.runtime_data.coordinator.data = {"protect": {"cameras": "invalid"}}
+        assert _protect_owns_resource(entry, "cameras", "cam1") is None
+
+    def test_select_console_duplicate_matches(self):
+        """Test _select_console raises ServiceValidationError when multiple consoles match."""
+        e1 = MagicMock(entry_id="id1", title="Console")
+        e2 = MagicMock(entry_id="id2", title="Console")
+        with pytest.raises(ServiceValidationError, match="matches more than one"):
+            _select_console([e1, e2], "Console", "Protect console")
+
+    async def test_network_resource_registry_fallback_and_mismatch(self, hass: HomeAssistant):
+        """Test device registry mismatch and fallback to entity registry."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"sites": {"s1": {}}, "devices": {"s1": {"d1": {}}}}
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"sites": {"s2": {}}, "devices": {"s2": {"d2": {}}}}
+
+        dev_reg = MagicMock()
+        dev_reg.async_get.return_value = MagicMock(config_entries={"unrelated_entry"})
+        ent_reg = MagicMock()
+        ent_reg.async_get.return_value = MagicMock(config_entry_id="e1")
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            patch("custom_components.unifi_insights.services.dr.async_get", return_value=dev_reg),
+            patch.dict(hass.data, {dr.DATA_REGISTRY: dev_reg}),
+            patch("custom_components.unifi_insights.services.er.async_get", return_value=ent_reg),
+            patch.dict(hass.data, {er.DATA_REGISTRY: ent_reg}),
+        ):
+            coord = _get_coordinator_for_network_resource(hass, device_id="d1")
+            assert coord is c1
+
+            with pytest.raises(ServiceValidationError, match="belongs to a different console than site"):
+                _get_coordinator_for_network_resource(hass, site_id="s2", device_id="d1")
+
+    async def test_network_resource_unloaded_site_and_device(self, hass: HomeAssistant):
+        """Test warm-up state where consoles haven't loaded site or device data."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
+            coord = _get_coordinator_for_network_resource(hass, site_id="unknown_site")
+            assert coord is c1
+
+            coord2 = _get_coordinator_for_network_resource(hass, device_id="unknown_dev")
+            assert coord2 is c1
+
+    async def test_network_resource_explicit_device_and_client_ownership(self, hass: HomeAssistant):
+        """Test single explicit match among candidate entries for devices and clients."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {
+            "sites": {"s1": {}},
+            "devices": {"s1": {"d_shared": {}}},
+            "clients": {"s1": {"c_shared": {"id": "c_shared"}}},
+        }
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"sites": {"s1": {}}}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_network_resource(hass, site_id="s1", device_id="d_shared")
+            assert coord is c1
+
+            coord_client = _get_coordinator_for_network_resource(hass, site_id="s1", client_id="c_shared")
+            assert coord_client is c1
+
+        # One console has site s1 explicitly, while e2 does not have s1 in sites
+        e2.runtime_data.coordinator.data = {"sites": {"s2": {}}}
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord_site = _get_coordinator_for_network_resource(hass, site_id="s1")
+            assert coord_site is c1
+
+    async def test_protect_resource_entity_registry_and_no_target(self, hass: HomeAssistant):
+        """Test Protect coordinator lookup via entity registry and empty target."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {"protect": {"cameras": {"cam2": {}}}}
+
+        ent_reg = MagicMock()
+        ent_reg.async_get.return_value = MagicMock(config_entry_id="e1")
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            patch("custom_components.unifi_insights.services.dr.async_get", return_value=MagicMock(async_get=MagicMock(return_value=None))),
+            patch.dict(hass.data, {dr.DATA_REGISTRY: MagicMock()}),
+            patch("custom_components.unifi_insights.services.er.async_get", return_value=ent_reg),
+            patch.dict(hass.data, {er.DATA_REGISTRY: ent_reg}),
+        ):
+            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
+            assert coord is c1
+
+            coord_no_type = _get_coordinator_for_protect_resource(hass, resource_id="cam1")
+            assert coord_no_type is c1
+
+    async def test_protect_resource_unloaded_data_and_unresolved_candidates(self, hass: HomeAssistant):
+        """Test Protect coordinator when data is unloaded or candidates cannot be resolved."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {}
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
+            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam_new")
+            assert coord is c1
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]),
+            pytest.raises(ServiceValidationError, match="Cannot tell which Protect console owns"),
+        ):
+            _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam_unknown")
+
+    async def test_protect_secondary_resource_unloaded_fallback(self, hass: HomeAssistant):
+        """Test secondary resource fallback when it is not yet in cached Protect data."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {
+            "protect": {"chimes": {"chime1": {}}, "cameras": {}}
+        }
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1]):
+            coord = _get_coordinator_for_protect_resource(
+                hass,
+                resource_type="chime",
+                resource_id="chime1",
+                secondary_resource_type="camera",
+                secondary_resource_id="cam_brand_new",
+            )
+            assert coord is c1
+
+    async def test_service_handlers_with_camera_id_and_ignored_guest_options(self, hass: HomeAssistant):
+        """Test service calls passing optional camera_id and ignored guest options."""
+        coord = MagicMock(protect_client=MagicMock())
+        coord.async_set_chime_volume = AsyncMock()
+        coord.async_set_chime_ringtone = AsyncMock()
+        coord.async_set_chime_repeat = AsyncMock()
+        coord.async_authorize_guest = AsyncMock()
+        coord.data = {
+            "sites": {"s1": {}},
+            "clients": {"s1": {"c1": {"id": "c1"}}},
+            "protect": {"chimes": {"chime1": {}}, "cameras": {"cam1": {}}},
+        }
+        entry = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=coord))
+
+        await async_setup_services(hass)
+        with patch.object(hass.config_entries, "async_entries", return_value=[entry]):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_volume",
+                {"chime_id": "chime1", "volume": 50, "camera_id": "cam1"},
+                blocking=True,
+            )
+            coord.async_set_chime_volume.assert_called_once_with("chime1", 50)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_ringtone",
+                {"chime_id": "chime1", "ringtone_id": "default", "camera_id": "cam1"},
+                blocking=True,
+            )
+            coord.async_set_chime_ringtone.assert_called_once_with("chime1", "default")
+
+            await hass.services.async_call(
+                DOMAIN,
+                "set_chime_repeat_times",
+                {"chime_id": "chime1", "repeat_times": 3, "camera_id": "cam1"},
+                blocking=True,
+            )
+            coord.async_set_chime_repeat.assert_called_once_with("chime1", 3)
+
+            await hass.services.async_call(
+                DOMAIN,
+                "authorize_guest",
+                {"site_id": "s1", "client_id": "c1", "duration_minutes": 60},
+                blocking=True,
+            )
+            coord.async_authorize_guest.assert_called_once_with("s1", "c1")
+
+        await async_unload_services(hass)
+
+    def test_client_records_match_non_mac_chars(self):
+        """Test _client_records_match when client_id has no hex characters."""
+        records = {"c1": {"mac": "11:22:33:44:55:66"}}
+        assert _client_records_match(records, ":::---") is False
+
+    async def test_protect_resource_device_registry_resolution(self, hass: HomeAssistant):
+        """Test Protect coordinator lookup via device registry."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
+
+        dev_reg = MagicMock()
+        dev_reg.async_get.return_value = MagicMock(config_entries={"e1"})
+
+        with (
+            patch.object(hass.config_entries, "async_entries", return_value=[e1]),
+            patch("custom_components.unifi_insights.services.dr.async_get", return_value=dev_reg),
+            patch.dict(hass.data, {dr.DATA_REGISTRY: dev_reg}),
+        ):
+            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
+            assert coord is c1
+
+    async def test_protect_resource_single_explicit_match(self, hass: HomeAssistant):
+        """Test Protect coordinator disambiguation when one console explicitly owns the resource."""
+        c1 = MagicMock(protect_client=MagicMock())
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"protect": {"cameras": {"cam1": {}}}}
+
+        c2 = MagicMock(protect_client=MagicMock())
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}  # Unloaded Protect data
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_protect_resource(hass, resource_type="camera", resource_id="cam1")
+            assert coord is c1
+
+    async def test_network_resource_multiple_candidate_single_explicit_site(self, hass: HomeAssistant):
+        """Test network coordinator disambiguation when multiple match site_id but only one explicitly owns it."""
+        c1 = MagicMock()
+        e1 = MagicMock(entry_id="e1", title="E1", runtime_data=MagicMock(coordinator=c1))
+        e1.runtime_data.coordinator.data = {"sites": {"s1": {}}}
+
+        c2 = MagicMock()
+        e2 = MagicMock(entry_id="e2", title="E2", runtime_data=MagicMock(coordinator=c2))
+        e2.runtime_data.coordinator.data = {}  # Unloaded data, so _entry_has_site is True
+
+        with patch.object(hass.config_entries, "async_entries", return_value=[e1, e2]):
+            coord = _get_coordinator_for_network_resource(hass, site_id="s1")
+            assert coord is c1
