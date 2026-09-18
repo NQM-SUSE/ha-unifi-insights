@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import (
     config_validation as cv,
+)
+from homeassistant.helpers import (
+    device_registry as dr,
+)
+from homeassistant.helpers import (
+    entity_registry as er,
 )
 
 from .const import (
@@ -241,13 +248,387 @@ def _protect_entry_has_resource(
     return True if owns is None else owns
 
 
+def _extract_target_id(call: ServiceCall, primary_field: str) -> str | None:
+    """Extract target resource ID from service call data, supporting targets."""
+    val = call.data.get(primary_field)
+    if val is None and "target" in call.data and isinstance(call.data["target"], dict):
+        target_dict = call.data["target"]
+        val = (
+            target_dict.get(primary_field)
+            or target_dict.get("entity_id")
+            or target_dict.get("device_id")
+        )
+    if val is None:
+        val = call.data.get("entity_id")
+    if val is None:
+        val = call.data.get("device_id")
+    if isinstance(val, list):
+        if not val:
+            msg = "At least one target must be specified"
+            raise ServiceValidationError(msg)
+        if len(val) > 1:
+            msg = (
+                f"Multiple targets specified for {call.service}; "
+                "action only supports a single target"
+            )
+            raise ServiceValidationError(msg)
+        val = val[0]
+    if isinstance(val, str):
+        val = val.strip()
+        return val or None
+    return None
+
+
+def _resolve_network_device_id(
+    hass: HomeAssistant,
+    device_id: str,
+    site_id: str | None,
+    entries: list[Any],
+) -> tuple[str, str | None, Any | None]:
+    """Resolve an HA device/entity registry ID to a native UniFi network device ID."""
+    dev_reg = (
+        dr.async_get(hass)
+        if hasattr(hass, "data")
+        and isinstance(hass.data, dict)
+        and dr.DATA_REGISTRY in hass.data
+        else None
+    )
+    ent_reg = (
+        er.async_get(hass)
+        if hasattr(hass, "data")
+        and isinstance(hass.data, dict)
+        and er.DATA_REGISTRY in hass.data
+        else None
+    )
+
+    if "." in device_id and (ent_reg is None or ent_reg.async_get(device_id) is None):
+        msg = f"Target entity '{device_id}' not found in entity registry"
+        raise ServiceValidationError(msg)
+
+    dev_entry: Any = None
+    resolved_entry: Any | None = None
+    ent_entry: er.RegistryEntry | None = None
+
+    if ent_reg is not None:
+        ent_entry = ent_reg.async_get(device_id)
+        if ent_entry is not None:
+            if ent_entry.platform != DOMAIN:
+                msg = f"Target '{device_id}' is not a UniFi Insights entity"
+                raise ServiceValidationError(msg)
+            if ent_entry.config_entry_id:
+                matching_e = [
+                    e for e in entries if e.entry_id == ent_entry.config_entry_id
+                ]
+                if not matching_e:
+                    msg = "Target's UniFi console is not loaded"
+                    raise ServiceValidationError(msg)
+                resolved_entry = matching_e[0]
+            if ent_entry.device_id and dev_reg is not None:
+                dev_entry = dev_reg.async_get(ent_entry.device_id)
+
+    if dev_entry is None and dev_reg is not None:
+        dev_entry = dev_reg.async_get(device_id)
+
+    if dev_entry is not None or ent_entry is not None:
+        if ent_entry is not None and ent_entry.unique_id:
+            candidate_entries = [resolved_entry] if resolved_entry else entries
+            for entry in candidate_entries:
+                devices_by_site = _coord_section(entry, "devices")
+                if isinstance(devices_by_site, dict):
+                    for s, s_devs in devices_by_site.items():
+                        if isinstance(s_devs, dict):
+                            for d in s_devs:
+                                prefix = f"{s}_{d}"
+                                if (
+                                    ent_entry.unique_id == prefix
+                                    or ent_entry.unique_id.startswith(f"{prefix}_")
+                                ):
+                                    return d, s, entry
+            parts = ent_entry.unique_id.split("_")
+            if len(parts) > 1:
+                return parts[1], parts[0], resolved_entry
+
+        if dev_entry is not None:
+            matching_config_entries = [
+                e for e in entries if e.entry_id in dev_entry.config_entries
+            ]
+            has_domain_identifier = any(
+                ident[0] == DOMAIN for ident in dev_entry.identifiers
+            )
+            if not matching_config_entries and not has_domain_identifier:
+                msg = f"Target '{device_id}' is not a UniFi Insights device"
+                raise ServiceValidationError(msg)
+
+            if dev_entry.config_entries and not matching_config_entries:
+                msg = "Target's UniFi console is not loaded"
+                raise ServiceValidationError(msg)
+
+            if resolved_entry is None and matching_config_entries:
+                resolved_entry = matching_config_entries[0]
+
+            candidate_entries = [resolved_entry] if resolved_entry else entries
+            for domain, ident in dev_entry.identifiers:
+                if domain != DOMAIN:
+                    continue
+                if ident.startswith(("protect_", "client_")):
+                    continue
+
+                for entry in candidate_entries:
+                    devices_by_site = _coord_section(entry, "devices")
+                    if isinstance(devices_by_site, dict):
+                        for s, s_devs in devices_by_site.items():
+                            if ident.startswith(f"{s}_"):
+                                d = ident[len(s) + 1 :]
+                                if isinstance(s_devs, dict) and d in s_devs:
+                                    return d, s, entry
+
+                if site_id and ident.startswith(f"{site_id}_"):
+                    d = ident[len(site_id) + 1 :]
+                    return d, site_id, resolved_entry
+
+                s, sep, d = ident.rpartition("_")
+                if sep and s and d:
+                    return d, s, resolved_entry
+
+        msg = f"Could not resolve target '{device_id}' to a UniFi network device"
+        raise ServiceValidationError(msg)
+
+    return device_id, site_id, None
+
+
+def _resolve_protect_resource_id(
+    hass: HomeAssistant,
+    resource_type: str,
+    resource_id: str,
+    protect_entries: list[Any],
+) -> tuple[str, Any | None]:
+    """Resolve an HA device/entity registry ID to a native UniFi Protect resource ID."""
+    dev_reg = (
+        dr.async_get(hass)
+        if hasattr(hass, "data")
+        and isinstance(hass.data, dict)
+        and dr.DATA_REGISTRY in hass.data
+        else None
+    )
+    ent_reg = (
+        er.async_get(hass)
+        if hasattr(hass, "data")
+        and isinstance(hass.data, dict)
+        and er.DATA_REGISTRY in hass.data
+        else None
+    )
+
+    if "." in resource_id and (
+        ent_reg is None or ent_reg.async_get(resource_id) is None
+    ):
+        msg = f"Target entity '{resource_id}' not found in entity registry"
+        raise ServiceValidationError(msg)
+
+    dev_entry: Any = None
+    resolved_entry: Any | None = None
+    ent_entry: er.RegistryEntry | None = None
+
+    if ent_reg is not None:
+        ent_entry = ent_reg.async_get(resource_id)
+        if ent_entry is not None:
+            if ent_entry.platform != DOMAIN:
+                msg = f"Target '{resource_id}' is not a UniFi Protect {resource_type}"
+                raise ServiceValidationError(msg)
+            if ent_entry.config_entry_id:
+                matching_e = [
+                    e
+                    for e in protect_entries
+                    if e.entry_id == ent_entry.config_entry_id
+                ]
+                if not matching_e:
+                    msg = "Target's UniFi console is not loaded"
+                    raise ServiceValidationError(msg)
+                resolved_entry = matching_e[0]
+            if ent_entry.device_id and dev_reg is not None:
+                dev_entry = dev_reg.async_get(ent_entry.device_id)
+
+    if dev_entry is None and dev_reg is not None:
+        dev_entry = dev_reg.async_get(resource_id)
+
+    if dev_entry is not None or ent_entry is not None:
+        if ent_entry is not None and ent_entry.unique_id:
+            prefix = f"{DOMAIN}_{resource_type}_"
+            if ent_entry.unique_id.startswith(prefix):
+                remainder = ent_entry.unique_id[len(prefix) :]
+                candidate_entries = (
+                    [resolved_entry] if resolved_entry else protect_entries
+                )
+                for entry in candidate_entries:
+                    protect_data = _coord_section(entry, "protect")
+                    if isinstance(protect_data, dict):
+                        collection = protect_data.get(
+                            {
+                                "camera": "cameras",
+                                "light": "lights",
+                                "chime": "chimes",
+                                "viewer": "viewers",
+                            }.get(resource_type, f"{resource_type}s")
+                        )
+                        if isinstance(collection, dict):
+                            for k in collection:
+                                if remainder == k or remainder.startswith(f"{k}_"):
+                                    return k, entry
+                parts = remainder.split("_")
+                return parts[0], resolved_entry
+
+        if dev_entry is not None:
+            matching_config_entries = [
+                e for e in protect_entries if e.entry_id in dev_entry.config_entries
+            ]
+            has_domain_identifier = any(
+                ident[0] == DOMAIN for ident in dev_entry.identifiers
+            )
+            if not matching_config_entries and not has_domain_identifier:
+                msg = f"Target '{resource_id}' is not a UniFi Protect {resource_type}"
+                raise ServiceValidationError(msg)
+
+            if dev_entry.config_entries and not matching_config_entries:
+                msg = "Target's UniFi console is not loaded"
+                raise ServiceValidationError(msg)
+
+            if resolved_entry is None and matching_config_entries:
+                resolved_entry = matching_config_entries[0]
+
+            expected_prefix = f"protect_{resource_type}_"
+            for domain, ident in dev_entry.identifiers:
+                if domain != DOMAIN:
+                    continue
+                if ident.startswith(expected_prefix):
+                    native_id = ident[len(expected_prefix) :]
+                    return native_id, resolved_entry
+                if ident.startswith("protect_"):
+                    actual_type = ident.split("_")[1]
+                    msg = (
+                        f"Target '{resource_id}' is a {actual_type},"
+                        f" not a {resource_type}"
+                    )
+                    raise ServiceValidationError(msg)
+
+            if ent_reg is not None and resource_type == "camera":
+                device_entities = er.async_entries_for_device(ent_reg, dev_entry.id)
+                for ent in device_entities:
+                    if ent.platform == DOMAIN and ent.unique_id.startswith(
+                        f"{DOMAIN}_camera_"
+                    ):
+                        remainder = ent.unique_id[len(f"{DOMAIN}_camera_") :]
+                        parts = remainder.split("_")
+                        return parts[0], resolved_entry
+
+        msg = (
+            f"Could not resolve target '{resource_id}'"
+            f" to a UniFi Protect {resource_type}"
+        )
+        raise ServiceValidationError(msg)
+
+    return resource_id, None
+
+
+def _resolve_network_client_id(
+    hass: HomeAssistant,
+    client_id: str,
+    entries: list[Any],
+) -> tuple[str, Any | None]:
+    """Resolve an HA device/entity registry ID to a native client ID or MAC."""
+    dev_reg = (
+        dr.async_get(hass)
+        if hasattr(hass, "data")
+        and isinstance(hass.data, dict)
+        and dr.DATA_REGISTRY in hass.data
+        else None
+    )
+    ent_reg = (
+        er.async_get(hass)
+        if hasattr(hass, "data")
+        and isinstance(hass.data, dict)
+        and er.DATA_REGISTRY in hass.data
+        else None
+    )
+
+    is_dotted_mac = re.fullmatch(r"(?:[0-9a-fA-F]{4}\.){2}[0-9a-fA-F]{4}", client_id)
+    if (
+        "." in client_id
+        and not is_dotted_mac
+        and (ent_reg is None or ent_reg.async_get(client_id) is None)
+    ):
+        msg = f"Target entity '{client_id}' not found in entity registry"
+        raise ServiceValidationError(msg)
+
+    dev_entry: Any = None
+    resolved_entry: Any | None = None
+    ent_entry: er.RegistryEntry | None = None
+
+    if ent_reg is not None:
+        ent_entry = ent_reg.async_get(client_id)
+        if ent_entry is not None:
+            if ent_entry.platform != DOMAIN:
+                msg = f"Target '{client_id}' is not a UniFi Insights entity"
+                raise ServiceValidationError(msg)
+            if ent_entry.config_entry_id:
+                matching_e = [
+                    e for e in entries if e.entry_id == ent_entry.config_entry_id
+                ]
+                if not matching_e:
+                    msg = "Target's UniFi console is not loaded"
+                    raise ServiceValidationError(msg)
+                resolved_entry = matching_e[0]
+            if ent_entry.device_id and dev_reg is not None:
+                dev_entry = dev_reg.async_get(ent_entry.device_id)
+
+    if dev_entry is None and dev_reg is not None:
+        dev_entry = dev_reg.async_get(client_id)
+
+    if dev_entry is not None or ent_entry is not None:
+        if ent_entry is not None and ent_entry.unique_id:
+            match = re.search(
+                r"(?:^|[^0-9a-fA-F])([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})(?:$|[^0-9a-fA-F])",
+                ent_entry.unique_id,
+            )
+            if match:
+                return (
+                    match.group(1).replace("-", ":").replace("_", ":"),
+                    resolved_entry,
+                )
+            parts = ent_entry.unique_id.split("_")
+            if len(parts) > 1:
+                return parts[1], resolved_entry
+
+        if dev_entry is not None:
+            matching_config_entries = [
+                e for e in entries if e.entry_id in dev_entry.config_entries
+            ]
+            has_domain_identifier = any(
+                ident[0] == DOMAIN for ident in dev_entry.identifiers
+            )
+            if not matching_config_entries and not has_domain_identifier:
+                msg = f"Target '{client_id}' is not a UniFi Insights device"
+                raise ServiceValidationError(msg)
+
+            if dev_entry.config_entries and not matching_config_entries:
+                msg = "Target's UniFi console is not loaded"
+                raise ServiceValidationError(msg)
+
+            if resolved_entry is None and matching_config_entries:
+                resolved_entry = matching_config_entries[0]
+
+            for domain, ident in dev_entry.identifiers:
+                if domain == DOMAIN and ident.startswith("client_"):
+                    return ident[len("client_") :], resolved_entry
+
+    return client_id, resolved_entry
+
+
 def _get_coordinator_for_network_resource(
     hass: HomeAssistant,
     *,
     site_id: str | None = None,
     device_id: str | None = None,
     client_id: str | None = None,
-) -> Any:
+) -> tuple[Any, str | None]:
     """Get the UniFi Insights coordinator owning the specified network resource."""
     entries = [
         entry
@@ -257,6 +638,25 @@ def _get_coordinator_for_network_resource(
     if not entries:
         msg = "No UniFi Insights coordinator found"
         raise ServiceValidationError(msg)
+
+    resolved_reg_entry: Any | None = None
+    native_device_id: str | None = None
+    resolved_target_id: str | None = None
+
+    if device_id is not None:
+        native_device_id, resolved_site, resolved_reg_entry = (
+            _resolve_network_device_id(hass, device_id, site_id, entries)
+        )
+        resolved_target_id = native_device_id
+        if site_id is None and resolved_site is not None:
+            site_id = resolved_site
+
+    if client_id is not None:
+        native_client_id, resolved_reg_entry = _resolve_network_client_id(
+            hass, client_id, entries
+        )
+        resolved_target_id = native_client_id
+        client_id = native_client_id
 
     # 1. Filter entries by site_id
     if site_id is not None:
@@ -269,70 +669,88 @@ def _get_coordinator_for_network_resource(
     else:
         matching_entries = entries
 
+    # If resolved via registry, verify that the entry matches site_id
+    if resolved_reg_entry is not None and resolved_reg_entry not in matching_entries:
+        target_name = device_id or client_id
+        msg = (
+            f"Device '{target_name}' belongs to a different console than"
+            f" site '{site_id}'"
+        )
+        raise ServiceValidationError(msg)
+
     # 2. Filter / validate by device_id if specified
-    if device_id is not None:
+    if native_device_id is not None:
         entries_with_device = [
             entry
             for entry in matching_entries
-            if _entry_has_device(entry, site_id, device_id)
+            if _entry_has_device(entry, site_id, native_device_id)
         ]
         if not entries_with_device:
             cross_console_entries = [
                 entry
                 for entry in entries
                 if entry not in matching_entries
-                and _entry_has_device(entry, None, device_id)
+                and _entry_has_device(entry, None, native_device_id)
             ]
             if cross_console_entries and site_id:
                 msg = (
-                    f"Device '{device_id}' belongs to a different console than"
+                    f"Device '{native_device_id}' belongs to a different console than"
                     f" site '{site_id}'"
                 )
                 raise ServiceValidationError(msg)
             msg = (
-                f"Device '{device_id}' not found on console for site '{site_id}'"
+                f"Device '{native_device_id}' not found on console for site '{site_id}'"
                 if site_id
-                else f"Device '{device_id}' not found on any configured UniFi console"
+                else (
+                    f"Device '{native_device_id}' not found"
+                    " on any configured UniFi console"
+                )
             )
             raise ServiceValidationError(msg)
+
+        if resolved_reg_entry is not None and resolved_reg_entry in entries_with_device:
+            return resolved_reg_entry.runtime_data.coordinator, native_device_id
 
         if len(entries_with_device) > 1:
             explicit_matches = [
                 e
                 for e in entries_with_device
-                if _entry_owns_device(e, site_id, device_id)
+                if _entry_owns_device(e, site_id, native_device_id)
             ]
             if len(explicit_matches) == 1:
-                return explicit_matches[0].runtime_data.coordinator
+                return explicit_matches[0].runtime_data.coordinator, native_device_id
             msg = (
                 f"Multiple consoles found for site '{site_id}' and device"
-                f" '{device_id}'; target is ambiguous"
+                f" '{native_device_id}'; target is ambiguous"
                 if site_id
                 else (
-                    f"Multiple consoles found for device '{device_id}';"
+                    f"Multiple consoles found for device '{native_device_id}';"
                     " target is ambiguous"
                 )
             )
             raise ServiceValidationError(msg)
 
-        return entries_with_device[0].runtime_data.coordinator
+        return entries_with_device[0].runtime_data.coordinator, native_device_id
 
     # 3. Filter by client_id if specified
     if client_id is not None and len(matching_entries) > 1:
+        if resolved_reg_entry is not None and resolved_reg_entry in matching_entries:
+            return resolved_reg_entry.runtime_data.coordinator, client_id
+
         entries_with_client = [
             entry
             for entry in matching_entries
             if _entry_has_client(entry, site_id, client_id)
         ]
         if len(entries_with_client) == 1:
-            return entries_with_client[0].runtime_data.coordinator
+            return entries_with_client[0].runtime_data.coordinator, client_id
         owning_entries = [
             entry
             for entry in matching_entries
             if _entry_owns_client(entry, site_id, client_id)
         ]
         if len(owning_entries) == 1:
-            return owning_entries[0].runtime_data.coordinator
+            return owning_entries[0].runtime_data.coordinator, client_id
         if len(owning_entries) > 1:
             msg = f"Multiple consoles contain client '{client_id}'; target is ambiguous"
             raise ServiceValidationError(msg)
@@ -348,7 +766,7 @@ def _get_coordinator_for_network_resource(
             msg = f"Multiple consoles contain site '{site_id}'; target is ambiguous"
             raise ServiceValidationError(msg)
         if len(explicit_matches) == 1:
-            return explicit_matches[0].runtime_data.coordinator
+            return explicit_matches[0].runtime_data.coordinator, resolved_target_id
 
     if len(matching_entries) > 1:
         msg = (
@@ -358,7 +776,7 @@ def _get_coordinator_for_network_resource(
         )
         raise ServiceValidationError(msg)
 
-    return matching_entries[0].runtime_data.coordinator
+    return matching_entries[0].runtime_data.coordinator, resolved_target_id
 
 
 def _entry_matches_console(entry: Any, console_id: str) -> bool:
@@ -392,7 +810,7 @@ def _get_coordinator_for_protect_resource(
     secondary_resource_type: str | None = None,
     secondary_resource_id: str | None = None,
     console_id: str | None = None,
-) -> Any:
+) -> tuple[Any, str | None]:
     """Get the UniFi Protect coordinator owning the specified protect resource."""
     protect_entries = [
         entry
@@ -408,7 +826,7 @@ def _get_coordinator_for_protect_resource(
     # 0. An explicit console always wins.
     if console_id:
         entry = _select_console(protect_entries, console_id, "UniFi Protect console")
-        return entry.runtime_data.coordinator
+        return entry.runtime_data.coordinator, None
 
     if resource_type is None or resource_id is None:
         if len(protect_entries) > 1:
@@ -421,7 +839,12 @@ def _get_coordinator_for_protect_resource(
                 f" {known}"
             )
             raise ServiceValidationError(msg)
-        return protect_entries[0].runtime_data.coordinator
+        return protect_entries[0].runtime_data.coordinator, None
+
+    # Resolve resource_id if it is an HA registry ID
+    native_resource_id, resolved_reg_entry = _resolve_protect_resource_id(
+        hass, resource_type, resource_id, protect_entries
+    )
 
     collection_key = {
         "camera": "cameras",
@@ -433,60 +856,82 @@ def _get_coordinator_for_protect_resource(
     matching_entries = [
         entry
         for entry in protect_entries
-        if _protect_entry_has_resource(entry, collection_key, resource_id)
+        if _protect_entry_has_resource(entry, collection_key, native_resource_id)
     ]
 
     if not matching_entries:
         msg = (
-            f"{resource_type.capitalize()} '{resource_id}' not found on any"
+            f"{resource_type.capitalize()} '{native_resource_id}' not found on any"
             " configured UniFi Protect console"
         )
         raise ServiceValidationError(msg)
 
+    if resolved_reg_entry is not None and resolved_reg_entry not in matching_entries:
+        msg = (
+            f"{resource_type.capitalize()} '{resource_id}' belongs to a different"
+            " console than the target console"
+        )
+        raise ServiceValidationError(msg)
+
     if len(matching_entries) > 1:
-        explicit_matches = [
-            entry
-            for entry in matching_entries
-            if _protect_owns_resource(entry, collection_key, resource_id) is True
-        ]
-        if len(explicit_matches) == 1:
-            matching_entries = explicit_matches
-        elif len(explicit_matches) > 1:
-            msg = (
-                f"Multiple Protect consoles contain {resource_type} '{resource_id}';"
-                " target is ambiguous"
-            )
-            raise ServiceValidationError(msg)
+        if resolved_reg_entry is not None and resolved_reg_entry in matching_entries:
+            matching_entries = [resolved_reg_entry]
         else:
-            # Nobody positively claims it and more than one console is still a
-            # candidate: that only happens when their data has not loaded, so
-            # say so instead of guessing at the first one.
-            msg = (
-                f"Cannot tell which Protect console owns {resource_type}"
-                f" '{resource_id}' yet; retry once the consoles have refreshed"
-            )
-            raise ServiceValidationError(msg)
+            explicit_matches = [
+                entry
+                for entry in matching_entries
+                if _protect_owns_resource(entry, collection_key, native_resource_id)
+                is True
+            ]
+            if len(explicit_matches) == 1:
+                matching_entries = explicit_matches
+            elif len(explicit_matches) > 1:
+                msg = (
+                    f"Multiple Protect consoles contain {resource_type}"
+                    f" '{native_resource_id}';"
+                    " target is ambiguous"
+                )
+                raise ServiceValidationError(msg)
+            else:
+                msg = (
+                    f"Cannot tell which Protect console owns {resource_type}"
+                    f" '{native_resource_id}' yet;"
+                    " retry once the consoles have refreshed"
+                )
+                raise ServiceValidationError(msg)
 
     target_entry = matching_entries[0]
 
-    # Validate secondary resource if provided (e.g. chime camera_id,
-    # or viewer liveview_id)
+    # Validate secondary resource if provided (e.g. chime camera_id)
     if secondary_resource_type and secondary_resource_id:
+        native_sec_id = secondary_resource_id
+        secondary_entry = None
+        if secondary_resource_type in ("camera", "light", "chime", "viewer"):
+            native_sec_id, secondary_entry = _resolve_protect_resource_id(
+                hass, secondary_resource_type, secondary_resource_id, protect_entries
+            )
+
+        if secondary_entry is not None and secondary_entry != target_entry:
+            msg = (
+                f"{secondary_resource_type.capitalize()} '{secondary_resource_id}'"
+                " belongs to a different Protect console than"
+                f" {resource_type} '{resource_id}'"
+            )
+            raise ServiceValidationError(msg)
+
         sec_collection_key = {
             "camera": "cameras",
             "liveview": "liveviews",
         }.get(secondary_resource_type, f"{secondary_resource_type}s")
 
         if not _protect_entry_has_resource(
-            target_entry, sec_collection_key, secondary_resource_id
+            target_entry, sec_collection_key, native_sec_id
         ):
             cross_entries = [
                 entry
                 for entry in protect_entries
                 if entry != target_entry
-                and _protect_owns_resource(
-                    entry, sec_collection_key, secondary_resource_id
-                )
+                and _protect_owns_resource(entry, sec_collection_key, native_sec_id)
                 is True
             ]
             if cross_entries:
@@ -496,10 +941,7 @@ def _get_coordinator_for_protect_resource(
                     f" {resource_type} '{resource_id}'"
                 )
                 raise ServiceValidationError(msg)
-            # Nothing positively claims it. The resource may simply be newer
-            # than the last refresh - a liveview created moments ago, say - so
-            # stay on the console the primary resource chose rather than fail a
-            # call that used to work.
+
             _LOGGER.debug(
                 "%s '%s' is not in cached Protect data; proceeding on the console"
                 " owning %s '%s'",
@@ -509,11 +951,21 @@ def _get_coordinator_for_protect_resource(
                 resource_id,
             )
 
-    return target_entry.runtime_data.coordinator
+    return target_entry.runtime_data.coordinator, native_resource_id
 
 
 SERVICE_REFRESH_DATA = "refresh_data"
 SERVICE_RESTART_DEVICE = "restart_device"
+
+TARGET_SELECTOR_SCHEMA = vol.Any(cv.string, [cv.string])
+TARGET_DICT_SCHEMA = vol.Schema(
+    {
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("area_id"): TARGET_SELECTOR_SCHEMA,
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 # Schema for refresh_data service
 REFRESH_DATA_SCHEMA = vol.Schema(
@@ -525,15 +977,20 @@ REFRESH_DATA_SCHEMA = vol.Schema(
 # Schema for restart_device service
 RESTART_DEVICE_SCHEMA = vol.Schema(
     {
-        vol.Required("site_id"): cv.string,
-        vol.Required("device_id"): cv.string,
+        vol.Optional("site_id"): cv.string,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
     }
 )
 
 # Schema for set_recording_mode service
 SET_RECORDING_MODE_SCHEMA = vol.Schema(
     {
-        vol.Required("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("mode"): cv.string,
     }
 )
@@ -541,7 +998,10 @@ SET_RECORDING_MODE_SCHEMA = vol.Schema(
 # Schema for set_hdr_mode service
 SET_HDR_MODE_SCHEMA = vol.Schema(
     {
-        vol.Required("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("mode"): vol.In([HDR_MODE_AUTO, HDR_MODE_ON, HDR_MODE_OFF]),
     }
 )
@@ -549,13 +1009,18 @@ SET_HDR_MODE_SCHEMA = vol.Schema(
 # Schema for set_video_mode service
 SET_VIDEO_MODE_SCHEMA = vol.Schema(
     {
-        vol.Required("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("mode"): vol.In(
             [
                 VIDEO_MODE_DEFAULT,
                 VIDEO_MODE_HIGH_FPS,
                 VIDEO_MODE_SPORT,
                 VIDEO_MODE_SLOW_SHUTTER,
+                "high_fps",
+                "slow_shutter",
             ]
         ),
     }
@@ -564,7 +1029,10 @@ SET_VIDEO_MODE_SCHEMA = vol.Schema(
 # Schema for set_mic_volume service
 SET_MIC_VOLUME_SCHEMA = vol.Schema(
     {
-        vol.Required("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("volume"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
     }
 )
@@ -572,7 +1040,10 @@ SET_MIC_VOLUME_SCHEMA = vol.Schema(
 # Schema for set_light_mode service
 SET_LIGHT_MODE_SCHEMA = vol.Schema(
     {
-        vol.Required("light_id"): cv.string,
+        vol.Optional("light_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("mode"): vol.In(
             [
                 LIGHT_MODE_ALWAYS,
@@ -586,7 +1057,10 @@ SET_LIGHT_MODE_SCHEMA = vol.Schema(
 # Schema for set_light_level service
 SET_LIGHT_LEVEL_SCHEMA = vol.Schema(
     {
-        vol.Required("light_id"): cv.string,
+        vol.Optional("light_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("level"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
     }
 )
@@ -594,16 +1068,21 @@ SET_LIGHT_LEVEL_SCHEMA = vol.Schema(
 # Schema for ptz_move service
 PTZ_MOVE_SCHEMA = vol.Schema(
     {
-        vol.Required("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("preset"): vol.All(vol.Coerce(int), vol.Range(min=0, max=15)),
     }
 )
 
-
 # Schema for ptz_patrol service
 PTZ_PATROL_SCHEMA = vol.Schema(
     {
-        vol.Required("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("action"): vol.In(["start", "stop"]),
         vol.Optional("slot", default=0): vol.All(
             vol.Coerce(int), vol.Range(min=0, max=15)
@@ -614,16 +1093,22 @@ PTZ_PATROL_SCHEMA = vol.Schema(
 # Schema for set_chime_volume service
 SET_CHIME_VOLUME_SCHEMA = vol.Schema(
     {
-        vol.Required("chime_id"): cv.string,
+        vol.Optional("chime_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("volume"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
-        vol.Optional("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
     }
 )
 
 # Schema for play_chime_ringtone service
 PLAY_CHIME_RINGTONE_SCHEMA = vol.Schema(
     {
-        vol.Required("chime_id"): cv.string,
+        vol.Optional("chime_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Optional("ringtone_id"): vol.In(
             [
                 CHIME_RINGTONE_DEFAULT,
@@ -641,7 +1126,10 @@ PLAY_CHIME_RINGTONE_SCHEMA = vol.Schema(
 # Schema for set_chime_ringtone service
 SET_CHIME_RINGTONE_SCHEMA = vol.Schema(
     {
-        vol.Required("chime_id"): cv.string,
+        vol.Optional("chime_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("ringtone_id"): vol.In(
             [
                 CHIME_RINGTONE_DEFAULT,
@@ -653,18 +1141,21 @@ SET_CHIME_RINGTONE_SCHEMA = vol.Schema(
                 CHIME_RINGTONE_CUSTOM_2,
             ]
         ),
-        vol.Optional("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
     }
 )
 
 # Schema for set_chime_repeat_times service
 SET_CHIME_REPEAT_TIMES_SCHEMA = vol.Schema(
     {
-        vol.Required("chime_id"): cv.string,
+        vol.Optional("chime_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("repeat_times"): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=10)
         ),
-        vol.Optional("camera_id"): cv.string,
+        vol.Optional("camera_id"): TARGET_SELECTOR_SCHEMA,
     }
 )
 
@@ -672,7 +1163,10 @@ SET_CHIME_REPEAT_TIMES_SCHEMA = vol.Schema(
 AUTHORIZE_GUEST_SCHEMA = vol.Schema(
     {
         vol.Required("site_id"): cv.string,
-        vol.Required("client_id"): cv.string,
+        vol.Optional("client_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         # Note: the official UniFi Integration API authorize action does not
         # accept duration or bandwidth/data limits. These options are accepted
         # for backwards compatibility but ignored (a warning is logged).
@@ -729,7 +1223,10 @@ CREATE_LIVEVIEW_SCHEMA = vol.Schema(
 # Schema for set_liveview service
 SET_LIVEVIEW_SCHEMA = vol.Schema(
     {
-        vol.Required("viewer_id"): cv.string,
+        vol.Optional("viewer_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("device_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("entity_id"): TARGET_SELECTOR_SCHEMA,
+        vol.Optional("target"): TARGET_DICT_SCHEMA,
         vol.Required("liveview_id"): cv.string,
     }
 )
@@ -797,23 +1294,41 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_restart_device(call: ServiceCall) -> None:
         """Handle the restart device service call."""
-        site_id = call.data["site_id"]
-        device_id = call.data["device_id"]
+        site_id = call.data.get("site_id")
+        raw_device_id = _extract_target_id(call, "device_id")
+        if not raw_device_id:
+            msg = "Device ID or target is required"
+            raise ServiceValidationError(msg)
 
-        coordinator = _get_coordinator_for_network_resource(
-            hass, site_id=site_id, device_id=device_id
+        coordinator, device_id = _get_coordinator_for_network_resource(
+            hass, site_id=site_id, device_id=raw_device_id
         )
+
+        if not site_id and isinstance(coordinator.data, dict):
+            devices_by_site = coordinator.data.get("devices")
+            if isinstance(devices_by_site, dict):
+                for s, s_devs in devices_by_site.items():
+                    if isinstance(s_devs, dict) and device_id in s_devs:
+                        site_id = s
+                        break
+
+        if not site_id:
+            msg = f"Site ID is required to restart device '{device_id}'"
+            raise ServiceValidationError(msg)
 
         _LOGGER.info("Restarting device %s in site %s", device_id, site_id)
         await coordinator.async_restart_device(site_id, device_id)
 
     async def async_handle_set_recording_mode(call: ServiceCall) -> None:
         """Handle the set_recording_mode service call."""
-        camera_id = call.data["camera_id"]
+        raw_camera_id = _extract_target_id(call, "camera_id")
+        if not raw_camera_id:
+            msg = "Camera ID or target is required"
+            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=camera_id
+        coordinator, camera_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="camera", resource_id=raw_camera_id
         )
 
         _LOGGER.info("Setting recording mode for camera %s to %s", camera_id, mode)
@@ -821,11 +1336,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_hdr_mode(call: ServiceCall) -> None:
         """Handle the set_hdr_mode service call."""
-        camera_id = call.data["camera_id"]
+        raw_camera_id = _extract_target_id(call, "camera_id")
+        if not raw_camera_id:
+            msg = "Camera ID or target is required"
+            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=camera_id
+        coordinator, camera_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="camera", resource_id=raw_camera_id
         )
 
         _LOGGER.info("Setting HDR mode for camera %s to %s", camera_id, mode)
@@ -833,11 +1351,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_video_mode(call: ServiceCall) -> None:
         """Handle the set_video_mode service call."""
-        camera_id = call.data["camera_id"]
+        raw_camera_id = _extract_target_id(call, "camera_id")
+        if not raw_camera_id:
+            msg = "Camera ID or target is required"
+            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=camera_id
+        coordinator, camera_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="camera", resource_id=raw_camera_id
         )
 
         _LOGGER.info("Setting video mode for camera %s to %s", camera_id, mode)
@@ -845,11 +1366,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_mic_volume(call: ServiceCall) -> None:
         """Handle the set_mic_volume service call."""
-        camera_id = call.data["camera_id"]
+        raw_camera_id = _extract_target_id(call, "camera_id")
+        if not raw_camera_id:
+            msg = "Camera ID or target is required"
+            raise ServiceValidationError(msg)
         volume = call.data["volume"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=camera_id
+        coordinator, camera_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="camera", resource_id=raw_camera_id
         )
 
         _LOGGER.info("Setting mic volume for camera %s to %d%%", camera_id, volume)
@@ -901,11 +1425,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_light_mode(call: ServiceCall) -> None:
         """Handle the set_light_mode service call."""
-        light_id = call.data["light_id"]
+        raw_light_id = _extract_target_id(call, "light_id")
+        if not raw_light_id:
+            msg = "Light ID or target is required"
+            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="light", resource_id=light_id
+        coordinator, light_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="light", resource_id=raw_light_id
         )
 
         _LOGGER.info("Setting light mode for %s to %s", light_id, mode)
@@ -913,11 +1440,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_light_level(call: ServiceCall) -> None:
         """Handle the set_light_level service call."""
-        light_id = call.data["light_id"]
+        raw_light_id = _extract_target_id(call, "light_id")
+        if not raw_light_id:
+            msg = "Light ID or target is required"
+            raise ServiceValidationError(msg)
         level = call.data["level"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="light", resource_id=light_id
+        coordinator, light_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="light", resource_id=raw_light_id
         )
 
         _LOGGER.info("Setting light level for %s to %d%%", light_id, level)
@@ -925,11 +1455,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_ptz_move(call: ServiceCall) -> None:
         """Handle the ptz_move service call."""
-        camera_id = call.data["camera_id"]
+        raw_camera_id = _extract_target_id(call, "camera_id")
+        if not raw_camera_id:
+            msg = "Camera ID or target is required"
+            raise ServiceValidationError(msg)
         preset = call.data["preset"]
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=camera_id
+        coordinator, camera_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="camera", resource_id=raw_camera_id
         )
 
         _LOGGER.info("Moving camera %s to preset %d", camera_id, preset)
@@ -937,12 +1470,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_ptz_patrol(call: ServiceCall) -> None:
         """Handle the ptz_patrol service call."""
-        camera_id = call.data["camera_id"]
+        raw_camera_id = _extract_target_id(call, "camera_id")
+        if not raw_camera_id:
+            msg = "Camera ID or target is required"
+            raise ServiceValidationError(msg)
         action = call.data["action"]
         slot = call.data.get("slot", 0)
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=camera_id
+        coordinator, camera_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="camera", resource_id=raw_camera_id
         )
 
         if action == "start":
@@ -984,26 +1520,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_chime_volume(call: ServiceCall) -> None:
         """Handle the set_chime_volume service call."""
-        chime_id = call.data["chime_id"]
+        raw_chime_id = _extract_target_id(call, "chime_id")
+        if not raw_chime_id:
+            msg = "Chime ID or target is required"
+            raise ServiceValidationError(msg)
         volume = call.data["volume"]
-        camera_id = call.data.get("camera_id")
+        raw_camera_id = call.data.get("camera_id")
+        if isinstance(raw_camera_id, list):
+            raw_camera_id = raw_camera_id[0] if raw_camera_id else None
+        if isinstance(raw_camera_id, str):
+            raw_camera_id = raw_camera_id.strip() or None
 
-        coordinator = _get_coordinator_for_protect_resource(
+        coordinator, chime_id = _get_coordinator_for_protect_resource(
             hass,
             resource_type="chime",
-            resource_id=chime_id,
-            secondary_resource_type="camera" if camera_id else None,
-            secondary_resource_id=camera_id,
+            resource_id=raw_chime_id,
+            secondary_resource_type="camera" if raw_camera_id else None,
+            secondary_resource_id=raw_camera_id,
         )
 
-        if camera_id:
-            # camera_id only narrows which console owns the chime. Chime
-            # records do carry per-camera ringSettings, but this integration
-            # has never used them, so the volume is applied chime-wide.
+        if raw_camera_id:
             _LOGGER.debug(
                 "camera_id %s selects the console owning chime %s; volume"
                 " applies to the whole chime",
-                camera_id,
+                raw_camera_id,
                 chime_id,
             )
         _LOGGER.info("Setting chime %s volume to %d%%", chime_id, volume)
@@ -1011,10 +1551,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_play_chime_ringtone(call: ServiceCall) -> None:
         """Handle the play_chime_ringtone service call."""
-        chime_id = call.data["chime_id"]
+        raw_chime_id = _extract_target_id(call, "chime_id")
+        if not raw_chime_id:
+            msg = "Chime ID or target is required"
+            raise ServiceValidationError(msg)
 
-        coordinator = _get_coordinator_for_protect_resource(
-            hass, resource_type="chime", resource_id=chime_id
+        coordinator, chime_id = _get_coordinator_for_protect_resource(
+            hass, resource_type="chime", resource_id=raw_chime_id
         )
 
         _LOGGER.info("Playing ringtone on chime %s", chime_id)
@@ -1022,25 +1565,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_chime_ringtone(call: ServiceCall) -> None:
         """Handle the set_chime_ringtone service call."""
-        chime_id = call.data["chime_id"]
+        raw_chime_id = _extract_target_id(call, "chime_id")
+        if not raw_chime_id:
+            msg = "Chime ID or target is required"
+            raise ServiceValidationError(msg)
         ringtone_id = call.data["ringtone_id"]
-        camera_id = call.data.get("camera_id")
+        raw_camera_id = call.data.get("camera_id")
+        if isinstance(raw_camera_id, list):
+            raw_camera_id = raw_camera_id[0] if raw_camera_id else None
+        if isinstance(raw_camera_id, str):
+            raw_camera_id = raw_camera_id.strip() or None
 
-        coordinator = _get_coordinator_for_protect_resource(
+        coordinator, chime_id = _get_coordinator_for_protect_resource(
             hass,
             resource_type="chime",
-            resource_id=chime_id,
-            secondary_resource_type="camera" if camera_id else None,
-            secondary_resource_id=camera_id,
+            resource_id=raw_chime_id,
+            secondary_resource_type="camera" if raw_camera_id else None,
+            secondary_resource_id=raw_camera_id,
         )
 
-        if camera_id:
-            # camera_id only narrows which console owns the chime; this
-            # integration applies the ringtone chime-wide.
+        if raw_camera_id:
             _LOGGER.debug(
                 "camera_id %s selects the console owning chime %s; ringtone"
                 " applies to the whole chime",
-                camera_id,
+                raw_camera_id,
                 chime_id,
             )
         _LOGGER.info("Setting chime %s ringtone to %s", chime_id, ringtone_id)
@@ -1048,25 +1596,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_chime_repeat_times(call: ServiceCall) -> None:
         """Handle the set_chime_repeat_times service call."""
-        chime_id = call.data["chime_id"]
+        raw_chime_id = _extract_target_id(call, "chime_id")
+        if not raw_chime_id:
+            msg = "Chime ID or target is required"
+            raise ServiceValidationError(msg)
         repeat_times = call.data["repeat_times"]
-        camera_id = call.data.get("camera_id")
+        raw_camera_id = call.data.get("camera_id")
+        if isinstance(raw_camera_id, list):
+            raw_camera_id = raw_camera_id[0] if raw_camera_id else None
+        if isinstance(raw_camera_id, str):
+            raw_camera_id = raw_camera_id.strip() or None
 
-        coordinator = _get_coordinator_for_protect_resource(
+        coordinator, chime_id = _get_coordinator_for_protect_resource(
             hass,
             resource_type="chime",
-            resource_id=chime_id,
-            secondary_resource_type="camera" if camera_id else None,
-            secondary_resource_id=camera_id,
+            resource_id=raw_chime_id,
+            secondary_resource_type="camera" if raw_camera_id else None,
+            secondary_resource_id=raw_camera_id,
         )
 
-        if camera_id:
-            # camera_id only narrows which console owns the chime; this
-            # integration applies the repeat count chime-wide.
+        if raw_camera_id:
             _LOGGER.debug(
                 "camera_id %s selects the console owning chime %s; repeat times"
                 " apply to the whole chime",
-                camera_id,
+                raw_camera_id,
                 chime_id,
             )
         _LOGGER.info("Setting chime %s repeat times to %d", chime_id, repeat_times)
@@ -1075,11 +1628,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     async def async_handle_authorize_guest(call: ServiceCall) -> None:
         """Handle the authorize_guest service call."""
         site_id = call.data["site_id"]
-        client_id = call.data["client_id"]
+        raw_client_id = _extract_target_id(call, "client_id")
+        if not raw_client_id:
+            msg = "Client ID or target is required"
+            raise ServiceValidationError(msg)
 
-        # The official Integration API authorize action does not accept the
-        # duration or bandwidth/data limits the legacy guest portal supported;
-        # warn so users understand those fields are ignored.
         ignored = [
             key
             for key in (
@@ -1098,9 +1651,25 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 ", ".join(ignored),
             )
 
-        coordinator = _get_coordinator_for_network_resource(
-            hass, site_id=site_id, client_id=client_id
+        coordinator, client_id = _get_coordinator_for_network_resource(
+            hass, site_id=site_id, client_id=raw_client_id
         )
+
+        # Trackers identify clients by MAC; the Integration API needs the
+        # native client ID from the selected site's cached client records.
+        data = coordinator.data
+        if isinstance(data, dict):
+            clients = data.get("clients", {})
+            site_clients = clients.get(site_id, {}) if isinstance(clients, dict) else {}
+            if (
+                isinstance(site_clients, dict)
+                and client_id is not None
+                and client_id not in site_clients
+            ):
+                for native_id, record in site_clients.items():
+                    if _client_records_match({native_id: record}, client_id):
+                        client_id = native_id
+                        break
 
         await coordinator.async_authorize_guest(site_id, client_id)
 
@@ -1114,7 +1683,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         data_limit_mb = call.data.get("data_limit_mb")
         note = call.data.get("note")
 
-        coordinator = _get_coordinator_for_network_resource(hass, site_id=site_id)
+        coordinator, _ = _get_coordinator_for_network_resource(hass, site_id=site_id)
 
         await coordinator.async_generate_voucher(
             site_id,
@@ -1131,7 +1700,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         site_id = call.data["site_id"]
         voucher_id = call.data["voucher_id"]
 
-        coordinator = _get_coordinator_for_network_resource(hass, site_id=site_id)
+        coordinator, _ = _get_coordinator_for_network_resource(hass, site_id=site_id)
 
         await coordinator.async_delete_voucher(site_id, voucher_id)
 
@@ -1139,10 +1708,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         """Handle the trigger_alarm service call."""
         alarm_id = call.data["alarm_id"]
 
-        # alarm_id is a user-defined alarm-manager webhook trigger, not a
-        # device: it appears in no coordinator collection, so the console is
-        # the only thing that can be resolved.
-        coordinator = _get_coordinator_for_protect_resource(
+        coordinator, _ = _get_coordinator_for_protect_resource(
             hass, console_id=call.data.get("console_id")
         )
 
@@ -1154,7 +1720,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         layout = call.data["layout"]
         is_default = call.data.get("is_default", False)
 
-        coordinator = _get_coordinator_for_protect_resource(
+        coordinator, _ = _get_coordinator_for_protect_resource(
             hass, console_id=call.data.get("console_id")
         )
 
@@ -1166,13 +1732,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_liveview(call: ServiceCall) -> None:
         """Handle the set_liveview service call."""
-        viewer_id = call.data["viewer_id"]
+        raw_viewer_id = _extract_target_id(call, "viewer_id")
+        if not raw_viewer_id:
+            msg = "Viewer ID or target is required"
+            raise ServiceValidationError(msg)
         liveview_id = call.data["liveview_id"]
 
-        coordinator = _get_coordinator_for_protect_resource(
+        coordinator, viewer_id = _get_coordinator_for_protect_resource(
             hass,
             resource_type="viewer",
-            resource_id=viewer_id,
+            resource_id=raw_viewer_id,
             secondary_resource_type="liveview",
             secondary_resource_id=liveview_id,
         )
