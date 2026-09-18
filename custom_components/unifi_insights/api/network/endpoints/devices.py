@@ -123,7 +123,6 @@ class DevicesEndpoint:
                         "Failed to validate device (%s): %s",
                         item.get("id")
                         or item.get("name")
-                        or item.get("macAddress")
                         or "unknown",
                         err,
                     )
