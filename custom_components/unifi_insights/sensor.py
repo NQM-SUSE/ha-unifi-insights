@@ -1332,19 +1332,18 @@ def _discover_protect_sensors(
                 continue
             has_storage = _has_storage_info(nvr_data)
             for nvr_desc in NVR_SENSOR_TYPES:
-                if nvr_desc.device_type == DEVICE_TYPE_NVR:
-                    if nvr_desc.key.startswith("storage_") and not has_storage:
-                        continue
-                    nvr_key = (nvr_id, nvr_desc.key)
-                    if nvr_key not in known_sensor_keys:
-                        known_sensor_keys.add(nvr_key)
-                        entities.append(
-                            UnifiProtectNVRSensor(
-                                coordinator=coordinator,
-                                description=nvr_desc,
-                                device_id=nvr_id,
-                            )
+                if nvr_desc.key.startswith("storage_") and not has_storage:
+                    continue
+                nvr_key = (nvr_id, nvr_desc.key)
+                if nvr_key not in known_sensor_keys:
+                    known_sensor_keys.add(nvr_key)
+                    entities.append(
+                        UnifiProtectNVRSensor(
+                            coordinator=coordinator,
+                            description=nvr_desc,
+                            device_id=nvr_id,
                         )
+                    )
 
 
 async def async_setup_entry(
