@@ -6,13 +6,17 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import (
     config_validation as cv,
+)
+from homeassistant.helpers import (
     device_registry as dr,
+)
+from homeassistant.helpers import (
     entity_registry as er,
 )
-import voluptuous as vol
 
 from .const import (
     CHIME_RINGTONE_CHRISTMAS,
@@ -303,8 +307,10 @@ def _resolve_network_device_id(
                 matching_e = [
                     e for e in entries if e.entry_id == ent_entry.config_entry_id
                 ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
+                if not matching_e:
+                    msg = "Target's UniFi console is not loaded"
+                    raise ServiceValidationError(msg)
+                resolved_entry = matching_e[0]
             if ent_entry.device_id and dev_reg is not None:
                 dev_entry = dev_reg.async_get(ent_entry.device_id)
 
@@ -327,7 +333,7 @@ def _resolve_network_device_id(
                                 ):
                                     return d, s, entry
             parts = ent_entry.unique_id.split("_")
-            if len(parts) >= 2:
+            if len(parts) > 1:
                 return parts[1], parts[0], resolved_entry
 
         if dev_entry is not None:
@@ -339,6 +345,10 @@ def _resolve_network_device_id(
             )
             if not matching_config_entries and not has_domain_identifier:
                 msg = f"Target '{device_id}' is not a UniFi Insights device"
+                raise ServiceValidationError(msg)
+
+            if dev_entry.config_entries and not matching_config_entries:
+                msg = "Target's UniFi console is not loaded"
                 raise ServiceValidationError(msg)
 
             if resolved_entry is None and matching_config_entries:
@@ -418,8 +428,10 @@ def _resolve_protect_resource_id(
                     for e in protect_entries
                     if e.entry_id == ent_entry.config_entry_id
                 ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
+                if not matching_e:
+                    msg = "Target's UniFi console is not loaded"
+                    raise ServiceValidationError(msg)
+                resolved_entry = matching_e[0]
             if ent_entry.device_id and dev_reg is not None:
                 dev_entry = dev_reg.async_get(ent_entry.device_id)
 
@@ -463,6 +475,10 @@ def _resolve_protect_resource_id(
                 msg = f"Target '{resource_id}' is not a UniFi Protect {resource_type}"
                 raise ServiceValidationError(msg)
 
+            if dev_entry.config_entries and not matching_config_entries:
+                msg = "Target's UniFi console is not loaded"
+                raise ServiceValidationError(msg)
+
             if resolved_entry is None and matching_config_entries:
                 resolved_entry = matching_config_entries[0]
 
@@ -475,7 +491,10 @@ def _resolve_protect_resource_id(
                     return native_id, resolved_entry
                 if ident.startswith("protect_"):
                     actual_type = ident.split("_")[1]
-                    msg = f"Target '{resource_id}' is a {actual_type}, not a {resource_type}"
+                    msg = (
+                        f"Target '{resource_id}' is a {actual_type},"
+                        f" not a {resource_type}"
+                    )
                     raise ServiceValidationError(msg)
 
             if ent_reg is not None and resource_type == "camera":
@@ -488,7 +507,10 @@ def _resolve_protect_resource_id(
                         parts = remainder.split("_")
                         return parts[0], resolved_entry
 
-        msg = f"Could not resolve target '{resource_id}' to a UniFi Protect {resource_type}"
+        msg = (
+            f"Could not resolve target '{resource_id}'"
+            f" to a UniFi Protect {resource_type}"
+        )
         raise ServiceValidationError(msg)
 
     return resource_id, None
@@ -515,7 +537,12 @@ def _resolve_network_client_id(
         else None
     )
 
-    if "." in client_id and (ent_reg is None or ent_reg.async_get(client_id) is None):
+    is_dotted_mac = re.fullmatch(r"(?:[0-9a-fA-F]{4}\.){2}[0-9a-fA-F]{4}", client_id)
+    if (
+        "." in client_id
+        and not is_dotted_mac
+        and (ent_reg is None or ent_reg.async_get(client_id) is None)
+    ):
         msg = f"Target entity '{client_id}' not found in entity registry"
         raise ServiceValidationError(msg)
 
@@ -533,8 +560,10 @@ def _resolve_network_client_id(
                 matching_e = [
                     e for e in entries if e.entry_id == ent_entry.config_entry_id
                 ]
-                if matching_e:
-                    resolved_entry = matching_e[0]
+                if not matching_e:
+                    msg = "Target's UniFi console is not loaded"
+                    raise ServiceValidationError(msg)
+                resolved_entry = matching_e[0]
             if ent_entry.device_id and dev_reg is not None:
                 dev_entry = dev_reg.async_get(ent_entry.device_id)
 
@@ -553,7 +582,7 @@ def _resolve_network_client_id(
                     resolved_entry,
                 )
             parts = ent_entry.unique_id.split("_")
-            if len(parts) >= 2:
+            if len(parts) > 1:
                 return parts[1], resolved_entry
 
         if dev_entry is not None:
@@ -565,6 +594,10 @@ def _resolve_network_client_id(
             )
             if not matching_config_entries and not has_domain_identifier:
                 msg = f"Target '{client_id}' is not a UniFi Insights device"
+                raise ServiceValidationError(msg)
+
+            if dev_entry.config_entries and not matching_config_entries:
+                msg = "Target's UniFi console is not loaded"
                 raise ServiceValidationError(msg)
 
             if resolved_entry is None and matching_config_entries:
@@ -656,7 +689,10 @@ def _get_coordinator_for_network_resource(
             msg = (
                 f"Device '{native_device_id}' not found on console for site '{site_id}'"
                 if site_id
-                else f"Device '{native_device_id}' not found on any configured UniFi console"
+                else (
+                    f"Device '{native_device_id}' not found"
+                    " on any configured UniFi console"
+                )
             )
             raise ServiceValidationError(msg)
 
@@ -839,14 +875,16 @@ def _get_coordinator_for_protect_resource(
                 matching_entries = explicit_matches
             elif len(explicit_matches) > 1:
                 msg = (
-                    f"Multiple Protect consoles contain {resource_type} '{native_resource_id}';"
+                    f"Multiple Protect consoles contain {resource_type}"
+                    f" '{native_resource_id}';"
                     " target is ambiguous"
                 )
                 raise ServiceValidationError(msg)
             else:
                 msg = (
                     f"Cannot tell which Protect console owns {resource_type}"
-                    f" '{native_resource_id}' yet; retry once the consoles have refreshed"
+                    f" '{native_resource_id}' yet;"
+                    " retry once the consoles have refreshed"
                 )
                 raise ServiceValidationError(msg)
 
@@ -855,10 +893,19 @@ def _get_coordinator_for_protect_resource(
     # Validate secondary resource if provided (e.g. chime camera_id)
     if secondary_resource_type and secondary_resource_id:
         native_sec_id = secondary_resource_id
+        secondary_entry = None
         if secondary_resource_type in ("camera", "light", "chime", "viewer"):
-            native_sec_id, _ = _resolve_protect_resource_id(
+            native_sec_id, secondary_entry = _resolve_protect_resource_id(
                 hass, secondary_resource_type, secondary_resource_id, protect_entries
             )
+
+        if secondary_entry is not None and secondary_entry != target_entry:
+            msg = (
+                f"{secondary_resource_type.capitalize()} '{secondary_resource_id}'"
+                " belongs to a different Protect console than"
+                f" {resource_type} '{resource_id}'"
+            )
+            raise ServiceValidationError(msg)
 
         sec_collection_key = {
             "camera": "cameras",
@@ -1575,6 +1622,22 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         coordinator, client_id = _get_coordinator_for_network_resource(
             hass, site_id=site_id, client_id=raw_client_id
         )
+
+        # Trackers identify clients by MAC; the Integration API needs the
+        # native client ID from the selected site's cached client records.
+        data = coordinator.data
+        if isinstance(data, dict):
+            clients = data.get("clients", {})
+            site_clients = clients.get(site_id, {}) if isinstance(clients, dict) else {}
+            if (
+                isinstance(site_clients, dict)
+                and client_id is not None
+                and client_id not in site_clients
+            ):
+                for native_id, record in site_clients.items():
+                    if _client_records_match({native_id: record}, client_id):
+                        client_id = native_id
+                        break
 
         await coordinator.async_authorize_guest(site_id, client_id)
 
