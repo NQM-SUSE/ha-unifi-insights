@@ -510,8 +510,7 @@ def _get_coordinator_for_protect_resource(
             # say so instead of guessing at the first one.
             msg = (
                 f"Cannot tell which Protect console owns {resource_type}"
-                f" '{resource_id}' yet; set 'console_id' or retry once the"
-                " consoles have refreshed"
+                f" '{resource_id}' yet; retry once the consoles have refreshed"
             )
             raise ServiceValidationError(msg)
 

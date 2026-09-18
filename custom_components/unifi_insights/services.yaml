@@ -56,8 +56,9 @@ set_chime_volume:
     camera_id:
       name: Camera ID
       description: >-
-        Optional camera ID, used only to pick the console that owns the chime
-        when more than one is configured. This integration applies the volume
+        Optional camera ID, used only to validate that the camera belongs to
+        the same console as the resolved chime; a mismatch is logged but does
+        not change which console is used. This integration applies the volume
         chime-wide.
       required: false
       example: "60e9c8c0e3e4b8001a123456"
@@ -121,8 +122,9 @@ set_chime_ringtone:
     camera_id:
       name: Camera ID
       description: >-
-        Optional camera ID, used only to pick the console that owns the chime
-        when more than one is configured. This integration applies the ringtone
+        Optional camera ID, used only to validate that the camera belongs to
+        the same console as the resolved chime; a mismatch is logged but does
+        not change which console is used. This integration applies the ringtone
         chime-wide.
       required: false
       example: "60e9c8c0e3e4b8001a123456"
@@ -153,8 +155,9 @@ set_chime_repeat_times:
     camera_id:
       name: Camera ID
       description: >-
-        Optional camera ID, used only to pick the console that owns the chime
-        when more than one is configured. This integration applies the repeat
+        Optional camera ID, used only to validate that the camera belongs to
+        the same console as the resolved chime; a mismatch is logged but does
+        not change which console is used. This integration applies the repeat
         count chime-wide.
       required: false
       example: "60e9c8c0e3e4b8001a123456"
