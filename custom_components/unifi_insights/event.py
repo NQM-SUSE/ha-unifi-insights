@@ -114,7 +114,9 @@ async def async_setup_entry(
         # Add sensor open/close event entities
         sensors = protect.get("sensors", {})
         if isinstance(sensors, dict):
-            for sensor_id in sensors:
+            for sensor_id, sensor_data in sensors.items():
+                if not isinstance(sensor_data, dict):
+                    continue
                 sensor_key = (sensor_id, "sensor")
                 if sensor_key not in known_event_keys:
                     known_event_keys.add(sensor_key)

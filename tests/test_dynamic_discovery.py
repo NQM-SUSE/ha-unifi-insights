@@ -473,3 +473,134 @@ class TestDynamicDiscoveryResilience:
 
         assert mock_coordinator.async_add_listener.call_count == 1
         assert mock_config_entry.async_on_unload.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "setup_fn"),
+        [
+            ("update", async_setup_update),
+            ("binary_sensor", async_setup_binary_sensor),
+            ("sensor", async_setup_sensor),
+            ("button", async_setup_button),
+            ("switch", async_setup_switch),
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("number", async_setup_number),
+            ("select", async_setup_select),
+            ("event", async_setup_event),
+            ("image", async_setup_image),
+        ],
+    )
+    async def test_listener_malformed_records_and_collections(
+        self,
+        name: str,
+        setup_fn: Any,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Listeners handle malformed collections and records inside coordinator data."""
+        add_entities = MagicMock()
+        await setup_fn(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        malformed_payloads = [
+            # Collections are not dicts
+            {
+                "devices": {"site1": "not-a-dict"},
+                "clients": {"site1": "not-a-dict"},
+                "wifi": {"site1": "not-a-dict"},
+                "firewall_rules": {"site1": "not-a-dict"},
+                "policy_routes": {"site1": "not-a-dict"},
+                "vpn_clients": {"site1": "not-a-dict"},
+                "protect": {
+                    "cameras": "not-a-dict",
+                    "lights": "not-a-dict",
+                    "sensors": "not-a-dict",
+                    "chimes": "not-a-dict",
+                    "viewers": "not-a-dict",
+                },
+                "stats": {"site1": "not-a-dict"},
+            },
+            # Records within collections are not dicts or missing fields
+            {
+                "devices": {
+                    "site1": {
+                        "dev_str": "not-a-dict",
+                        "dev_bad_outlets": {
+                            "id": "dev_bad_outlets",
+                            "name": "PDU",
+                            "features": ["switching"],
+                            "outlet_table": "not-a-list",
+                            "interfaces": {"ports": "not-a-list"},
+                        },
+                        "dev_bad_outlets_list": {
+                            "id": "dev_bad_outlets_list",
+                            "name": "PDU2",
+                            "features": ["switching"],
+                            "outlet_table": [
+                                "not-a-dict",
+                                {},
+                                {"index": "not-an-int"},
+                            ],
+                            "interfaces": {
+                                "ports": ["not-a-dict", {}],
+                            },
+                        },
+                    }
+                },
+                "clients": {"site1": {"c_str": "not-a-dict"}},
+                "wifi": {
+                    "site1": {
+                        "w_str": "not-a-dict",
+                        "w_no_qr": {"name": "WiFi", "qr_code": None},
+                        "w_valid": {"name": "Guest", "qr_code": "WIFI:S:Guest;;"},
+                    }
+                },
+                "firewall_rules": {"site1": {"r_str": "not-a-dict"}},
+                "policy_routes": {"site1": {"pr_str": "not-a-dict"}},
+                "vpn_clients": {"site1": {"vpn_str": "not-a-dict"}},
+                "protect": {
+                    "cameras": {"cam_str": "not-a-dict"},
+                    "lights": {"light_str": "not-a-dict"},
+                    "sensors": {"sensor_str": "not-a-dict"},
+                    "chimes": {"chime_str": "not-a-dict"},
+                    "viewers": {"viewer_str": "not-a-dict"},
+                },
+                "stats": {
+                    "site1": {
+                        "dev_bad_outlets": "not-a-dict",
+                    }
+                },
+            },
+        ]
+
+        for payload in malformed_payloads:
+            mock_coordinator.data = payload
+            listener()
+
+        # Run again with same payload to trigger duplicate skips
+        listener()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "setup_fn"),
+        [
+            ("camera", async_setup_camera),
+            ("light", async_setup_light),
+            ("number", async_setup_number),
+        ],
+    )
+    async def test_protect_platforms_skip_when_no_protect_client(
+        self,
+        name: str,
+        setup_fn: Any,
+        hass: Any,
+        mock_coordinator: MagicMock,
+        mock_config_entry: MagicMock,
+    ) -> None:
+        """Protect platforms return early when protect_client is None."""
+        mock_coordinator.protect_client = None
+        add_entities = MagicMock()
+        await setup_fn(hass, mock_config_entry, add_entities)
+        add_entities.assert_not_called()
