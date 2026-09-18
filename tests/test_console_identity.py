@@ -26,6 +26,7 @@ from custom_components.unifi_insights import (
     _is_console_device,
     async_migrate_entry,
 )
+from custom_components.unifi_insights.api import UniFiResponseError
 from custom_components.unifi_insights.const import (
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
@@ -593,6 +594,79 @@ async def test_reconfigure_local_account_mismatch(
         )
         assert result["type"] == FlowResultType.ABORT
         assert result["reason"] == "account_mismatch"
+
+
+async def test_reconfigure_without_any_prior_identity_writes_no_console_id(
+    hass: HomeAssistant,
+) -> None:
+    """An entry with nothing to preserve still must not store an empty id.
+
+    Once the stored console id is used as a fallback, ``new_id`` is only
+    falsy for a legacy entry that has neither CONF_CONSOLE_ID nor a
+    unique_id, reconfigured to a host that yields no derivable id. The
+    entry must then be left without a CONF_CONSOLE_ID key rather than
+    gaining an empty one.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=None,
+        title="UniFi - Legacy",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+            CONF_HOST: "192.168.1.70",
+            CONF_API_KEY: "existing_key",
+            CONF_VERIFY_SSL: False,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    net_cm_err, net_client_err = _make_mock_client()
+    net_client_err.sites.get_all = AsyncMock(
+        side_effect=UniFiResponseError("Not Found", status_code=404)
+    )
+    protect_client = MagicMock()
+    protect_client.cameras.get_all = AsyncMock(return_value=[MagicMock()])
+    protect_client.nvr.get = AsyncMock(return_value=None)
+    protect_cm = MagicMock()
+    protect_cm.__aenter__ = AsyncMock(return_value=protect_client)
+    protect_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiNetworkClient",
+            return_value=net_cm_err,
+        ),
+        patch(
+            "custom_components.unifi_insights.config_flow.UniFiProtectClient",
+            return_value=protect_cm,
+        ),
+        patch("custom_components.unifi_insights.config_flow.LocalAuth"),
+        patch(
+            "custom_components.unifi_insights.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": config_entries.SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_HOST: "",
+                CONF_API_KEY: "existing_key",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+        await hass.async_block_till_done()
+
+        assert result["type"] == FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        assert CONF_CONSOLE_ID not in entry.data
+        assert entry.unique_id is None
 
 
 async def test_reconfigure_transient_device_error_preserves_console_mac(
