@@ -782,8 +782,6 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                             except UniFiAuthenticationError:
                                 errors[CONF_CONSOLE_ID] = "invalid_console_id"
 
-            except AbortFlow:
-                raise
             except UniFiAuthenticationError:
                 errors[CONF_API_KEY] = "invalid_auth"
             except UniFiConnectionError:
