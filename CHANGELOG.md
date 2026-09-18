@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.9.4] - 2026-09-19
+
 ### Added
 
 - New devices and entities now appear on their own, without reloading the integration. Adopting an access point, switch or Protect camera, plugging in an SFP transceiver, or a device gaining a new capability previously left the matching entities missing until the integration was reloaded or Home Assistant was restarted, because all eleven entity platforms only created entities during setup. Every platform now re-checks the coordinator data as it arrives and adds whatever is new, tracking what it has already created so nothing is duplicated, and honouring the **Client control** option for the entities it gates. [#143](https://github.com/ruaan-deysel/ha-unifi-insights/pull/143)
