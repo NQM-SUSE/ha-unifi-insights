@@ -483,9 +483,14 @@ async def test_transport_change_preserves_device_and_entity_registry(
         assert result["type"] == FlowResultType.ABORT
         assert result["reason"] == "reconfigure_successful"
 
-    registered_device = device_registry.async_get_device_by_identifier(
-        (DOMAIN, "gateway_mac_123"), entry.entry_id
-    )
+    if hasattr(device_registry, "async_get_device_by_identifier"):
+        registered_device = device_registry.async_get_device_by_identifier(
+            (DOMAIN, "gateway_mac_123"), entry.entry_id
+        )
+    else:
+        registered_device = device_registry.async_get_device(
+            identifiers={(DOMAIN, "gateway_mac_123")}
+        )
     assert registered_device is not None
     assert registered_device.id == device.id
     assert entry.entry_id in registered_device.config_entries
