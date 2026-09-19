@@ -23,8 +23,8 @@ from custom_components.unifi_insights.api.network.models import (
     parse_outlet_metrics,
 )
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
+from custom_components.unifi_insights.helpers import async_get_device_entry
 
-from ..helpers import async_get_device_entry
 from .base import UnifiBaseCoordinator
 
 if TYPE_CHECKING:

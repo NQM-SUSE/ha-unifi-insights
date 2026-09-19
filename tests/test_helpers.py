@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+from homeassistant.helpers import device_registry as dr
 
 from custom_components.unifi_insights import helpers
 from custom_components.unifi_insights.helpers import async_get_device_entry
@@ -77,8 +78,6 @@ def test_legacy_fallback_when_new_apis_absent(monkeypatch, registry):
 
 def test_capability_flags_match_installed_homeassistant():
     """The detected capabilities reflect the real HA device registry class."""
-    from homeassistant.helpers import device_registry as dr
-
     expected_by_identifier = hasattr(
         dr.DeviceRegistry, "async_get_device_by_identifier"
     )
