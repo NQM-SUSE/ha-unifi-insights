@@ -483,10 +483,8 @@ async def test_transport_change_preserves_device_and_entity_registry(
         assert result["type"] == FlowResultType.ABORT
         assert result["reason"] == "reconfigure_successful"
 
-    from custom_components.unifi_insights.helpers import async_get_device_entry
-
-    registered_device = async_get_device_entry(
-        device_registry, (DOMAIN, "gateway_mac_123"), entry.entry_id
+    registered_device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, "gateway_mac_123"), entry.entry_id
     )
     assert registered_device is not None
     assert registered_device.id == device.id
