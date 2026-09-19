@@ -24,6 +24,7 @@ from custom_components.unifi_insights.api.network.models import (
 )
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
 
+from ..helpers import async_get_device_entry
 from .base import UnifiBaseCoordinator
 
 if TYPE_CHECKING:
@@ -967,8 +968,10 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             self._previous_network_device_ids - current_network_device_ids
         )
         for device_identifier in stale_network_ids:
-            device = device_registry.async_get_device(
-                identifiers={(DOMAIN, device_identifier)}
+            device = async_get_device_entry(
+                device_registry,
+                (DOMAIN, device_identifier),
+                self.config_entry.entry_id,
             )
             if device:
                 _LOGGER.info(
