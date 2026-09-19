@@ -49,6 +49,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
         network_client: UniFiNetworkClient,
         protect_client: UniFiProtectClient | None,
         entry: ConfigEntry,
+        *,
         network_available: bool = True,
     ) -> None:
         """Initialize the config coordinator."""
