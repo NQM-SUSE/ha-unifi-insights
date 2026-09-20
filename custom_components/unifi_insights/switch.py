@@ -37,6 +37,8 @@ from .entity import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -103,6 +105,167 @@ def _resolve_site_name(coordinator: UnifiFacadeCoordinator, site_id: str) -> str
         or site_data.get("name")
         or site_id
     )
+
+
+def _stale_switch_unique_ids(
+    coordinator: UnifiFacadeCoordinator,
+    reg_entries: list[er.RegistryEntry],
+    *,
+    unique_id_suffix: str,
+    data_key: str,
+    availability_fn: Callable[[str], bool],
+) -> set[str]:
+    """
+    Return unique_ids of switches whose backing object no longer exists.
+
+    Policy-based-route, firewall-rule, and VPN-client switches have no
+    cleanup: deleting the underlying object on the console leaves ``available``
+    (each type's own property) permanently False, but nothing ever removes the
+    entity-registry row. This mirrors the client-block-switch cleanup
+    (``async_setup_entry`` above) and the stale port-sensor cleanup
+    (``sensor.py``), generalised to a table-driven
+    ``(unique_id_suffix, data_key, availability_fn)`` spec.
+
+    The three switch types do **not** share an availability predicate:
+    ``config_available`` is global while ``firewall_available(site_id)`` is
+    site-scoped, so each call site passes its own ``availability_fn``.
+    Hard-coding one predicate for all three would prune, e.g., every
+    firewall-rule entity during a firewall-only degradation while
+    ``config_available`` stays True.
+
+    A site is only "genuinely fetched" -- and therefore eligible for pruning
+    -- when all of these hold for it: ``availability_fn(site_id)`` is True,
+    ``coordinator.data[data_key][site_id]`` is present and a ``dict``, and
+    that dict is **non-empty**. A site that is missing, non-dict, empty, or
+    whose availability predicate is False is left alone entirely.
+
+    The non-empty requirement matters because only firewall rules have a
+    per-site failure signal. On a failed firewall fetch the coordinator
+    records the site in ``_failed_sections`` and restores the *previous*
+    per-site data, so ``firewall_available(site_id)`` gates it out. Policy-
+    based routes and VPN clients have no equivalent: a transient per-site
+    failure stores ``{}`` for that site while the overall refresh succeeds
+    and ``config_available`` stays True. Without the non-empty check, one
+    timeout during startup would delete every route/VPN row for that site.
+    """
+    collections = coordinator.data.get(data_key)
+    if not isinstance(collections, dict):
+        return set()
+
+    # Every site id the integration knows about, not just the qualified ones.
+    # Needed to detect an ambiguous prefix match below.
+    known_site_ids: set[str] = set(collections)
+    sites = coordinator.data.get("sites")
+    if isinstance(sites, dict):
+        known_site_ids |= set(sites)
+
+    live_unique_ids: set[str] = set()
+    qualified_site_ids: set[str] = set()
+    for site_id, site_objects in collections.items():
+        if not isinstance(site_objects, dict):
+            continue
+        if not site_objects:
+            # An EMPTY collection is never sufficient evidence to prune.
+            # Policy-based routes and VPN clients have no per-site "fetched
+            # successfully" signal: on a transient per-site fetch failure the
+            # config coordinator stores `{}` for that site while the overall
+            # refresh still succeeds, so `config_available` stays True. An
+            # empty dict is therefore indistinguishable from "every object
+            # was deleted", and treating it as the latter would delete every
+            # row of this type for the site. The cost of this guard is that
+            # deleting the *last* object of a type on a site leaves its
+            # entity behind; that is strictly better than the alternative.
+            continue
+        if not availability_fn(site_id):
+            continue
+        qualified_site_ids.add(site_id)
+        for object_id in site_objects:
+            live_unique_ids.add(f"{site_id}_{object_id}{unique_id_suffix}")
+
+    if not qualified_site_ids:
+        return set()
+
+    stale: set[str] = set()
+    for reg_entry in reg_entries:
+        unique_id = reg_entry.unique_id
+        if not unique_id.endswith(unique_id_suffix):
+            continue
+        # `startswith` alone is ambiguous when one site id is a prefix of
+        # another (site `s` also matches `s_backup_<id>_<suffix>`). Require
+        # exactly one known site to claim the row before trusting it.
+        matching_site_ids = {
+            site_id for site_id in known_site_ids if unique_id.startswith(f"{site_id}_")
+        }
+        if len(matching_site_ids) != 1:
+            continue
+        if matching_site_ids.pop() not in qualified_site_ids:
+            # Belongs to a site we did not just fetch (or none at all) --
+            # never prune based on data we cannot confirm is current.
+            continue
+        if unique_id not in live_unique_ids:
+            stale.add(unique_id)
+
+    return stale
+
+
+def _prune_orphaned_switch_entities(
+    hass: HomeAssistant,
+    entry: UnifiInsightsConfigEntry,
+    coordinator: UnifiFacadeCoordinator,
+) -> None:
+    """
+    Remove registry rows for deleted routes, rules, and VPN clients.
+
+    Runs once, after the first discovery pass in ``async_setup_entry`` --
+    NOT on every coordinator update -- following the ``sensor.py`` stale
+    port-sensor precedent. Dynamic discovery already re-adds an entity if the
+    same id reappears; this only removes rows whose object is confirmed gone.
+
+    Deliberately excludes ``UnifiWifiSwitch`` (gated by
+    ``wifi_available(site_id)``), which has the identical orphan gap. Left as
+    a noted follow-up: deleting a WiFi network is rarer than deleting a route,
+    rule, or VPN client, and keeping this first cleanup PR's blast radius
+    small matters more than completeness.
+    """
+    registry = er.async_get(hass)
+    reg_entries = [
+        reg_entry
+        for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id)
+        if reg_entry.domain == "switch" and reg_entry.platform == DOMAIN
+    ]
+
+    specs: tuple[tuple[str, str, Callable[[str], bool]], ...] = (
+        (
+            "_policy_based_route",
+            "policy_based_routes",
+            lambda _site_id: coordinator.config_available,
+        ),
+        (
+            "_firewall_rule",
+            "firewall_rules",
+            coordinator.firewall_available,
+        ),
+        (
+            "_vpn_client",
+            "vpn_clients",
+            lambda _site_id: coordinator.config_available,
+        ),
+    )
+
+    stale_unique_ids: set[str] = set()
+    for unique_id_suffix, data_key, availability_fn in specs:
+        stale_unique_ids |= _stale_switch_unique_ids(
+            coordinator,
+            reg_entries,
+            unique_id_suffix=unique_id_suffix,
+            data_key=data_key,
+            availability_fn=availability_fn,
+        )
+
+    for reg_entry in reg_entries:
+        if reg_entry.unique_id in stale_unique_ids:
+            _LOGGER.debug("Removing orphaned switch entity: %s", reg_entry.unique_id)
+            registry.async_remove(reg_entry.entity_id)
 
 
 async def async_setup_entry(
@@ -290,7 +453,7 @@ async def async_setup_entry(
                             continue
                         try:
                             outlet_idx = int(idx)
-                        except (TypeError, ValueError):
+                        except TypeError, ValueError:
                             continue
 
                         switch_key = (site_id, device_id, outlet_idx, "outlet_switch")
@@ -373,6 +536,12 @@ async def async_setup_entry(
         first_setup = False
 
     async_discover_switches()
+
+    # One-time prune of orphaned PBR/firewall-rule/VPN-client switches -- see
+    # docstring. Must run after the discovery pass above (so coordinator.data
+    # reflects the first refresh) and only once, not on every listener tick.
+    _prune_orphaned_switch_entities(hass, entry, coordinator)
+
     entry.async_on_unload(coordinator.async_add_listener(async_discover_switches))
 
 
@@ -1457,7 +1626,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
         return None
 
@@ -1488,7 +1657,7 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                                 if cycle_enabled is not None:
                                     outlet["cycle_enabled"] = cycle_enabled
                                 break
-                        except (TypeError, ValueError):
+                        except TypeError, ValueError:
                             continue
 
     @property
@@ -1667,7 +1836,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
         return None
 
@@ -1694,7 +1863,7 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                             if int(idx) == self._outlet_index:
                                 outlet["cycle_enabled"] = cycle_enabled
                                 break
-                        except (TypeError, ValueError):
+                        except TypeError, ValueError:
                             continue
 
     @property

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
@@ -43,6 +43,7 @@ from custom_components.unifi_insights.switch import (
     UnifiProtectStatusLightSwitch,
     UnifiVpnClientSwitch,
     UnifiWifiSwitch,
+    _prune_orphaned_switch_entities,
     async_setup_entry,
 )
 
@@ -251,6 +252,295 @@ class TestAsyncSetupEntry:
         listener()
 
         assert async_add_entities.call_count == 1
+
+
+# (data_key, unique_id_suffix, availability_attr) -- availability_attr is
+# either a plain bool attribute ("config_available") or a callable taking
+# site_id ("firewall_available"). Table-driven to match the production
+# helper's own (unique_id_suffix, data_key, availability_fn) spec.
+_ORPHAN_TYPE_PARAMS = [
+    pytest.param(
+        "policy_based_routes", "_policy_based_route", "config_available", id="pbr"
+    ),
+    pytest.param(
+        "firewall_rules", "_firewall_rule", "firewall_available", id="firewall_rule"
+    ),
+    pytest.param("vpn_clients", "_vpn_client", "config_available", id="vpn_client"),
+]
+
+
+class TestPruneOrphanedSwitchEntities:
+    """Tests for `_prune_orphaned_switch_entities`.
+
+    Deleting a policy-based route, firewall rule, or VPN client on the
+    console leaves its switch permanently unavailable (see each class's
+    `available` property) with nothing to remove it from the entity
+    registry. These tests lock down the per-type availability guard: each
+    of the three types must use its OWN availability predicate, never a
+    shared one, or a firewall-specific outage would wipe every PBR/VPN
+    entity too (and vice versa).
+    """
+
+    @pytest.fixture
+    def mock_coordinator(self) -> MagicMock:
+        """Coordinator with all three collections populated and available."""
+        coordinator = MagicMock()
+        coordinator.config_available = True
+        coordinator.firewall_available = MagicMock(return_value=True)
+        coordinator.data = {
+            "policy_based_routes": {"site1": {"route1": {}}},
+            "firewall_rules": {"site1": {"rule1": {}}},
+            "vpn_clients": {"site1": {"vpn1": {}}},
+        }
+        return coordinator
+
+    @staticmethod
+    def _reg_entry(unique_id: str) -> MagicMock:
+        """Build a fake `switch` domain, `unifi_insights` platform entry."""
+        entry = MagicMock()
+        entry.domain = "switch"
+        entry.platform = DOMAIN
+        entry.unique_id = unique_id
+        entry.entity_id = f"switch.{unique_id}"
+        return entry
+
+    def _prune(self, hass, coordinator, reg_entries) -> MagicMock:
+        """Run the prune against mocked registry lookups.
+
+        Returns the mock registry so callers can assert on
+        `async_remove` calls.
+        """
+        mock_entry = MagicMock()
+        mock_entry.entry_id = "entry1"
+        mock_registry = MagicMock()
+
+        with (
+            patch(
+                "custom_components.unifi_insights.switch.er.async_get",
+                return_value=mock_registry,
+            ),
+            patch(
+                "custom_components.unifi_insights.switch.er."
+                "async_entries_for_config_entry",
+                return_value=reg_entries,
+            ),
+        ):
+            _prune_orphaned_switch_entities(hass, mock_entry, coordinator)
+
+        return mock_registry
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_own_availability_false_prunes_nothing_even_if_others_true(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """This type's own predicate False -> zero pruned, regardless of the
+        other two types' predicates being True (the regression the per-type
+        guard exists to prevent)."""
+        if availability_attr == "firewall_available":
+            mock_coordinator.firewall_available = MagicMock(return_value=False)
+        else:
+            setattr(mock_coordinator, availability_attr, False)
+
+        stale_entry = self._reg_entry(f"site1_stale{suffix}")
+        registry = self._prune(hass, mock_coordinator, [stale_entry])
+
+        registry.async_remove.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_missing_data_key_prunes_nothing(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """Coordinator data missing the collection entirely -> zero pruned."""
+        del mock_coordinator.data[data_key]
+
+        stale_entry = self._reg_entry(f"site1_stale{suffix}")
+        registry = self._prune(hass, mock_coordinator, [stale_entry])
+
+        registry.async_remove.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_missing_site_key_prunes_nothing(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """Collection present but the entry's site_id key is absent from it
+        -> zero pruned (looks identical to a transient fetch failure)."""
+        mock_coordinator.data[data_key] = {}
+
+        stale_entry = self._reg_entry(f"site1_stale{suffix}")
+        registry = self._prune(hass, mock_coordinator, [stale_entry])
+
+        registry.async_remove.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_site_value_not_dict_prunes_nothing(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """Site key present but its value is not a dict -> zero pruned."""
+        mock_coordinator.data[data_key] = {"site1": "not-a-dict"}
+
+        stale_entry = self._reg_entry(f"site1_stale{suffix}")
+        registry = self._prune(hass, mock_coordinator, [stale_entry])
+
+        registry.async_remove.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_stale_id_pruned_siblings_untouched(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """Site present as a dict with one stale id -> exactly that entity
+        removed; a live sibling in the same site is untouched."""
+        live_id = next(iter(mock_coordinator.data[data_key]["site1"]))
+        live_entry = self._reg_entry(f"site1_{live_id}{suffix}")
+        stale_entry = self._reg_entry(f"site1_stale{suffix}")
+
+        registry = self._prune(hass, mock_coordinator, [live_entry, stale_entry])
+
+        registry.async_remove.assert_called_once_with(stale_entry.entity_id)
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_other_sites_unique_id_untouched_when_only_one_site_qualified(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """An entry whose site prefix does not match any qualified site is
+        left alone, even though a *different* site in the same collection
+        is qualified and has stale ids of its own pruned."""
+        mock_coordinator.data[data_key]["site2"] = "not-a-dict"
+
+        stale_site1 = self._reg_entry(f"site1_stale{suffix}")
+        site2_entry = self._reg_entry(f"site2_stale{suffix}")
+
+        registry = self._prune(hass, mock_coordinator, [stale_site1, site2_entry])
+
+        registry.async_remove.assert_called_once_with(stale_site1.entity_id)
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_empty_site_collection_prunes_nothing(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """An EMPTY per-site collection must never trigger a prune.
+
+        Regression test. Policy-based routes and VPN clients have no
+        per-site "fetched successfully" signal: on a transient per-site
+        fetch failure the config coordinator stores `{}` for that site
+        while the overall refresh still succeeds, leaving
+        `config_available` True. Treating that `{}` as "every object was
+        deleted" would irreversibly remove every row of this type for the
+        site on a single startup timeout.
+        """
+        mock_coordinator.data[data_key]["site1"] = {}
+
+        entry_a = self._reg_entry(f"site1_route_a{suffix}")
+        entry_b = self._reg_entry(f"site1_route_b{suffix}")
+
+        registry = self._prune(hass, mock_coordinator, [entry_a, entry_b])
+
+        registry.async_remove.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
+    )
+    def test_overlapping_site_ids_are_not_pruned_by_prefix_collision(
+        self, hass, mock_coordinator, data_key, suffix, availability_attr
+    ) -> None:
+        """A site id that is a prefix of another must not claim its rows.
+
+        Regression test. With qualified site `site1` and an unfetched
+        `site1_backup`, a plain `startswith("site1_")` also matches
+        `site1_backup_<id>`, so the second site's entities would be
+        deleted on evidence that says nothing about them. Ownership must
+        be unambiguous before anything is removed.
+        """
+        mock_coordinator.data[data_key]["site1_backup"] = {}
+        mock_coordinator.data.setdefault("sites", {})["site1_backup"] = {}
+
+        backup_entry = self._reg_entry(f"site1_backup_route1{suffix}")
+        stale_site1 = self._reg_entry(f"site1_stale{suffix}")
+
+        registry = self._prune(hass, mock_coordinator, [backup_entry, stale_site1])
+
+        registry.async_remove.assert_called_once_with(stale_site1.entity_id)
+
+    def test_non_matching_unique_ids_untouched(self, hass, mock_coordinator) -> None:
+        """A client-block switch (and any other unrelated unique_id) is never
+        considered by this cleanup, even when every predicate is True and the
+        stale ids for all three managed types are pruned."""
+        block_entry = self._reg_entry("site1_client1_block_switch")
+        stale_pbr = self._reg_entry("site1_stale_policy_based_route")
+        stale_rule = self._reg_entry("site1_stale_firewall_rule")
+        stale_vpn = self._reg_entry("site1_stale_vpn_client")
+
+        registry = self._prune(
+            hass, mock_coordinator, [block_entry, stale_pbr, stale_rule, stale_vpn]
+        )
+
+        removed_ids = {call.args[0] for call in registry.async_remove.call_args_list}
+        assert removed_ids == {
+            stale_pbr.entity_id,
+            stale_rule.entity_id,
+            stale_vpn.entity_id,
+        }
+
+    async def test_setup_entry_prunes_once_not_on_every_listener_tick(
+        self, hass
+    ) -> None:
+        """The prune runs once during setup, after the first discovery pass
+        -- not on every coordinator update (dynamic discovery fires on every
+        tick; re-running the prune there would be wasted work at best)."""
+        coordinator = MagicMock()
+        coordinator.protect_client = None
+        coordinator.config_available = True
+        coordinator.firewall_available = MagicMock(return_value=True)
+        coordinator.data = {
+            "sites": {},
+            "devices": {},
+            "clients": {},
+            "wifi": {},
+            "firewall_rules": {},
+            "policy_based_routes": {},
+            "vpn_clients": {},
+            "protect": {
+                "cameras": {},
+                "lights": {},
+                "sensors": {},
+                "nvrs": {},
+                "viewers": {},
+                "chimes": {},
+                "liveviews": {},
+            },
+        }
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = coordinator
+        mock_entry.options = {CONF_CLIENT_CONTROL: True}
+
+        async_add_entities = MagicMock()
+
+        with patch(
+            "custom_components.unifi_insights.switch._prune_orphaned_switch_entities"
+        ) as mock_prune:
+            await async_setup_entry(hass, mock_entry, async_add_entities)
+            listener = coordinator.async_add_listener.call_args[0][0]
+
+            assert mock_prune.call_count == 1
+
+            listener()
+
+            assert mock_prune.call_count == 1
 
 
 class TestUnifiProtectMicrophoneSwitch:
