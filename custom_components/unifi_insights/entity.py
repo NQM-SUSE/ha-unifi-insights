@@ -41,6 +41,25 @@ def get_field(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return default
 
 
+def first_not_none(*values: Any, default: Any = None) -> Any:
+    """
+    Return the first value that is not None.
+
+    This is the value-level companion to `get_field`'s key-level None-skip:
+    `get_field` already skips a candidate *key* whose value is None, but
+    callers that then chain the resulting *values* together with `or` are
+    falsy-based, not None-based, and `or` silently discards a legitimate
+    `0` (or `False`/`""`) in favour of the next candidate. Use this helper
+    wherever multiple candidate values for a numeric measurement or counter
+    (rate, power, bytes, temperature, percentage, count) are combined, so a
+    real `0` reading is preserved instead of being coerced into `None`.
+    """
+    for value in values:
+        if value is not None:
+            return value
+    return default
+
+
 def device_has_feature(device_data: dict[str, Any], *features_to_match: str) -> bool:
     """
     Return True when a device advertises any of the requested features.

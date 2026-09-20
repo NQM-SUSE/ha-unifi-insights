@@ -4,11 +4,25 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from homeassistant.const import PERCENTAGE, UnitOfInformation, UnitOfTemperature
+from homeassistant.const import (
+    CONF_API_KEY,
+    CONF_HOST,
+    CONF_VERIFY_SSL,
+    PERCENTAGE,
+    UnitOfInformation,
+    UnitOfTemperature,
+)
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers import entity_registry as er
 
+from custom_components.unifi_insights.const import (
+    CONF_CONNECTION_TYPE,
+    CONNECTION_TYPE_LOCAL,
+    DOMAIN,
+)
 from custom_components.unifi_insights.sensor import (
     NVR_SENSOR_TYPES,
     OUTLET_SENSOR_TYPES,
@@ -475,6 +489,192 @@ class TestUnifiInsightsSensor:
         assert sensor.unique_id == "site1_device1_cpu_usage"
 
 
+class TestUplinkRateZeroIsZeroNotNone:
+    """
+    Headline regression: a literal 0 rate must read 0, never unknown.
+
+    `or` is falsy-based, so `0 or <fallback>` silently discards a real 0
+    reading. These tests assert both `== 0` and `is not None` at the
+    value_fn level, because `assert not x` would also pass for None and
+    is exactly the mistake this bug class is guarding against.
+    """
+
+    @pytest.mark.parametrize(
+        ("sensor_key", "api_key"),
+        [
+            ("tx_rate", "txRateBps"),
+            ("rx_rate", "rxRateBps"),
+        ],
+    )
+    async def test_uplink_rate_zero_is_zero_not_none(
+        self, hass: HomeAssistant, mock_coordinator, sensor_key, api_key
+    ):
+        """A device reporting a literal 0 B/s rate must yield 0, not None."""
+        description = next(s for s in SENSOR_TYPES if s.key == sensor_key)
+        mock_coordinator.data["stats"]["site1"]["device1"]["uplink"] = {
+            api_key: 0,
+        }
+
+        sensor = UnifiInsightsSensor(
+            coordinator=mock_coordinator,
+            description=description,
+            site_id="site1",
+            device_id="device1",
+        )
+
+        assert sensor.native_value == 0
+        assert sensor.native_value is not None
+
+    @pytest.mark.parametrize(
+        ("sensor_key", "api_key"),
+        [
+            ("tx_rate", "txRateBps"),
+            ("rx_rate", "rxRateBps"),
+        ],
+    )
+    async def test_uplink_rate_absent_key_stays_unknown(
+        self, hass: HomeAssistant, mock_coordinator, sensor_key, api_key
+    ):
+        """
+        Negative test: an absent key still yields None (state `unknown`).
+
+        This guards against "fixing" the bug by defaulting to 0, which
+        would fabricate a reading for a device that never reported one.
+        """
+        description = next(s for s in SENSOR_TYPES if s.key == sensor_key)
+        stats = mock_coordinator.data["stats"]["site1"]["device1"]
+        stats.pop("uplink", None)
+        for absent_key in (
+            "txRateBps",
+            "tx_rate_bps",
+            "tx_bytes_per_sec",
+            "rxRateBps",
+            "rx_rate_bps",
+            "rx_bytes_per_sec",
+        ):
+            stats.pop(absent_key, None)
+
+        sensor = UnifiInsightsSensor(
+            coordinator=mock_coordinator,
+            description=description,
+            site_id="site1",
+            device_id="device1",
+        )
+
+        assert sensor.native_value is None
+
+    async def test_non_numeric_lookup_without_fallback_still_returns_none(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """
+        Sanity check that the falsy-zero fix was not applied too broadly.
+
+        `firmware_version` is a non-numeric lookup with no fallback
+        candidate, and this PR deliberately leaves it alone. An absent
+        value must therefore still yield `None` (rendered as `Unknown`)
+        rather than being coerced into a value, confirming the sweep did
+        not turn every lookup into "return something".
+        """
+        description = next(s for s in SENSOR_TYPES if s.key == "firmware_version")
+        mock_coordinator.data["devices"]["site1"]["device1"].pop(
+            "firmwareVersion", None
+        )
+
+        sensor = UnifiInsightsSensor(
+            coordinator=mock_coordinator,
+            description=description,
+            site_id="site1",
+            device_id="device1",
+        )
+
+        # No fallback candidate exists, so absence still yields None.
+        assert sensor.native_value is None
+
+
+class TestUplinkRateStateLevel:
+    """
+    State-level proof of the user-visible symptom, not just the value_fn.
+
+    tx_rate/rx_rate carry suggested_unit_of_measurement=Mbit/s, so the
+    stored HA state is the *converted* value, not the raw native value.
+    Comparing against the string "0" would be a false negative for any
+    non-integer conversion result, so this asserts on the float value.
+    """
+
+    @pytest.fixture
+    def real_config_entry(self) -> MockConfigEntry:
+        """
+        Build a genuine, registerable MockConfigEntry.
+
+        The module-level `mock_config_entry` fixture in this file is a bare
+        MagicMock used by the async_setup_entry()-level tests above; it is
+        never added to hass.config_entries, so
+        `hass.config_entries.async_setup()` cannot find it. This test needs
+        the real thing to drive a full integration setup.
+        """
+        return MockConfigEntry(
+            version=1,
+            minor_version=0,
+            domain=DOMAIN,
+            title="UniFi Insights (Local)",
+            data={
+                CONF_CONNECTION_TYPE: CONNECTION_TYPE_LOCAL,
+                CONF_HOST: "https://192.168.1.1",
+                CONF_API_KEY: "test_api_key",
+                CONF_VERIFY_SSL: False,
+            },
+            options={},
+            source="user",
+            unique_id="test_api_key",
+            entry_id="zero_uplink_test_entry_id",
+        )
+
+    async def test_zero_uplink_rate_state_is_zero_not_unknown(
+        self,
+        *,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        real_config_entry: MockConfigEntry,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_local_auth: MagicMock,
+        enable_custom_integrations: None,
+    ) -> None:
+        """A device reporting txRateBps=0 must show sensor state 0, not unknown."""
+        real_config_entry.add_to_hass(hass)
+
+        mock_network_client.sites.get_all.return_value = [
+            {"id": "default", "name": "Default", "desc": "Default"}
+        ]
+        mock_network_client.devices.get_all.return_value = [
+            {
+                "id": "zero_uplink_device",
+                "name": "Zero Uplink Switch",
+                "model": "USW-24",
+                "mac": "AA:BB:CC:DD:EE:00",
+                "macAddress": "AA:BB:CC:DD:EE:00",
+                "state": "ONLINE",
+                "ipAddress": "192.168.1.50",
+            }
+        ]
+        mock_network_client.devices.get_statistics = AsyncMock(
+            return_value={"uplink": {"txRateBps": 0, "rxRateBps": 0}}
+        )
+
+        await hass.config_entries.async_setup(real_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        entity_id = entity_registry.async_get_entity_id(
+            "sensor", DOMAIN, "default_zero_uplink_device_tx_rate"
+        )
+        assert entity_id is not None, "tx_rate sensor was not created"
+
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state not in ("unknown", "unavailable")
+        assert float(state.state) == 0.0
+
+
 class TestUnifiPortSensor:
     """Tests for UnifiPortSensor."""
 
@@ -492,6 +692,23 @@ class TestUnifiPortSensor:
 
         assert sensor.native_value == 15.5
         assert sensor.translation_placeholders == {"port_label": "Port 1"}
+
+    def test_port_poe_power_value_fn_zero_watts_is_zero_not_none(self):
+        """
+        A port drawing 0 W (e.g. the flap case) must report 0, not unknown.
+
+        `get_field(port, "poe_power_w") or get_field(port, "poe", ...).get(
+        "power") or ...` would discard a real 0.0 in favour of the next
+        candidate. Exercised directly at the value_fn level, bypassing the
+        coordinator-stats poe_ports shortcut.
+        """
+        description = next(s for s in PORT_SENSOR_TYPES if s.key == "port_poe_power")
+        port = {"poe": {"enabled": True, "power": 0.0, "good": False}}
+
+        value = description.value_fn(port)
+
+        assert value == 0.0
+        assert value is not None
 
     async def test_port_speed(self, hass: HomeAssistant, mock_coordinator):
         """Test port speed sensor."""
@@ -1464,6 +1681,29 @@ class TestGetStorageBytes:
         data = {"storageInfo": {"usedSize": "string"}}
         assert _get_storage_bytes(data, "used") is None
 
+    def test_get_storage_bytes_zero_used_direct_is_zero_not_none(self):
+        """
+        A genuinely empty NVR reports usedSize 0; that must survive.
+
+        `or` between the direct and snake_case candidates would treat a
+        real 0 as absent and incorrectly fall through to the nested
+        storageInfo lookup.
+        """
+        assert _get_storage_bytes({"storageUsedBytes": 0}, "used") == 0
+        result = _get_storage_bytes({"storageUsedBytes": 0}, "used")
+        assert result is not None
+
+    def test_get_storage_bytes_zero_used_nested_is_zero_not_none(self):
+        """A nested storageInfo.usedSize of 0 must also survive, not fall through."""
+        data = {"storageInfo": {"usedSize": 0}}
+        assert _get_storage_bytes(data, "used") == 0
+        assert _get_storage_bytes(data, "used") is not None
+
+    def test_get_storage_bytes_zero_total_direct_is_zero_not_none(self):
+        """A totalBytes of 0 must survive rather than being treated as absent."""
+        assert _get_storage_bytes({"storageTotalBytes": 0}, "total") == 0
+        assert _get_storage_bytes({"storageTotalBytes": 0}, "total") is not None
+
 
 class TestNVRStorageHelpers:
     """Tests for NVR storage helper functions."""
@@ -2183,9 +2423,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
-        port_indices = {
-            e._port_idx for e in entities if isinstance(e, UnifiPortSensor)
-        }
+        port_indices = {e._port_idx for e in entities if isinstance(e, UnifiPortSensor)}
         assert 40 in port_indices
 
     async def test_setup_entry_ignores_unparseable_poe_values(
@@ -2193,9 +2431,7 @@ class TestAsyncSetupEntryEdgeCases:
     ):
         """Malformed PoE data (non-dict, non-numeric power) is ignored rather
         than raising, and no PoE sensor is created for those ports."""
-        mock_coordinator.data["devices"]["site1"]["device1"]["interfaces"][
-            "ports"
-        ] += [
+        mock_coordinator.data["devices"]["site1"]["device1"]["interfaces"]["ports"] += [
             {"idx": 30, "state": "UP", "poe": "not-a-dict"},
             {"idx": 31, "state": "UP", "poe": {"power": "invalid"}},
             {"idx": 32, "state": "UP", "poe_power_w": "not-a-number"},
@@ -2224,9 +2460,7 @@ class TestAsyncSetupEntryEdgeCases:
     ):
         """A malformed (non-dict) stats entry for a switching device is
         skipped without raising, and regular port sensors are unaffected."""
-        mock_coordinator.data["devices"]["site1"]["device1"]["features"] = [
-            "switching"
-        ]
+        mock_coordinator.data["devices"]["site1"]["device1"]["features"] = ["switching"]
         mock_coordinator.data["stats"]["site1"]["device1"] = "not-a-dict"
         mock_config_entry.runtime_data.coordinator = mock_coordinator
 
@@ -2239,9 +2473,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         # Regular interface port sensors (e.g. port 1, which is UP) are still
         # created even though the stats-based fallback was skipped.
-        port_indices = {
-            e._port_idx for e in entities if isinstance(e, UnifiPortSensor)
-        }
+        port_indices = {e._port_idx for e in entities if isinstance(e, UnifiPortSensor)}
         assert 1 in port_indices
 
     async def test_setup_entry_stats_fallback_skips_invalid_keys_and_dedupes(
@@ -2411,6 +2643,103 @@ class TestUnifiPortSensorNativeValueEdgeCases:
         value = sensor.native_value
         # Value should be extracted from value_fn
         assert value is not None or value == 0
+
+    async def test_native_value_poe_power_int_keyed_zero_with_port_data(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """
+        An int-keyed poe_ports dict mapping to a real 0 W must yield 0.0.
+
+        Port 1 exists in interfaces.ports (port_data is found), so this
+        exercises the "prefer PoE watts from coordinator stats" branch.
+        `poe_ports.get(1) or poe_ports.get("1")` would treat the int-keyed
+        0 as falsy and wrongly fall through to the (absent) string key.
+        """
+        poe_desc = PORT_SENSOR_TYPES[0]  # port_poe_power
+        mock_coordinator.data["stats"]["site1"]["device1"]["poe_ports"] = {1: 0}
+
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=poe_desc,
+            site_id="site1",
+            device_id="device1",
+            port_idx=1,
+        )
+
+        assert sensor.native_value == 0.0
+        assert sensor.native_value is not None
+
+    async def test_native_value_poe_power_int_keyed_zero_without_port_data(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """
+        Same int-keyed-zero case, but for a port absent from interfaces.ports.
+
+        This exercises the earlier "no port_data" fallback branch, which
+        has its own separate `poe_ports.get(idx) or poe_ports.get(str(idx))`
+        call site.
+        """
+        poe_desc = PORT_SENSOR_TYPES[0]  # port_poe_power
+        mock_coordinator.data["stats"]["site1"]["device1"]["poe_ports"] = {5: 0}
+
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=poe_desc,
+            site_id="site1",
+            device_id="device1",
+            port_idx=5,  # Not present in interfaces.ports
+        )
+
+        assert sensor.native_value == 0.0
+        assert sensor.native_value is not None
+
+    async def test_native_value_poe_power_string_keyed_zero_with_port_data(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """
+        A string-keyed poe_ports dict mapping to a real 0 W must still yield 0.0.
+
+        Covers the fallback half of the lookup: the int-key probe misses, so
+        the string-key probe must run and its `0` must survive. Together with
+        the int-keyed test this pins both sides of the two-step lookup that
+        replaced `poe_ports.get(idx) or poe_ports.get(str(idx))`.
+        """
+        poe_desc = PORT_SENSOR_TYPES[0]  # port_poe_power
+        mock_coordinator.data["stats"]["site1"]["device1"]["poe_ports"] = {"1": 0}
+
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=poe_desc,
+            site_id="site1",
+            device_id="device1",
+            port_idx=1,
+        )
+
+        assert sensor.native_value == 0.0
+        assert sensor.native_value is not None
+
+    async def test_native_value_poe_power_string_keyed_zero_without_port_data(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """
+        Same string-keyed-zero case for a port absent from interfaces.ports.
+
+        This is the second, separate call site, which needs its own coverage
+        of the string-key fallback.
+        """
+        poe_desc = PORT_SENSOR_TYPES[0]  # port_poe_power
+        mock_coordinator.data["stats"]["site1"]["device1"]["poe_ports"] = {"5": 0}
+
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=poe_desc,
+            site_id="site1",
+            device_id="device1",
+            port_idx=5,
+        )
+
+        assert sensor.native_value == 0.0
+        assert sensor.native_value is not None
 
 
 class TestUnifiProtectNVRSensorEdgeCases:

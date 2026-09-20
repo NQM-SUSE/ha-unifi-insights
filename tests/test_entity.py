@@ -3,9 +3,9 @@
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
+import pytest
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
 from homeassistant.helpers.entity import EntityDescription
-import pytest
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -20,6 +20,7 @@ from custom_components.unifi_insights.const import (
 from custom_components.unifi_insights.entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
+    first_not_none,
     get_field,
     is_device_online,
 )
@@ -60,6 +61,49 @@ class TestGetField:
 
         assert get_field(data_camel, "firmwareVersion", "firmware_version") == "1.0.0"
         assert get_field(data_snake, "firmwareVersion", "firmware_version") == "2.0.0"
+
+
+class TestFirstNotNone:
+    """Tests for first_not_none helper function."""
+
+    def test_first_not_none_zero_is_returned(self):
+        """A leading 0 is a legitimate value and must not be skipped."""
+        assert first_not_none(0, 5) == 0
+
+    def test_first_not_none_zero_is_not_none(self):
+        """The returned 0 must be the int 0, not None (the bug under test)."""
+        result = first_not_none(0, 5)
+        assert result == 0
+        assert result is not None
+
+    def test_first_not_none_skips_leading_nones(self):
+        """Leading None values are skipped in favor of the first real value."""
+        assert first_not_none(None, None, 7) == 7
+
+    def test_first_not_none_all_none_returns_default(self):
+        """Returns the default when every candidate is None."""
+        assert first_not_none(None, None, default="fallback") == "fallback"
+
+    def test_first_not_none_all_none_no_default_returns_none(self):
+        """Returns None when every candidate is None and no default given."""
+        assert first_not_none(None, None) is None
+
+    def test_first_not_none_does_not_skip_false(self):
+        """first_not_none is None-aware, not truthy-aware: False survives."""
+        falsy_value = False
+        assert first_not_none(falsy_value, "unreachable") is False
+
+    def test_first_not_none_does_not_skip_empty_string(self):
+        """first_not_none is None-aware, not truthy-aware: "" survives."""
+        assert first_not_none("", "unreachable") == ""
+
+    def test_first_not_none_does_not_skip_empty_dict(self):
+        """first_not_none is None-aware, not truthy-aware: {} survives."""
+        assert first_not_none({}, "unreachable") == {}
+
+    def test_first_not_none_single_value(self):
+        """A single non-None value is returned as-is."""
+        assert first_not_none(3) == 3
 
 
 class TestIsDeviceOnline:
