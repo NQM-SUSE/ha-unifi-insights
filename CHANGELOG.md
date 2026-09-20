@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Protect-only console with no UniFi Network application (such as a standalone UNVR) no longer logs a `Response is not JSON` warning every five minutes. Such a console answers the Network sites endpoint with HTTP 200 and an HTML body, which the config coordinator retried on every five-minute poll. The coordinator now skips that poll entirely when the setup probe reports the Network application as unavailable, and stops polling it for the rest of the session the first time the console answers with a non-JSON body or a 404. The probe runs again on every integration start and reload, so installing the Network application later restores site polling.
 - Fall back to classic `system-stats` (`sys_stats`) CPU, memory, and uptime metrics for gateway and console devices (such as the UCG-Max) when the v1 statistics endpoint omits them or when devices are keyed by MAC address, preventing CPU and memory usage sensors from showing "Unknown". [#151](https://github.com/ruaan-deysel/ha-unifi-insights/issues/151)
 - Recognize `UCG`, `UXG`, `UDR`, and `UDW` gateway models alongside `UDM` and `USG` for WAN sensors and gateway entity discovery.
 
