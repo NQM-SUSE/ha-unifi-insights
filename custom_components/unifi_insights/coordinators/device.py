@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,8 @@ from custom_components.unifi_insights.helpers import async_get_device_entry
 from .base import UnifiBaseCoordinator
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
@@ -37,6 +40,73 @@ if TYPE_CHECKING:
     from .config import UnifiConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# Stats keys the v1 statistics endpoint may already have populated. A legacy
+# reading only fills a gap, it never overwrites a value v1 supplied.
+_CPU_STAT_KEYS = ("cpuUtilizationPct", "cpu_utilization_pct", "cpu_percent", "cpu")
+_MEMORY_STAT_KEYS = (
+    "memoryUtilizationPct",
+    "memory_utilization_pct",
+    "memory_percent",
+    "memory",
+)
+_UPTIME_STAT_KEYS = ("uptimeSec", "uptime_sec", "uptime_seconds", "uptime")
+
+
+def _fill_missing_stat(
+    stats: dict[str, Any],
+    target_key: str,
+    existing_keys: tuple[str, ...],
+    value: Any,
+    caster: Callable[[Any], Any],
+) -> None:
+    """Set ``target_key`` from a legacy reading when v1 reported none."""
+    if value is None or any(stats.get(key) is not None for key in existing_keys):
+        return
+    with suppress(TypeError, ValueError):
+        stats[target_key] = caster(value)
+
+
+def _legacy_system_stats(legacy_device: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """
+    Return ``(cpu, memory, uptime)`` from a legacy controller device dict.
+
+    Gateways keyed by MAC rather than a v1 UUID report CPU and memory
+    percentages under ``system-stats``. The similarly named ``sys_stats``
+    object holds raw counters (``loadavg_*``, ``mem_total``, ``mem_used``) and
+    carries no ``cpu``/``mem`` keys, yet real consoles report both objects.
+    Each key is therefore resolved across ``system-stats``, ``sys_stats`` and
+    the device root in turn, rather than picking a single object up front.
+    """
+    sources = [
+        source
+        for source in (
+            legacy_device.get("system-stats"),
+            legacy_device.get("sys_stats"),
+            legacy_device,
+        )
+        if isinstance(source, dict)
+    ]
+
+    def _pick(key: str) -> Any:
+        for source in sources:
+            value = source.get(key)
+            if value is not None:
+                return value
+        return None
+
+    return _pick("cpu"), _pick("mem"), _pick("uptime")
+
+
+def _merge_legacy_system_stats(
+    stats: dict[str, Any], legacy_device: dict[str, Any]
+) -> None:
+    """Fill CPU, memory and uptime in ``stats`` from a legacy device dict."""
+    cpu, mem, uptime = _legacy_system_stats(legacy_device)
+    _fill_missing_stat(stats, "cpuUtilizationPct", _CPU_STAT_KEYS, cpu, float)
+    _fill_missing_stat(stats, "memoryUtilizationPct", _MEMORY_STAT_KEYS, mem, float)
+    _fill_missing_stat(stats, "uptimeSec", _UPTIME_STAT_KEYS, uptime, int)
+
 
 # How many consecutive polls a device's last good statistics are reused for
 # when its statistics call keeps failing, before its stats are dropped.
@@ -99,6 +169,18 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         if not isinstance(value, str) or not value:
             return None
         return value.strip().lower()
+
+    @classmethod
+    def _legacy_device_for(
+        cls,
+        device: dict[str, Any],
+        legacy_devices_by_mac: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return the legacy controller dict matching a v1 device, if any."""
+        mac = cls._normalize_mac(device.get("mac") or device.get("macAddress"))
+        if mac is None:
+            return None
+        return legacy_devices_by_mac.get(mac)
 
     @staticmethod
     def _normalize_legacy_port(port: dict[str, Any]) -> dict[str, Any] | None:
@@ -436,6 +518,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         device_dict: dict[str, Any],
         clients: list[dict[str, Any]],
         legacy_site_name: str | None = None,
+        legacy_device: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         """Process a single device and its stats."""
         device_id: str = device_dict.get("id", "")
@@ -451,7 +534,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 )
                 stats = self._model_to_dict(stats_model) if stats_model else {}
 
-            # Use vendored API for legacy per-port PoE/byte metrics
+            # Use vendored API for legacy per-port PoE/byte metrics & system stats
             try:
                 device_mac = (
                     device_dict.get("mac")
@@ -495,11 +578,36 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
                     if metrics.poe_total_w is not None:
                         stats["poe_total_w"] = metrics.poe_total_w
+
+                    _fill_missing_stat(
+                        stats,
+                        "cpu_utilization_pct",
+                        _CPU_STAT_KEYS,
+                        metrics.cpu_utilization_pct,
+                        float,
+                    )
+                    _fill_missing_stat(
+                        stats,
+                        "memory_utilization_pct",
+                        _MEMORY_STAT_KEYS,
+                        metrics.memory_utilization_pct,
+                        float,
+                    )
+                    _fill_missing_stat(
+                        stats,
+                        "uptime_sec",
+                        _UPTIME_STAT_KEYS,
+                        metrics.uptime_sec,
+                        int,
+                    )
             except Exception as err:
                 _LOGGER.debug(
-                    "Legacy PoE wattage fetch failed: %s",
+                    "Legacy PoE/metrics fetch failed: %s",
                     err,
                 )
+
+            if isinstance(legacy_device, dict):
+                _merge_legacy_system_stats(stats, legacy_device)
 
             # Add client data to stats
             if stats:
@@ -717,6 +825,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 device,
                 clients,
                 legacy_site_name=legacy_site_name,
+                legacy_device=self._legacy_device_for(device, legacy_devices_by_mac),
             )
             for device in devices
         ]

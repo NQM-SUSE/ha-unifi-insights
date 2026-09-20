@@ -453,10 +453,44 @@ class DevicesEndpoint:
         if poe_total_w is None and poe_ports:
             poe_total_w = float(sum(poe_ports.values()))
 
+        # Extract system stats if present (e.g. for devices without v1 UUID stats).
+        # ``system-stats`` carries the CPU/memory percentages; the similarly
+        # named ``sys_stats`` carries raw counters (loadavg_*, mem_total,
+        # mem_used) and has no cpu/mem keys at all. Real gateway consoles
+        # report both, so each key is resolved across both objects and the
+        # device root instead of committing to one object up front.
+        stat_sources = [
+            source
+            for source in (
+                legacy.get("system-stats"),
+                legacy.get("sys_stats"),
+                legacy,
+            )
+            if isinstance(source, dict)
+        ]
+
+        def _stat(key: str) -> Any:
+            for source in stat_sources:
+                value = source.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        cpu = _stat("cpu")
+        mem = _stat("mem")
+        uptime = _stat("uptime")
+
+        cpu_utilization_pct = _to_float(cpu)
+        memory_utilization_pct = _to_float(mem)
+        uptime_sec = _to_int(uptime)
+
         return LegacyPortMetrics(
             poe_total_w=poe_total_w,
             poe_ports=poe_ports,
             port_bytes=port_bytes,
+            cpu_utilization_pct=cpu_utilization_pct,
+            memory_utilization_pct=memory_utilization_pct,
+            uptime_sec=uptime_sec,
         )
 
     async def execute_action(
