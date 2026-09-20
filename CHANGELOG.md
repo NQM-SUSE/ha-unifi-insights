@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Device registry lookups now call `DeviceRegistry.async_get_device_by_identifier()` on Home Assistant 2026.8 and newer, scoped to this config entry. Home Assistant 2026.9 deprecated `async_get_device()` because identifiers are only unique per config entry, and schedules its removal in 2027.8. Older Home Assistant versions keep using the existing call, so the integration still runs on the 2026.6 minimum declared in `hacs.json`.
 
+### Fixed
+
+- A Protect-only console with no UniFi Network application (such as a standalone UNVR) no longer logs a `Response is not JSON` warning every five minutes. Such a console answers the Network sites endpoint with HTTP 200 and an HTML body, which the config coordinator retried on every five-minute poll. The coordinator now skips that poll entirely when the setup probe reports the Network application as unavailable, and stops polling it for the rest of the session the first time the console answers with a non-JSON body or a 404. The probe runs again on every integration start and reload, so installing the Network application later restores site polling.
+
 ## [2026.9.4] - 2026-09-19
 
 ### Added
