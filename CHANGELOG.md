@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The `Response is not JSON` warning now names the request method and path that produced the non-JSON body. Previously it logged only the (redacted, truncated) response body, so when a console returned an HTML page on one of the several endpoints polled by the config coordinator, the warning could not be attributed to the call that actually failed - a sustained burst of these was undiagnosable for exactly this reason. The path is logged via `url.path`, which omits the query string, so request credentials are never written to the log or captured in a diagnostics upload.
+
 ## [2026.9.5] - 2026-09-20
 
 ### Changed
