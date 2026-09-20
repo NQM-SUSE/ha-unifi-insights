@@ -71,18 +71,29 @@ def _legacy_system_stats(legacy_device: dict[str, Any]) -> tuple[Any, Any, Any]:
     """
     Return ``(cpu, memory, uptime)`` from a legacy controller device dict.
 
-    Gateways keyed by MAC rather than a v1 UUID report these under
-    ``sys_stats``/``system-stats``, falling back to the device root.
+    Gateways keyed by MAC rather than a v1 UUID report CPU and memory
+    percentages under ``system-stats``. The similarly named ``sys_stats``
+    object holds raw counters (``loadavg_*``, ``mem_total``, ``mem_used``) and
+    carries no ``cpu``/``mem`` keys, yet real consoles report both objects.
+    Each key is therefore resolved across ``system-stats``, ``sys_stats`` and
+    the device root in turn, rather than picking a single object up front.
     """
-    sys_stats = (
-        legacy_device.get("sys_stats") or legacy_device.get("system-stats") or {}
-    )
-    if not isinstance(sys_stats, dict):
-        sys_stats = {}
+    sources = [
+        source
+        for source in (
+            legacy_device.get("system-stats"),
+            legacy_device.get("sys_stats"),
+            legacy_device,
+        )
+        if isinstance(source, dict)
+    ]
 
     def _pick(key: str) -> Any:
-        value = sys_stats.get(key)
-        return legacy_device.get(key) if value is None else value
+        for source in sources:
+            value = source.get(key)
+            if value is not None:
+                return value
+        return None
 
     return _pick("cpu"), _pick("mem"), _pick("uptime")
 

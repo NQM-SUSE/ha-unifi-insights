@@ -453,17 +453,32 @@ class DevicesEndpoint:
         if poe_total_w is None and poe_ports:
             poe_total_w = float(sum(poe_ports.values()))
 
-        # Extract system stats if present (e.g. for devices without v1 UUID stats)
-        sys_stats = legacy.get("sys_stats") or legacy.get("system-stats") or {}
-        cpu = sys_stats.get("cpu") if isinstance(sys_stats, dict) else None
-        if cpu is None:
-            cpu = legacy.get("cpu")
-        mem = sys_stats.get("mem") if isinstance(sys_stats, dict) else None
-        if mem is None:
-            mem = legacy.get("mem")
-        uptime = sys_stats.get("uptime") if isinstance(sys_stats, dict) else None
-        if uptime is None:
-            uptime = legacy.get("uptime")
+        # Extract system stats if present (e.g. for devices without v1 UUID stats).
+        # ``system-stats`` carries the CPU/memory percentages; the similarly
+        # named ``sys_stats`` carries raw counters (loadavg_*, mem_total,
+        # mem_used) and has no cpu/mem keys at all. Real gateway consoles
+        # report both, so each key is resolved across both objects and the
+        # device root instead of committing to one object up front.
+        stat_sources = [
+            source
+            for source in (
+                legacy.get("system-stats"),
+                legacy.get("sys_stats"),
+                legacy,
+            )
+            if isinstance(source, dict)
+        ]
+
+        def _stat(key: str) -> Any:
+            for source in stat_sources:
+                value = source.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        cpu = _stat("cpu")
+        mem = _stat("mem")
+        uptime = _stat("uptime")
 
         cpu_utilization_pct = _to_float(cpu)
         memory_utilization_pct = _to_float(mem)

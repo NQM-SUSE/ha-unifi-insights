@@ -46,6 +46,46 @@ class TestLegacyDeviceStatsExtraction:
         assert metrics.uptime_sec == 123456
 
     @pytest.mark.asyncio
+    async def test_get_port_metrics_prefers_system_stats_over_sys_stats(self):
+        """Both stat objects present: percentages come from ``system-stats``.
+
+        Real gateway consoles (UDM/UCG) report ``sys_stats`` and
+        ``system-stats`` side by side. Only ``system-stats`` carries the
+        cpu/mem percentages; ``sys_stats`` holds raw counters and no
+        cpu/mem keys at all, so selecting a single object by truthiness
+        picks the one that cannot answer.
+        """
+        client = MagicMock()
+        client._get = AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "mac": "aa:bb:cc:dd:ee:ff",
+                        "sys_stats": {
+                            "loadavg_1": "1.58",
+                            "loadavg_5": "1.32",
+                            "loadavg_15": "1.19",
+                            "mem_buffer": 0,
+                            "mem_total": 4045352960,
+                            "mem_used": 3119644672,
+                        },
+                        "system-stats": {
+                            "cpu": "9.3",
+                            "mem": "77.1",
+                            "uptime": "1022432",
+                        },
+                        "uptime": 1022431,
+                    }
+                ]
+            }
+        )
+        endpoint = DevicesEndpoint(client)
+        metrics = await endpoint.get_port_metrics("default", "aa:bb:cc:dd:ee:ff")
+        assert metrics.cpu_utilization_pct == 9.3
+        assert metrics.memory_utilization_pct == 77.1
+        assert metrics.uptime_sec == 1022432
+
+    @pytest.mark.asyncio
     async def test_get_port_metrics_system_stats_fallback(self):
         """Test extraction from system-stats and top-level fields."""
         client = MagicMock()
@@ -214,6 +254,38 @@ class TestGatewayModelPrefixes:
         )
 
         assert (cpu, mem, uptime) == ("12.5", "33.0", 60)
+
+    def test_legacy_system_stats_prefers_system_stats_over_sys_stats(self):
+        """Both objects present: cpu/mem come from ``system-stats``.
+
+        ``sys_stats`` is truthy on real gateways but exposes only raw
+        counters, so it must not shadow the ``system-stats`` percentages.
+        """
+        cpu, mem, uptime = _legacy_system_stats(
+            {
+                "sys_stats": {
+                    "loadavg_1": "1.58",
+                    "mem_total": 4045352960,
+                    "mem_used": 3119644672,
+                },
+                "system-stats": {"cpu": "9.3", "mem": "77.1", "uptime": "1022432"},
+                "uptime": 1022431,
+            }
+        )
+
+        assert (cpu, mem, uptime) == ("9.3", "77.1", "1022432")
+
+    def test_legacy_system_stats_falls_back_to_sys_stats_keys(self):
+        """``sys_stats`` still answers when ``system-stats`` lacks the key."""
+        cpu, mem, uptime = _legacy_system_stats(
+            {
+                "system-stats": {"cpu": "5.0"},
+                "sys_stats": {"mem": "42.0"},
+                "uptime": 1234,
+            }
+        )
+
+        assert (cpu, mem, uptime) == ("5.0", "42.0", 1234)
 
     def test_legacy_system_stats_tolerates_non_dict_sys_stats(self):
         """A malformed sys_stats value falls back to the device root."""
