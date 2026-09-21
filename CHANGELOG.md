@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The `Response is not JSON` warning now names the request method and path that produced the non-JSON body. Previously it logged only the (redacted, truncated) response body, so when a console returned an HTML page on one of the several endpoints polled by the config coordinator, the warning could not be attributed to the call that actually failed - a sustained burst of these was undiagnosable for exactly this reason. The path is logged via `url.path`, which omits the query string, so request credentials are never written to the log or captured in a diagnostics upload.
 
+### Fixed
+
+- Deleting a policy-based route, firewall rule, or VPN client on the console no longer leaves its switch entity permanently unavailable. Each of these switches reports `unavailable` once its backing object is gone, but nothing ever removed the entity from the registry - so the entity stayed forever, even after the object it represented no longer existed. A one-time cleanup at startup now removes each of these three switch types when the site that owned the deleted route, rule, or client was itself confirmed present in the same refresh, so a transient config-fetch failure, a console without the feature, or an in-progress first refresh can never be mistaken for "the object is gone" and cause an over-broad prune. `UnifiWifiSwitch` has the identical gap (gated by `wifi_available`) but is intentionally left for a follow-up, since deleting a WiFi network is rarer than deleting a route, rule, or VPN client.
+
 ## [2026.9.5] - 2026-09-20
 
 ### Changed
