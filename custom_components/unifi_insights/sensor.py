@@ -54,6 +54,7 @@ from .entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
     device_has_feature,
+    first_not_none,
     get_field,
 )
 from .entity import (
@@ -135,6 +136,23 @@ def bytes_to_bits(bytes_per_sec: float | None) -> float | None:
     if bytes_per_sec is None:
         return None
     return bytes_per_sec * 8
+
+
+def _uplink_rate_bps(stats: dict[str, Any], *keys: str) -> Any:
+    """
+    Get an uplink tx/rx rate candidate, preserving a legitimate 0.
+
+    Reads the uplink stats container once, then tries the same key names
+    against it and against the top-level stats dict, keeping the first
+    candidate that is not None. A plain `or` chain here would discard a
+    real `0 B/s` reading (traffic momentarily idle) in favour of a
+    non-existent fallback, flipping the sensor state to `unknown`.
+    """
+    uplink = get_stats_field(stats, "uplink", "uplink_stats", default={})
+    return first_not_none(
+        get_field(uplink, *keys),
+        get_field(stats, *keys),
+    )
 
 
 def _get_temperature_entry_value(
@@ -299,33 +317,38 @@ def _get_storage_bytes(nvr_data: dict[str, Any], field: str) -> int | None:
     - Nested (library model): storageInfo.usedSize, storageInfo.totalSize
     - Nested (snake_case): storageInfo.used_size, storageInfo.total_size
     """
-    # Check direct camelCase fields
+    # Check direct camelCase fields. A zero-byte reading is legitimate (an
+    # empty NVR), so candidates are combined with first_not_none, not `or`.
     if field == "used":
-        value = nvr_data.get("storageUsedBytes") or nvr_data.get("storage_used_bytes")
+        value = first_not_none(
+            nvr_data.get("storageUsedBytes"), nvr_data.get("storage_used_bytes")
+        )
         if value is not None:
             return int(value) if isinstance(value, (int, float)) else None
         # Check nested storageInfo (library model uses usedSize/totalSize)
         storage_info = nvr_data.get("storageInfo")
         if isinstance(storage_info, dict):
-            nested_value = (
-                storage_info.get("usedSize")
-                or storage_info.get("used_size")
-                or storage_info.get("usedSpaceBytes")
-                or storage_info.get("used_space_bytes")
+            nested_value = first_not_none(
+                storage_info.get("usedSize"),
+                storage_info.get("used_size"),
+                storage_info.get("usedSpaceBytes"),
+                storage_info.get("used_space_bytes"),
             )
             return int(nested_value) if isinstance(nested_value, (int, float)) else None
     elif field == "total":
-        value = nvr_data.get("storageTotalBytes") or nvr_data.get("storage_total_bytes")
+        value = first_not_none(
+            nvr_data.get("storageTotalBytes"), nvr_data.get("storage_total_bytes")
+        )
         if value is not None:
             return int(value) if isinstance(value, (int, float)) else None
         # Check nested storageInfo (library model uses usedSize/totalSize)
         storage_info = nvr_data.get("storageInfo")
         if isinstance(storage_info, dict):
-            nested_value = (
-                storage_info.get("totalSize")
-                or storage_info.get("total_size")
-                or storage_info.get("totalSpaceBytes")
-                or storage_info.get("total_space_bytes")
+            nested_value = first_not_none(
+                storage_info.get("totalSize"),
+                storage_info.get("total_size"),
+                storage_info.get("totalSpaceBytes"),
+                storage_info.get("total_space_bytes"),
             )
             return int(nested_value) if isinstance(nested_value, (int, float)) else None
     return None
@@ -451,13 +474,7 @@ SENSOR_TYPES: tuple[UnifiInsightsSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:upload-network",
         value_fn=lambda stats: bytes_to_bits(
-            get_stats_field(stats, "uplink", "uplink_stats", default={}).get(
-                "txRateBps"
-            )
-            or get_stats_field(stats, "uplink", "uplink_stats", default={}).get(
-                "tx_rate_bps"
-            )
-            or get_stats_field(stats, "txRateBps", "tx_rate_bps", "tx_bytes_per_sec")
+            _uplink_rate_bps(stats, "txRateBps", "tx_rate_bps", "tx_bytes_per_sec")
         ),
     ),
     UnifiInsightsSensorEntityDescription(
@@ -470,13 +487,7 @@ SENSOR_TYPES: tuple[UnifiInsightsSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:download-network",
         value_fn=lambda stats: bytes_to_bits(
-            get_stats_field(stats, "uplink", "uplink_stats", default={}).get(
-                "rxRateBps"
-            )
-            or get_stats_field(stats, "uplink", "uplink_stats", default={}).get(
-                "rx_rate_bps"
-            )
-            or get_stats_field(stats, "rxRateBps", "rx_rate_bps", "rx_bytes_per_sec")
+            _uplink_rate_bps(stats, "rxRateBps", "rx_rate_bps", "rx_bytes_per_sec")
         ),
     ),
     UnifiInsightsSensorEntityDescription(
@@ -672,10 +683,10 @@ PORT_SENSOR_TYPES: tuple[UnifiInsightsSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=None,  # Changed from DIAGNOSTIC to make visible by default
         icon="mdi:flash",
-        value_fn=lambda port: (
-            get_field(port, "poe_power_w")
-            or get_field(port, "poe", default={}).get("power")
-            or get_field(port, "poe", default={}).get("watts")
+        value_fn=lambda port: first_not_none(
+            get_field(port, "poe_power_w"),
+            get_field(port, "poe", default={}).get("power"),
+            get_field(port, "poe", default={}).get("watts"),
         ),
     ),
     # Port Speed
@@ -1638,9 +1649,12 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
                 if isinstance(stats, dict):
                     poe_ports = stats.get("poe_ports")
                     if isinstance(poe_ports, dict):
-                        watts = poe_ports.get(self._port_idx) or poe_ports.get(
-                            str(self._port_idx)
-                        )
+                        # An int-keyed poe_ports (e.g. {3: 0}) must not fall
+                        # through to the string-key lookup: `or` would treat
+                        # a real 0 W reading as absent.
+                        watts = poe_ports.get(self._port_idx)
+                        if watts is None:
+                            watts = poe_ports.get(str(self._port_idx))
                         if isinstance(watts, (int, float)):
                             return float(watts)
                         if isinstance(watts, str):
@@ -1696,9 +1710,12 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
             if isinstance(stats, dict):
                 poe_ports = stats.get("poe_ports")
                 if isinstance(poe_ports, dict):
-                    watts = poe_ports.get(self._port_idx) or poe_ports.get(
-                        str(self._port_idx)
-                    )
+                    # An int-keyed poe_ports (e.g. {3: 0}) must not fall
+                    # through to the string-key lookup: `or` would treat
+                    # a real 0 W reading as absent.
+                    watts = poe_ports.get(self._port_idx)
+                    if watts is None:
+                        watts = poe_ports.get(str(self._port_idx))
                     if isinstance(watts, (int, float)):
                         return float(watts)
                     if isinstance(watts, str):
