@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1261,12 +1262,22 @@ async def test_devices_get_pending_adoption_skips_malformed_items() -> None:
     assert result[0].id == "pend-1"
 
 
-def _make_response(*, status: int = 200, text: str = "", json_side_effect=None):
+def _make_response(
+    *,
+    status: int = 200,
+    text: str = "",
+    json_side_effect=None,
+    method: str = "GET",
+    path: str = "/proxy/network/integration/v1/sites",
+):
     """Build a fake aiohttp.ClientResponse for _handle_response tests."""
     response = MagicMock()
     response.status = status
     response.text = AsyncMock(return_value=text)
     response.headers = {}
+    response.method = method
+    response.url = MagicMock()
+    response.url.path = path
     if json_side_effect is not None:
         response.json = AsyncMock(side_effect=json_side_effect)
     else:
@@ -1298,6 +1309,79 @@ async def test_handle_response_2xx_non_json_raises() -> None:
         await client._handle_response(response)
 
     assert exc_info.value.status_code == 200
+
+
+async def test_handle_response_non_json_warning_names_request_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The non-JSON warning must name the endpoint that failed.
+
+    Without the request path this warning identifies only the response body,
+    so a console returning an HTML page on one of several polled config
+    endpoints cannot be attributed to the call that actually failed. That is
+    exactly why a sustained burst of this warning in production could not be
+    pinned to a culprit endpoint.
+    """
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    path = "/proxy/network/v2/api/site/default/trafficroutes"
+    response = _make_response(
+        status=200,
+        text="<!doctype html><html><body>login</body></html>",
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        method="GET",
+        path=path,
+    )
+
+    with caplog.at_level(logging.WARNING), pytest.raises(UniFiResponseError):
+        await client._handle_response(response)
+
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if "Response is not JSON" in record.getMessage()
+    )
+    assert "GET" in message
+    assert path in message
+
+
+async def test_handle_response_non_json_warning_omits_query_string(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning must log url.path, never the full URL.
+
+    A UniFi request URL can carry credentials in its query string. Logging
+    `response.url` instead of `response.url.path` would leak them into the
+    HA log and into any diagnostics upload, so this pins the safe form.
+    """
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    path = "/proxy/network/integration/v1/sites"
+    response = _make_response(
+        status=200,
+        text="<!doctype html><html><body>login</body></html>",
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        path=path,
+    )
+    response.url.__str__.return_value = f"https://192.168.1.1{path}?apiKey=SUPER-SECRET"
+
+    with caplog.at_level(logging.WARNING), pytest.raises(UniFiResponseError):
+        await client._handle_response(response)
+
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if "Response is not JSON" in record.getMessage()
+    )
+    assert "SUPER-SECRET" not in message
+    assert "apiKey" not in message
+    assert path in message
 
 
 async def test_handle_response_empty_body_returns_none() -> None:

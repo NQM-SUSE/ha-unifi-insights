@@ -306,7 +306,17 @@ class BaseUniFiClient(ABC):
             redacted_response = (
                 _redact(response_text)[:200] if response_text else "empty"
             )
-            _LOGGER.warning("Response is not JSON: %s", redacted_response)
+            # Log the request path: without it this warning names only the
+            # body, so a console returning an HTML page on one of several
+            # polled endpoints cannot be attributed to the endpoint that
+            # actually failed. `url.path` deliberately omits the query
+            # string, which can carry credentials.
+            _LOGGER.warning(
+                "Response is not JSON for %s %s: %s",
+                response.method,
+                response.url.path,
+                redacted_response,
+            )
             msg = f"API returned non-JSON response (status {status})"
             raise UniFiResponseError(
                 msg,
