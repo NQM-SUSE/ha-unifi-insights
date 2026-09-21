@@ -216,11 +216,6 @@ class UnifiInsightsEntity(CoordinatorEntity[UnifiFacadeCoordinator]):
         self._attr_device_info = DeviceInfo(**device_info)  # type: ignore[typeddict-item]
 
     @property
-    def device_info(self) -> DeviceInfo | None:
-        """Return device information."""
-        return self._attr_device_info
-
-    @property
     def available(self) -> bool:
         """Return True if entity is available."""
         # Cached device data can still read "online" long after the
@@ -434,11 +429,6 @@ class UnifiProtectEntity(CoordinatorEntity[UnifiFacadeCoordinator]):
             )
 
         self._attr_device_info = DeviceInfo(**device_info)  # type: ignore[typeddict-item]
-
-    @property
-    def device_info(self) -> DeviceInfo | None:
-        """Return device information."""
-        return self._attr_device_info
 
     @property
     def available(self) -> bool:
