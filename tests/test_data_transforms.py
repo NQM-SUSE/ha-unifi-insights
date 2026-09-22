@@ -2,6 +2,7 @@
 
 from custom_components.unifi_insights.data_transforms import (
     map_device_status,
+    normalize_legacy_wan,
     transform_network_device,
     transform_protect_camera,
     transform_protect_chime,
@@ -127,3 +128,39 @@ def test_transform_protect_camera_missing_fields():
     assert result["state"] == "UNKNOWN"  # Default when status missing
     assert result["hdr_mode"] == "AUTO"  # Default when hdr missing
     assert result["video_mode"] == "DEFAULT"  # Default when video_mode missing
+
+
+def test_normalize_legacy_wan_pppoe_up():
+    """A PPPoE link with carrier and an address is connected."""
+    wan = normalize_legacy_wan(
+        "wan1",
+        {"type": "pppoe", "up": True, "ip": "198.51.100.7", "name": "WAN"},
+    )
+    assert wan == {
+        "key": "wan1",
+        "name": "WAN",
+        "ifname": None,
+        "type": "pppoe",
+        "ip": "198.51.100.7",
+        "gateway": None,
+        "carrier_up": True,
+        "connected": True,
+    }
+
+
+def test_normalize_legacy_wan_carrier_up_without_address_is_disconnected():
+    """Carrier alone does not mean the PPP session is up."""
+    for missing_ip in ("", "0.0.0.0", None):
+        wan = normalize_legacy_wan(
+            "wan1", {"type": "pppoe", "up": True, "ip": missing_ip}
+        )
+        assert wan["carrier_up"] is True
+        assert wan["connected"] is False
+        assert wan["ip"] is None
+
+
+def test_normalize_legacy_wan_carrier_down_is_disconnected():
+    """A link without carrier is disconnected even with a stale address."""
+    wan = normalize_legacy_wan("wan2", {"up": False, "ip": "198.51.100.8"})
+    assert wan["connected"] is False
+    assert wan["name"] == "WAN2"

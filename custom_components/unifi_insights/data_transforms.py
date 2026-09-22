@@ -6,6 +6,13 @@ response formats to the internal data structures expected by entities,
 maintaining backward compatibility.
 """
 
+from __future__ import annotations
+
+from typing import Any, Final
+
+# Legacy stat/device reports a gateway's WAN links as wan1..wanN objects.
+LEGACY_WAN_KEYS: Final = tuple(f"wan{n}" for n in range(1, 7))
+
 
 def map_device_status(lib_status: str | None) -> str:
     """
@@ -149,4 +156,23 @@ def transform_protect_chime(lib_chime: dict) -> dict:
         "volume": lib_chime.get("volume"),
         "repeat_times": lib_chime.get("repeat"),
         "ringtone_id": lib_chime.get("ringtone"),
+    }
+
+
+def normalize_legacy_wan(wan_key: str, wan: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one legacy gateway WAN block into the entity-facing shape."""
+    ip = wan.get("ip")
+    has_ip = isinstance(ip, str) and ip not in ("", "0.0.0.0")
+    carrier_up = wan.get("up") is True
+    return {
+        "key": wan_key,
+        "name": wan.get("name") or wan_key.upper(),
+        "ifname": wan.get("ifname"),
+        "type": wan.get("type"),
+        "ip": ip if has_ip else None,
+        "gateway": wan.get("gateway"),
+        "carrier_up": carrier_up,
+        # PPPoE: the carrier can stay up while the PPP session is down, so a
+        # link only counts as connected once it also holds an address.
+        "connected": carrier_up and has_ip,
     }

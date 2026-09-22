@@ -2153,6 +2153,62 @@ class TestUnifiDeviceCoordinator:
         assert "Error updating data" in str(exc_info.value)
         assert coordinator._available is False
 
+    def test_merge_legacy_wan_data(self, coordinator: UnifiDeviceCoordinator):
+        """Enabled legacy WAN blocks are merged; disabled ones are skipped."""
+        device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {
+                "wan1": {"type": "pppoe", "up": True, "ip": "198.51.100.7"},
+                "wan2": {"type": "dhcp", "up": False, "enable": False},
+                "wan3": "not-a-dict",
+            }
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_wan_data(
+            device_dict, legacy_devices_by_mac
+        )
+
+        assert [wan["key"] for wan in device_dict["wans"]] == ["wan1"]
+        assert device_dict["wans"][0]["connected"] is True
+        assert device_dict["wans"][0]["type"] == "pppoe"
+
+    def test_merge_legacy_wan_data_without_wan_blocks(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Devices without WAN blocks, or without legacy data, are untouched."""
+        switch: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        unmatched: dict[str, Any] = {"macAddress": "11:22:33:44:55:66"}
+        no_mac: dict[str, Any] = {}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {"port_table": []}
+        }
+
+        for device_dict in (switch, unmatched, no_mac):
+            UnifiDeviceCoordinator._merge_legacy_wan_data(
+                device_dict, legacy_devices_by_mac
+            )
+            assert "wans" not in device_dict
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_merges_legacy_wans(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Legacy WAN link state reaches the gateway device through a refresh."""
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "wan1": {"type": "pppoe", "up": True, "ip": "198.51.100.7"},
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        wans = result["devices"]["default"]["device1"]["wans"]
+        assert wans[0]["key"] == "wan1"
+        assert wans[0]["connected"] is True
+
     def test_merge_legacy_port_data_includes_poe_good(
         self, coordinator: UnifiDeviceCoordinator
     ):

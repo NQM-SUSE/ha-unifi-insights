@@ -24,6 +24,10 @@ from custom_components.unifi_insights.api.network.models import (
     parse_outlet_metrics,
 )
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
+from custom_components.unifi_insights.data_transforms import (
+    LEGACY_WAN_KEYS,
+    normalize_legacy_wan,
+)
 from custom_components.unifi_insights.helpers import async_get_device_entry
 
 from .base import UnifiBaseCoordinator
@@ -458,6 +462,30 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             device_dict["outlet_ac_power_budget"] = outlet_metrics.ac_power_budget
             device_dict["ac_power_budget"] = outlet_metrics.ac_power_budget
 
+    @classmethod
+    def _merge_legacy_wan_data(
+        cls,
+        device_dict: dict[str, Any],
+        legacy_devices_by_mac: dict[str, dict[str, Any]],
+    ) -> None:
+        """Merge per-WAN link state (wan1..wanN) from legacy gateway data."""
+        mac_address = cls._normalize_mac(
+            device_dict.get("macAddress") or device_dict.get("mac")
+        )
+        if mac_address is None:
+            return
+        legacy_device = legacy_devices_by_mac.get(mac_address)
+        if legacy_device is None:
+            return
+        wans = [
+            normalize_legacy_wan(wan_key, wan)
+            for wan_key in LEGACY_WAN_KEYS
+            if isinstance(wan := legacy_device.get(wan_key), dict)
+            and wan.get("enable") is not False
+        ]
+        if wans:
+            device_dict["wans"] = wans
+
     def _map_legacy_site_names(
         self,
         site_ids: list[str],
@@ -801,6 +829,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
                 self._merge_legacy_port_data(device, legacy_devices_by_mac)
                 self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+                self._merge_legacy_wan_data(device, legacy_devices_by_mac)
 
         _LOGGER.debug(
             "Device coordinator: Site %s - Found %d devices and %d clients",
