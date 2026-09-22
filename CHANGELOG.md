@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A **WAN Connection** binary sensor for each gateway WAN link, including PPPoE WANs. It turns off when the link has no carrier or no address, so a dropped PPPoE session is visible in Home Assistant; the link type, address and next hop are attributes. The existing **WAN Status** sensor keeps reporting whether the gateway itself is online. [#162](https://github.com/ruaan-deysel/ha-unifi-insights/issues/162)
+- A **Site-to-Site VPN** binary sensor on the gateway of each site that has site-to-site VPN enabled. UniFi only reports site-wide tunnel counts, not per-tunnel state, so the sensor is on while at least one tunnel is up and none are down; the active and inactive tunnel counts are attributes. [#162](https://github.com/ruaan-deysel/ha-unifi-insights/issues/162)
+
 ### Changed
 
 - Removed the redundant vendored API version module and consolidated its version
   constant into the API constants module without changing runtime behavior.
+
+### Fixed
+
+- Gateway detection is now shared by every platform. Gateways recognised only by an advertised gateway/router feature now get the WAN Status sensor, and models such as "Cloud Gateway Max" now get the WAN IP/uptime sensors.
 
 ## [2026.9.6] - 2026-09-22
 
