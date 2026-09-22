@@ -21,6 +21,7 @@ from .const import (
     DEVICE_TYPE_NVR,
     DEVICE_TYPE_SENSOR,
     DOMAIN,
+    GATEWAY_MODEL_PREFIXES,
     MANUFACTURER,
 )
 from .coordinators import UnifiFacadeCoordinator
@@ -76,6 +77,26 @@ def device_has_feature(device_data: dict[str, Any], *features_to_match: str) -> 
     if isinstance(features, list):
         return any(feature_name in features for feature_name in features_to_match)
     return False
+
+
+def is_gateway_device(device_data: dict[str, Any]) -> bool:
+    """
+    Return True when a network device is a gateway/router.
+
+    A gateway is recognised by model prefix, by "GATEWAY" anywhere in the
+    model (e.g. "Cloud Gateway Max"), by an advertised gateway/router
+    feature, or by carrying merged legacy WAN link data - only devices that
+    route WAN traffic report ``wan1..wanN``. "switching" alone is
+    deliberately not enough: plain switches are not gateways.
+    """
+    model = device_data.get("model")
+    model_str = model.upper() if isinstance(model, str) else ""
+    return (
+        model_str.startswith(GATEWAY_MODEL_PREFIXES)
+        or "GATEWAY" in model_str
+        or device_has_feature(device_data, "gateway", "router")
+        or bool(device_data.get("wans"))
+    )
 
 
 def is_device_online(data: dict[str, Any]) -> bool:

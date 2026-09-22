@@ -23,6 +23,7 @@ from custom_components.unifi_insights.entity import (
     first_not_none,
     get_field,
     is_device_online,
+    is_gateway_device,
 )
 
 
@@ -163,6 +164,33 @@ class TestIsDeviceOnline:
 
         data_none = {"state": None}
         assert is_device_online(data_none) is False
+
+
+class TestIsGatewayDevice:
+    """Tests for the shared gateway heuristic."""
+
+    @pytest.mark.parametrize(
+        ("device", "expected"),
+        [
+            ({"model": "UDM-PRO"}, True),
+            ({"model": "UCG-Ultra"}, True),
+            ({"model": "ucg ultra"}, True),
+            ({"model": "UXG-Lite"}, True),
+            ({"model": "USG-3P"}, True),
+            ({"model": "UDR"}, True),
+            ({"model": "Cloud Gateway Max"}, True),
+            ({"model": "USW-24-POE", "features": ["switching"]}, False),
+            ({"model": "U6-LR", "features": ["accessPoint"]}, False),
+            ({"model": "Unknown", "features": ["switching", "gateway"]}, True),
+            ({"model": "Unknown", "features": {"router": True}}, True),
+            ({"model": "UX", "wans": [{"key": "wan1"}]}, True),
+            ({"model": None}, False),
+            ({}, False),
+        ],
+    )
+    def test_is_gateway_device(self, device, expected):
+        """Model prefix, gateway feature, or merged WAN data identify a gateway."""
+        assert is_gateway_device(device) is expected
 
 
 class TestUnifiInsightsEntity:

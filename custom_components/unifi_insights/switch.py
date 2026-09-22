@@ -23,7 +23,6 @@ from .const import (
     DEFAULT_CLIENT_CONTROL,
     DEVICE_TYPE_CAMERA,
     DOMAIN,
-    GATEWAY_MODEL_PREFIXES,
     MANUFACTURER,
     VIDEO_MODE_DEFAULT,
     VIDEO_MODE_HIGH_FPS,
@@ -31,9 +30,9 @@ from .const import (
 from .entity import (
     UnifiProtectEntity,
     async_call_coordinator_action,
-    device_has_feature as _device_has_feature,
     get_field,
     is_device_online,
+    is_gateway_device,
 )
 
 if TYPE_CHECKING:
@@ -84,13 +83,7 @@ def _find_gateway_device_id(
         if not isinstance(device_data, dict):
             continue
 
-        model = str(device_data.get("model", "")).upper()
-        is_gw = (
-            _device_has_feature(device_data, "gateway", "router")
-            or model.startswith(GATEWAY_MODEL_PREFIXES)
-            or "GATEWAY" in model
-        )
-        if is_gw:
+        if is_gateway_device(device_data):
             return str(device_id)
 
     return None

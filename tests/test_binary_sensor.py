@@ -612,6 +612,33 @@ class TestAsyncSetupEntry:
         ]
         assert len(device_sensors) > 0
 
+    async def test_setup_entry_wan_status_for_feature_only_gateway(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A gateway recognised only by its features still gets WAN status."""
+        mock_coordinator.data["devices"]["site1"]["device2"] = {
+            "id": "device2",
+            "name": "Gateway",
+            "model": "Unknown",
+            "features": ["gateway"],
+            "state": "ONLINE",
+            "macAddress": "11:22:33:44:55:66",
+        }
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        wan_status_devices = {
+            e._device_id
+            for e in added_entities
+            if isinstance(e, UnifiInsightsBinarySensor)
+            and e.entity_description.key == "wan_status"
+        }
+        assert wan_status_devices == {"device2"}
+
     async def test_setup_entry_creates_protect_sensors(
         self, hass: HomeAssistant, mock_coordinator, mock_config_entry
     ):

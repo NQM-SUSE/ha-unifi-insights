@@ -37,13 +37,18 @@ from .const import (
     CAMERA_TYPE_DOORBELL_WITH_PACKAGE_DETECTION,
     DEVICE_TYPE_CAMERA,
     DEVICE_TYPE_SENSOR,
-    GATEWAY_MODEL_PREFIXES,
     SMART_DETECT_ANIMAL,
     SMART_DETECT_PACKAGE,
     SMART_DETECT_PERSON,
     SMART_DETECT_VEHICLE,
 )
-from .entity import UnifiInsightsEntity, UnifiProtectEntity, get_field, is_device_online
+from .entity import (
+    UnifiInsightsEntity,
+    UnifiProtectEntity,
+    get_field,
+    is_device_online,
+    is_gateway_device,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -362,13 +367,9 @@ async def async_setup_entry(
                     for description in BINARY_SENSOR_TYPES:
                         if description.entity_type == "device":
                             # Skip WAN status sensor for non-gateway devices
-                            model = device_data.get("model")
-                            model_str = model.upper() if isinstance(model, str) else ""
-                            is_gateway = (
-                                model_str.startswith(GATEWAY_MODEL_PREFIXES)
-                                or "GATEWAY" in model_str
-                            )
-                            if description.key == "wan_status" and not is_gateway:
+                            if description.key == "wan_status" and not (
+                                is_gateway_device(device_data)
+                            ):
                                 _LOGGER.debug(
                                     "Skipping WAN status sensor for non-gateway device "
                                     "%s (%s)",
