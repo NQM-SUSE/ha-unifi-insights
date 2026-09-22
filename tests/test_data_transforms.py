@@ -150,7 +150,7 @@ def test_normalize_legacy_wan_pppoe_up():
 
 def test_normalize_legacy_wan_carrier_up_without_address_is_disconnected():
     """Carrier alone does not mean the PPP session is up."""
-    for missing_ip in ("", "0.0.0.0", None):
+    for missing_ip in ("", "0.0.0.0", "::", None):
         wan = normalize_legacy_wan(
             "wan1", {"type": "pppoe", "up": True, "ip": missing_ip}
         )

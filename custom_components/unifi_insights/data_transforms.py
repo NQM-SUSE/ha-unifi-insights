@@ -8,6 +8,7 @@ maintaining backward compatibility.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any, Final
 
 # Legacy stat/device reports a gateway's WAN links as wan1..wanN objects.
@@ -159,10 +160,18 @@ def transform_protect_chime(lib_chime: dict) -> dict:
     }
 
 
+def _is_unspecified_address(value: str) -> bool:
+    """Return True for 0.0.0.0 / ::, the placeholder a down link reports."""
+    try:
+        return ipaddress.ip_address(value).is_unspecified
+    except ValueError:
+        return False
+
+
 def normalize_legacy_wan(wan_key: str, wan: dict[str, Any]) -> dict[str, Any]:
     """Normalize one legacy gateway WAN block into the entity-facing shape."""
     ip = wan.get("ip")
-    has_ip = isinstance(ip, str) and ip not in ("", "0.0.0.0")
+    has_ip = isinstance(ip, str) and bool(ip) and not _is_unspecified_address(ip)
     carrier_up = wan.get("up") is True
     return {
         "key": wan_key,
