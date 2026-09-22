@@ -2262,7 +2262,7 @@ class TestUnifiDeviceCoordinator:
                     "model": "UCG-Ultra",
                     "type": "ugw",
                     "up": True,
-                    "wan1": {"type": "pppoe", "up": True, "ip": "198.51.100.7"},
+                    "last_wan_status": {"WAN": "online"},
                 }
             ]
         )
@@ -2270,7 +2270,7 @@ class TestUnifiDeviceCoordinator:
         result = await coordinator._async_update_data()
 
         (device,) = result["devices"]["default"].values()
-        assert device["wans"][0]["key"] == "wan1"
+        assert device["wans"][0]["key"] == "wan"
         assert device["wans"][0]["connected"] is True
 
     @pytest.mark.asyncio
@@ -2284,13 +2284,13 @@ class TestUnifiDeviceCoordinator:
         coordinator.network_client.sites.get_legacy_health.assert_not_awaited()
 
     def test_merge_legacy_wan_data(self, coordinator: UnifiDeviceCoordinator):
-        """Enabled legacy WAN blocks are merged; disabled ones are skipped."""
+        """The gateway's per-WAN connection state is merged by MAC."""
         device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
         legacy_devices_by_mac: dict[str, dict[str, Any]] = {
             "aa:bb:cc:dd:ee:ff": {
-                "wan1": {"type": "pppoe", "up": True, "ip": "198.51.100.7"},
-                "wan2": {"type": "dhcp", "up": False, "enable": False},
-                "wan3": "not-a-dict",
+                "wan1": {"type": "ethernet", "name": "eth8", "up": True},
+                "last_wan_status": {"WAN": "online"},
+                "last_wan_interfaces": {"WAN": {"ip": "198.51.100.7", "alive": True}},
             }
         }
 
@@ -2298,9 +2298,9 @@ class TestUnifiDeviceCoordinator:
             device_dict, legacy_devices_by_mac
         )
 
-        assert [wan["key"] for wan in device_dict["wans"]] == ["wan1"]
+        assert [wan["key"] for wan in device_dict["wans"]] == ["wan"]
         assert device_dict["wans"][0]["connected"] is True
-        assert device_dict["wans"][0]["type"] == "pppoe"
+        assert device_dict["wans"][0]["name"] == "WAN"
 
     def test_merge_legacy_wan_data_without_wan_blocks(
         self, coordinator: UnifiDeviceCoordinator
@@ -2328,7 +2328,7 @@ class TestUnifiDeviceCoordinator:
             return_value=[
                 {
                     "mac": "AA:BB:CC:DD:EE:FF",
-                    "wan1": {"type": "pppoe", "up": True, "ip": "198.51.100.7"},
+                    "last_wan_status": {"WAN": "online"},
                 }
             ]
         )
@@ -2336,7 +2336,7 @@ class TestUnifiDeviceCoordinator:
         result = await coordinator._async_update_data()
 
         wans = result["devices"]["default"]["device1"]["wans"]
-        assert wans[0]["key"] == "wan1"
+        assert wans[0]["key"] == "wan"
         assert wans[0]["connected"] is True
 
     def test_merge_legacy_port_data_includes_poe_good(

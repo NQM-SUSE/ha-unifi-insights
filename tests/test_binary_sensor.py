@@ -706,23 +706,19 @@ class TestWanLinkBinarySensor:
                         "macAddress": "11:22:33:44:55:66",
                         "wans": [
                             {
-                                "key": "wan1",
+                                "key": "wan",
                                 "name": "WAN",
-                                "ifname": "ppp0",
-                                "type": "pppoe",
+                                "status": "online",
+                                "alive": True,
                                 "ip": "198.51.100.7",
-                                "gateway_ip": "198.51.100.1",
-                                "carrier_up": True,
                                 "connected": True,
                             },
                             {
                                 "key": "wan2",
                                 "name": "WAN2",
-                                "ifname": "eth5",
-                                "type": "dhcp",
+                                "status": "offline",
+                                "alive": False,
                                 "ip": None,
-                                "gateway_ip": None,
-                                "carrier_up": False,
                                 "connected": False,
                             },
                         ],
@@ -758,19 +754,18 @@ class TestWanLinkBinarySensor:
             for e in added_entities
             if isinstance(e, UnifiWanLinkBinarySensor)
         }
-        assert set(wan) == {"wan1", "wan2"}
-        assert wan["wan1"].unique_id == "site1_gw_wan_link_wan1"
-        assert wan["wan1"].device_class == BinarySensorDeviceClass.CONNECTIVITY
-        assert wan["wan1"].translation_key == "wan_link"
-        assert wan["wan1"].translation_placeholders == {"wan_name": "WAN"}
-        assert wan["wan1"].is_on is True
+        assert set(wan) == {"wan", "wan2"}
+        assert wan["wan"].unique_id == "site1_gw_wan_link_wan"
+        assert wan["wan"].device_class == BinarySensorDeviceClass.CONNECTIVITY
+        assert wan["wan"].translation_key == "wan_link"
+        assert wan["wan"].translation_placeholders == {"wan_name": "WAN"}
+        assert wan["wan2"].translation_placeholders == {"wan_name": "WAN2"}
+        assert wan["wan"].is_on is True
         assert wan["wan2"].is_on is False
-        assert wan["wan1"].extra_state_attributes == {
-            "type": "pppoe",
+        assert wan["wan"].extra_state_attributes == {
+            "status": "online",
+            "alive": True,
             "ip": "198.51.100.7",
-            "gateway_ip": "198.51.100.1",
-            "ifname": "ppp0",
-            "carrier_up": True,
         }
 
     async def test_setup_entry_does_not_duplicate_on_refresh(
@@ -799,7 +794,7 @@ class TestWanLinkBinarySensor:
             coordinator=mock_coordinator,
             site_id="site1",
             device_id="gw",
-            wan_key="wan1",
+            wan_key="wan",
             wan_name="WAN",
         )
         del mock_coordinator.data["devices"]["site1"]["gw"]["wans"]
@@ -930,7 +925,7 @@ class TestSiteToSiteVpnBinarySensor:
         """An unrecognised model that reports WAN links still gets the sensor."""
         gw = mock_coordinator.data["devices"]["site1"]["gw"]
         gw["model"] = "Unknown"
-        gw["wans"] = [{"key": "wan1", "name": "WAN", "connected": True}]
+        gw["wans"] = [{"key": "wan", "name": "WAN", "connected": True}]
 
         (sensor,) = await self._setup(hass, mock_config_entry)
 

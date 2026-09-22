@@ -24,10 +24,7 @@ from custom_components.unifi_insights.api.network.models import (
     parse_outlet_metrics,
 )
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
-from custom_components.unifi_insights.data_transforms import (
-    LEGACY_WAN_KEYS,
-    normalize_legacy_wan,
-)
+from custom_components.unifi_insights.data_transforms import normalize_legacy_wans
 from custom_components.unifi_insights.helpers import async_get_device_entry
 
 from .base import UnifiBaseCoordinator
@@ -476,7 +473,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         device_dict: dict[str, Any],
         legacy_devices_by_mac: dict[str, dict[str, Any]],
     ) -> None:
-        """Merge per-WAN link state (wan1..wanN) from legacy gateway data."""
+        """Merge per-WAN connection state from legacy gateway data."""
         mac_address = cls._normalize_mac(
             device_dict.get("macAddress") or device_dict.get("mac")
         )
@@ -485,12 +482,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         legacy_device = legacy_devices_by_mac.get(mac_address)
         if legacy_device is None:
             return
-        wans = [
-            normalize_legacy_wan(wan_key, wan)
-            for wan_key in LEGACY_WAN_KEYS
-            if isinstance(wan := legacy_device.get(wan_key), dict)
-            and wan.get("enable") is not False
-        ]
+        wans = normalize_legacy_wans(legacy_device)
         if wans:
             device_dict["wans"] = wans
 

@@ -55,8 +55,6 @@ TO_REDACT = {
     "wanIp",
     "lan_ip",
     "lanIp",
-    # Upstream next hop of a gateway WAN link (merged legacy WAN data).
-    "gateway_ip",
     "sourceAddress",
     "source_address",
     "destinationAddress",

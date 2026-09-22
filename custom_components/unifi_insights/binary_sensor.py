@@ -759,7 +759,7 @@ class UnifiPortBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
 
 
 class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
-    """Connectivity of one gateway WAN link (DHCP, static or PPPoE)."""
+    """Connectivity of one gateway WAN connection (DHCP, static or PPPoE)."""
 
     def __init__(
         self,
@@ -807,10 +807,7 @@ class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
         wan = self._find_wan()
         if wan is None:
             return None
-        return {
-            key: wan.get(key)
-            for key in ("type", "ip", "gateway_ip", "ifname", "carrier_up")
-        }
+        return {key: wan.get(key) for key in ("status", "alive", "ip")}
 
 
 class UnifiSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):

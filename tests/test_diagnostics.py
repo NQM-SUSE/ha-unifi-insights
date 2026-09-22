@@ -279,10 +279,10 @@ async def test_diagnostics_redacts_wan_link_addresses(
                 "features": {"gateway": True},
                 "wans": [
                     {
-                        "key": "wan1",
-                        "type": "pppoe",
+                        "key": "wan",
+                        "name": "WAN",
+                        "status": "online",
                         "ip": "198.51.100.7",
-                        "gateway_ip": "198.51.100.1",
                         "connected": True,
                     }
                 ],
@@ -295,10 +295,8 @@ async def test_diagnostics_redacts_wan_link_addresses(
     device = diagnostics["data"]["devices"]["site-1"]["device-1"]
     wan = device["wans"][0]
     assert wan["ip"] == REDACTED
-    assert wan["gateway_ip"] == REDACTED
-    # Only the WAN next hop is redacted, not every key named "gateway".
     assert device["features"] == {"gateway": True}
-    assert wan["type"] == "pppoe"
+    assert wan["status"] == "online"
     assert wan["connected"] is True
 
 

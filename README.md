@@ -142,22 +142,22 @@ After setup, open the integration's options flow (**Settings** → **Devices & S
 
 ### Binary sensors
 
-| Entity            | Description                                                               |
-| ----------------- | ------------------------------------------------------------------------- |
-| Device Status     | Network device online/offline state                                       |
-| WAN Status        | Gateway online state (for link state use WAN Connection)                  |
-| WAN Connection    | Per-WAN link state (DHCP, static or PPPoE); attributes: type, IP, gateway |
-| Site-to-Site VPN  | On while all site-to-site VPN tunnels are up (site-wide tunnel counts)    |
-| Motion Detection  | Camera or sensor motion activity                                          |
-| Person Detection  | AI person detection                                                       |
-| Vehicle Detection | AI vehicle detection                                                      |
-| Animal Detection  | AI animal detection                                                       |
-| Package Detection | AI package detection                                                      |
-| Doorbell Ring     | Doorbell ring activity                                                    |
-| Door / Window     | Protect sensor open/close state                                           |
-| Tamper            | Protect sensor tamper detection                                           |
-| Leak              | Protect sensor water leak detection                                       |
-| Recording         | Camera actively recording                                                 |
+| Entity            | Description                                                                         |
+| ----------------- | ----------------------------------------------------------------------------------- |
+| Device Status     | Network device online/offline state                                                 |
+| WAN Status        | Gateway online state (for link state use WAN Connection)                            |
+| WAN Connection    | Per-WAN internet connection state (DHCP, static or PPPoE) as the gateway reports it |
+| Site-to-Site VPN  | On while all site-to-site VPN tunnels are up (site-wide tunnel counts)              |
+| Motion Detection  | Camera or sensor motion activity                                                    |
+| Person Detection  | AI person detection                                                                 |
+| Vehicle Detection | AI vehicle detection                                                                |
+| Animal Detection  | AI animal detection                                                                 |
+| Package Detection | AI package detection                                                                |
+| Doorbell Ring     | Doorbell ring activity                                                              |
+| Door / Window     | Protect sensor open/close state                                                     |
+| Tamper            | Protect sensor tamper detection                                                     |
+| Leak              | Protect sensor water leak detection                                                 |
+| Recording         | Camera actively recording                                                           |
 
 ### Switches
 
