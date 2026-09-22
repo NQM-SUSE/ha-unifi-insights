@@ -11,6 +11,7 @@ from custom_components.unifi_insights.binary_sensor import (
     UnifiInsightsBinarySensor,
     UnifiPortBinarySensor,
     UnifiProtectBinarySensor,
+    UnifiWanLinkBinarySensor,
     _get_supported_smart_detect_types,
     _is_doorbell_camera,
     _is_smart_detect_active,
@@ -679,6 +680,131 @@ class TestAsyncSetupEntry:
             e for e in added_entities if isinstance(e, UnifiProtectBinarySensor)
         ]
         assert len(protect_sensors) == 0
+
+
+class TestWanLinkBinarySensor:
+    """Tests for the per-WAN link connectivity binary sensor."""
+
+    @pytest.fixture
+    def mock_coordinator(self, hass: HomeAssistant):
+        """Create a coordinator holding one gateway with two WAN links."""
+        coordinator = MagicMock()
+        coordinator.hass = hass
+        coordinator.network_client = MagicMock()
+        coordinator.network_client.base_url = "https://192.168.1.1"
+        coordinator.protect_client = None
+        coordinator.data = {
+            "sites": {"site1": {"id": "site1"}},
+            "devices": {
+                "site1": {
+                    "gw": {
+                        "id": "gw",
+                        "name": "Gateway",
+                        "model": "UCG-Ultra",
+                        "state": "ONLINE",
+                        "macAddress": "11:22:33:44:55:66",
+                        "wans": [
+                            {
+                                "key": "wan1",
+                                "name": "WAN",
+                                "ifname": "ppp0",
+                                "type": "pppoe",
+                                "ip": "198.51.100.7",
+                                "gateway": "198.51.100.1",
+                                "carrier_up": True,
+                                "connected": True,
+                            },
+                            {
+                                "key": "wan2",
+                                "name": "WAN2",
+                                "ifname": "eth5",
+                                "type": "dhcp",
+                                "ip": None,
+                                "gateway": None,
+                                "carrier_up": False,
+                                "connected": False,
+                            },
+                        ],
+                    },
+                },
+            },
+            "stats": {},
+            "clients": {},
+        }
+        return coordinator
+
+    @pytest.fixture
+    def mock_config_entry(self, mock_coordinator):
+        """Create mock config entry."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = mock_coordinator
+        return entry
+
+    async def test_setup_entry_creates_one_sensor_per_wan(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Each merged WAN link gets its own connectivity sensor."""
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        wan = {
+            e._wan_key: e
+            for e in added_entities
+            if isinstance(e, UnifiWanLinkBinarySensor)
+        }
+        assert set(wan) == {"wan1", "wan2"}
+        assert wan["wan1"].unique_id == "site1_gw_wan_link_wan1"
+        assert wan["wan1"].device_class == BinarySensorDeviceClass.CONNECTIVITY
+        assert wan["wan1"].translation_key == "wan_link"
+        assert wan["wan1"].translation_placeholders == {"wan_name": "WAN"}
+        assert wan["wan1"].is_on is True
+        assert wan["wan2"].is_on is False
+        assert wan["wan1"].extra_state_attributes == {
+            "type": "pppoe",
+            "ip": "198.51.100.7",
+            "gateway": "198.51.100.1",
+            "ifname": "ppp0",
+            "carrier_up": True,
+        }
+
+    async def test_setup_entry_does_not_duplicate_on_refresh(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Rediscovery on later coordinator updates adds no duplicates."""
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+        listener()
+
+        wan_sensors = [
+            e for e in added_entities if isinstance(e, UnifiWanLinkBinarySensor)
+        ]
+        assert len(wan_sensors) == 2
+
+    async def test_state_unknown_when_wan_disappears(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """A WAN missing from the latest data reports unknown, not off."""
+        sensor = UnifiWanLinkBinarySensor(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            device_id="gw",
+            wan_key="wan1",
+            wan_name="WAN",
+        )
+        del mock_coordinator.data["devices"]["site1"]["gw"]["wans"]
+
+        assert sensor.is_on is None
+        assert sensor.extra_state_attributes is None
 
 
 class TestGetSupportedSmartDetectTypes:

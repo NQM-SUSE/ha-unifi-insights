@@ -267,6 +267,9 @@
       "wan_status": {
         "name": "WAN Status"
       },
+      "wan_link": {
+        "name": "{wan_name} Connection"
+      },
       "camera_motion": {
         "name": "Motion Detection"
       },

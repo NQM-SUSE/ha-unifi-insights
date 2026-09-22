@@ -420,6 +420,26 @@ async def async_setup_entry(
                                 )
                             )
 
+                    # Per-WAN link connectivity (merged legacy WAN data)
+                    wans = device_data.get("wans", [])
+                    if isinstance(wans, list):
+                        for wan in wans:
+                            if not isinstance(wan, dict) or not wan.get("key"):
+                                continue
+                            wan_key = (site_id, device_id, wan["key"], "wan_link")
+                            if wan_key in known_sensor_keys:
+                                continue
+                            known_sensor_keys.add(wan_key)
+                            entities.append(
+                                UnifiWanLinkBinarySensor(
+                                    coordinator=coordinator,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                    wan_key=wan["key"],
+                                    wan_name=wan.get("name") or wan["key"].upper(),
+                                )
+                            )
+
         # Add binary sensors for Protect devices
         if coordinator.protect_client:
             protect = coordinator.data.get("protect", {})
@@ -708,3 +728,55 @@ class UnifiPortBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
             if val:
                 attrs[label] = val
         return attrs or None
+
+
+class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
+    """Connectivity of one gateway WAN link (DHCP, static or PPPoE)."""
+
+    def __init__(
+        self,
+        coordinator: UnifiFacadeCoordinator,
+        site_id: str,
+        device_id: str,
+        wan_key: str,
+        wan_name: str,
+    ) -> None:
+        """Initialize the WAN link binary sensor."""
+        desc = UnifiInsightsBinarySensorEntityDescription(
+            key=f"wan_link_{wan_key}",
+            translation_key="wan_link",
+            device_class=BinarySensorDeviceClass.CONNECTIVITY,
+            entity_type="device",
+        )
+        super().__init__(coordinator, desc, site_id, device_id)
+        self._wan_key = wan_key
+        self._attr_translation_placeholders = {"wan_name": wan_name}
+
+    def _find_wan(self) -> dict[str, Any] | None:
+        """Return this sensor's WAN link from coordinator data."""
+        device_data = (
+            self.coordinator.data.get("devices", {})
+            .get(self._site_id, {})
+            .get(self._device_id, {})
+        )
+        for wan in device_data.get("wans", []):
+            if isinstance(wan, dict) and wan.get("key") == self._wan_key:
+                return wan
+        return None
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when the WAN link is connected."""
+        wan = self._find_wan()
+        return None if wan is None else bool(wan.get("connected"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return WAN link details."""
+        wan = self._find_wan()
+        if wan is None:
+            return None
+        return {
+            key: wan.get(key)
+            for key in ("type", "ip", "gateway", "ifname", "carrier_up")
+        }

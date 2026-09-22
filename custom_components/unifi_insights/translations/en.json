@@ -261,6 +261,9 @@
           "off": "Offline"
         }
       },
+      "wan_link": {
+        "name": "{wan_name} Connection"
+      },
       "camera_motion": {
         "name": "Motion Detection"
       },
