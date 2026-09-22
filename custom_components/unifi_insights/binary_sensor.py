@@ -442,17 +442,22 @@ async def async_setup_entry(
 
                     # Site-to-site VPN status, one per site on its gateway
                     site_health = coordinator.data.get("site_health", {})
-                    site_vpn = (
-                        site_health.get(site_id, {}).get("vpn")
+                    site_entry = (
+                        site_health.get(site_id)
                         if isinstance(site_health, dict)
                         else None
+                    )
+                    site_vpn = (
+                        site_entry.get("vpn") if isinstance(site_entry, dict) else None
                     )
                     vpn_key = (site_id, "site_to_site_vpn")
                     if (
                         isinstance(site_vpn, dict)
                         and site_vpn.get("site_to_site_enabled")
                         and vpn_key not in known_sensor_keys
-                        and is_gateway_device(device_data)
+                        # Devices reporting WAN links route traffic even when
+                        # their model/features are not recognised.
+                        and (is_gateway_device(device_data) or wans)
                     ):
                         known_sensor_keys.add(vpn_key)
                         entities.append(
@@ -782,7 +787,10 @@ class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
             .get(self._site_id, {})
             .get(self._device_id, {})
         )
-        for wan in device_data.get("wans", []):
+        wans = device_data.get("wans")
+        if not isinstance(wans, list):
+            return None
+        for wan in wans:
             if isinstance(wan, dict) and wan.get("key") == self._wan_key:
                 return wan
         return None
@@ -801,7 +809,7 @@ class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
             return None
         return {
             key: wan.get(key)
-            for key in ("type", "ip", "gateway", "ifname", "carrier_up")
+            for key in ("type", "ip", "gateway_ip", "ifname", "carrier_up")
         }
 
 
@@ -832,8 +840,11 @@ class UnifiSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
 
     def _vpn_health(self) -> dict[str, Any] | None:
         """Return the site's vpn health subsystem from coordinator data."""
-        site_health = self.coordinator.data.get("site_health", {})
-        vpn = site_health.get(self._site_id, {}).get("vpn")
+        site_health = self.coordinator.data.get("site_health")
+        if not isinstance(site_health, dict):
+            return None
+        site = site_health.get(self._site_id)
+        vpn = site.get("vpn") if isinstance(site, dict) else None
         return vpn if isinstance(vpn, dict) else None
 
     @property

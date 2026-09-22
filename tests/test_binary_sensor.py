@@ -711,7 +711,7 @@ class TestWanLinkBinarySensor:
                                 "ifname": "ppp0",
                                 "type": "pppoe",
                                 "ip": "198.51.100.7",
-                                "gateway": "198.51.100.1",
+                                "gateway_ip": "198.51.100.1",
                                 "carrier_up": True,
                                 "connected": True,
                             },
@@ -721,7 +721,7 @@ class TestWanLinkBinarySensor:
                                 "ifname": "eth5",
                                 "type": "dhcp",
                                 "ip": None,
-                                "gateway": None,
+                                "gateway_ip": None,
                                 "carrier_up": False,
                                 "connected": False,
                             },
@@ -768,7 +768,7 @@ class TestWanLinkBinarySensor:
         assert wan["wan1"].extra_state_attributes == {
             "type": "pppoe",
             "ip": "198.51.100.7",
-            "gateway": "198.51.100.1",
+            "gateway_ip": "198.51.100.1",
             "ifname": "ppp0",
             "carrier_up": True,
         }
@@ -806,6 +806,9 @@ class TestWanLinkBinarySensor:
 
         assert sensor.is_on is None
         assert sensor.extra_state_attributes is None
+
+        mock_coordinator.data["devices"]["site1"]["gw"]["wans"] = None
+        assert sensor.is_on is None
 
 
 class TestSiteToSiteVpnBinarySensor:
@@ -920,6 +923,29 @@ class TestSiteToSiteVpnBinarySensor:
         vpn["site_to_site_enabled"] = False
 
         assert await self._setup(hass, mock_config_entry) == []
+
+    async def test_created_on_device_reporting_wans(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """An unrecognised model that reports WAN links still gets the sensor."""
+        gw = mock_coordinator.data["devices"]["site1"]["gw"]
+        gw["model"] = "Unknown"
+        gw["wans"] = [{"key": "wan1", "name": "WAN", "connected": True}]
+
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        assert sensor._device_id == "gw"
+
+    async def test_unknown_on_malformed_site_health(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A non-dict site health entry reads unknown instead of raising."""
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        mock_coordinator.data["site_health"] = {"site1": None}
+        assert sensor.is_on is None
+        mock_coordinator.data["site_health"] = None
+        assert sensor.is_on is None
 
     async def test_not_created_without_gateway(
         self, hass: HomeAssistant, mock_coordinator, mock_config_entry

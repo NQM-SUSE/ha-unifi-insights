@@ -2200,6 +2200,80 @@ class TestUnifiDeviceCoordinator:
         assert result["devices"]["default"]
 
     @pytest.mark.asyncio
+    async def test_site_health_reused_for_bounded_polls_then_dropped(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A failing health call reuses the last good value for a few polls."""
+        good = {
+            "subsystem": "vpn",
+            "site_to_site_enabled": True,
+            "site_to_site_num_active": 1,
+            "site_to_site_num_inactive": 0,
+        }
+        coordinator.network_client.sites.get_legacy_health = AsyncMock(
+            return_value=[good]
+        )
+        await coordinator._async_update_data()
+
+        coordinator.network_client.sites.get_legacy_health = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        for _ in range(MAX_STATS_REUSE_POLLS):
+            result = await coordinator._async_update_data()
+            assert result["site_health"]["default"] == {"vpn": good}
+
+        result = await coordinator._async_update_data()
+        assert result["site_health"]["default"] == {}
+
+        # A success resets the failure count.
+        coordinator.network_client.sites.get_legacy_health = AsyncMock(
+            return_value=[good]
+        )
+        await coordinator._async_update_data()
+        assert coordinator._health_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_site_health_dropped_for_sites_no_longer_polled(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Health of a site that is no longer polled is purged."""
+        coordinator.data["site_health"]["gone"] = {"vpn": {"subsystem": "vpn"}}
+        coordinator._health_failures["gone"] = 1
+
+        result = await coordinator._async_update_data()
+
+        assert "gone" not in result["site_health"]
+        assert "gone" not in coordinator._health_failures
+
+    @pytest.mark.asyncio
+    async def test_legacy_primary_devices_still_get_wans(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """WAN links are merged when legacy devices replace a failing v1 list."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Gateway",
+                    "model": "UCG-Ultra",
+                    "type": "ugw",
+                    "up": True,
+                    "wan1": {"type": "pppoe", "up": True, "ip": "198.51.100.7"},
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        (device,) = result["devices"]["default"].values()
+        assert device["wans"][0]["key"] == "wan1"
+        assert device["wans"][0]["connected"] is True
+
+    @pytest.mark.asyncio
     async def test_fetch_site_health_without_legacy_site(
         self, coordinator: UnifiDeviceCoordinator
     ):

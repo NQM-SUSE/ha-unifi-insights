@@ -117,7 +117,8 @@ def _merge_legacy_system_stats(
 
 
 # How many consecutive polls a device's last good statistics are reused for
-# when its statistics call keeps failing, before its stats are dropped.
+# when its statistics call keeps failing, before its stats are dropped. Site
+# health is bounded the same way.
 MAX_STATS_REUSE_POLLS = 3
 
 
@@ -163,6 +164,8 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         # the devices whose stats were reused (not refetched) this refresh.
         self._stats_failures: dict[str, int] = {}
         self._reused_stats: set[str] = set()
+        # Consecutive polls each site's health call has failed for.
+        self._health_failures: dict[str, int] = {}
         self.data: dict[str, Any] = {
             "devices": {},
             "clients": {},
@@ -491,16 +494,38 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         if wans:
             device_dict["wans"] = wans
 
+    def _site_health_or_previous(
+        self, site_id: str, health: dict[str, dict[str, Any]] | None
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Return fresh site health, or reuse the last good one for a few polls.
+
+        A single failed health call would otherwise flip the site-to-site VPN
+        sensor on -> unknown -> on and fire automations. The reuse is bounded
+        so a call that keeps failing cannot hold a stale "connected" forever.
+        """
+        if health is not None:
+            self._health_failures.pop(site_id, None)
+            return health
+        failures = self._health_failures.get(site_id, 0) + 1
+        self._health_failures[site_id] = failures
+        previous = self.data["site_health"].get(site_id)
+        if failures <= MAX_STATS_REUSE_POLLS and isinstance(previous, dict):
+            return previous
+        return {}
+
     async def _fetch_site_health(
         self, site_id: str, legacy_site_name: str | None
-    ) -> dict[str, dict[str, Any]]:
+    ) -> dict[str, dict[str, Any]] | None:
         """
         Return the site's health subsystems we use, keyed by subsystem name.
 
-        Health only feeds optional entities, so a failure here must never fail
-        the device refresh - auth problems surface through _process_site. Only
-        the subsystems in _SITE_HEALTH_SUBSYSTEMS are kept: the others carry
-        ISP names, nameservers and gateway MACs that nothing reads.
+        Returns None when the call failed, so the caller can tell a failure
+        from a site that reports nothing. Health only feeds optional entities,
+        so a failure here must never fail the device refresh - auth problems
+        surface through _process_site. Only the subsystems in
+        _SITE_HEALTH_SUBSYSTEMS are kept: the others carry ISP names,
+        nameservers and gateway MACs that nothing reads.
         """
         if legacy_site_name is None:
             return {}
@@ -514,7 +539,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 site_id,
                 err,
             )
-            return {}
+            return None
         return {
             name: subsystem
             for subsystem in subsystems
@@ -859,11 +884,14 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             is not None
         }
 
-        if legacy_devices_by_mac and not legacy_as_primary:
+        if legacy_devices_by_mac:
             for device in devices:
-                self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
-                self._merge_legacy_port_data(device, legacy_devices_by_mac)
-                self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+                if not legacy_as_primary:
+                    self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
+                    self._merge_legacy_port_data(device, legacy_devices_by_mac)
+                    self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+                # The legacy-to-v1 mapping does not carry WAN links, so they
+                # are merged whichever source is primary.
                 self._merge_legacy_wan_data(device, legacy_devices_by_mac)
 
         _LOGGER.debug(
@@ -924,6 +952,11 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                     for site_id, value in self.data[key].items()
                     if site_id in site_ids
                 }
+            self._health_failures = {
+                site_id: count
+                for site_id, count in self._health_failures.items()
+                if site_id in site_ids
+            }
 
             if not site_ids:
                 # Deliberately no stale-device cleanup here: an empty site
@@ -1018,7 +1051,9 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 self.data["devices"][site_id] = devices_dict
                 self.data["stats"][site_id] = stats_dict
                 self.data["clients"][site_id] = clients_dict
-                self.data["site_health"][site_id] = health
+                self.data["site_health"][site_id] = self._site_health_or_previous(
+                    site_id, health
+                )
 
                 _LOGGER.debug(
                     "Device coordinator: Processed site %s - %d devices, %d clients",

@@ -276,12 +276,13 @@ async def test_diagnostics_redacts_wan_link_addresses(
             "device-1": {
                 "id": "device-1",
                 "model": "UCG-Ultra",
+                "features": {"gateway": True},
                 "wans": [
                     {
                         "key": "wan1",
                         "type": "pppoe",
                         "ip": "198.51.100.7",
-                        "gateway": "198.51.100.1",
+                        "gateway_ip": "198.51.100.1",
                         "connected": True,
                     }
                 ],
@@ -291,9 +292,12 @@ async def test_diagnostics_redacts_wan_link_addresses(
 
     diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
 
-    wan = diagnostics["data"]["devices"]["site-1"]["device-1"]["wans"][0]
+    device = diagnostics["data"]["devices"]["site-1"]["device-1"]
+    wan = device["wans"][0]
     assert wan["ip"] == REDACTED
-    assert wan["gateway"] == REDACTED
+    assert wan["gateway_ip"] == REDACTED
+    # Only the WAN next hop is redacted, not every key named "gateway".
+    assert device["features"] == {"gateway": True}
     assert wan["type"] == "pppoe"
     assert wan["connected"] is True
 

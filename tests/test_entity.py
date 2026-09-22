@@ -183,13 +183,14 @@ class TestIsGatewayDevice:
             ({"model": "U6-LR", "features": ["accessPoint"]}, False),
             ({"model": "Unknown", "features": ["switching", "gateway"]}, True),
             ({"model": "Unknown", "features": {"router": True}}, True),
-            ({"model": "UX", "wans": [{"key": "wan1"}]}, True),
+            # WAN data alone must not change which device groups site entities
+            ({"model": "UX", "wans": [{"key": "wan1"}]}, False),
             ({"model": None}, False),
             ({}, False),
         ],
     )
     def test_is_gateway_device(self, device, expected):
-        """Model prefix, gateway feature, or merged WAN data identify a gateway."""
+        """Model prefix or a gateway/router feature identify a gateway."""
         assert is_gateway_device(device) is expected
 
 

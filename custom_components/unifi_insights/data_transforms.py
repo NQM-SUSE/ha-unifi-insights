@@ -179,7 +179,7 @@ def normalize_legacy_wan(wan_key: str, wan: dict[str, Any]) -> dict[str, Any]:
         "ifname": wan.get("ifname"),
         "type": wan.get("type"),
         "ip": ip if has_ip else None,
-        "gateway": wan.get("gateway"),
+        "gateway_ip": wan.get("gateway"),
         "carrier_up": carrier_up,
         # PPPoE: the carrier can stay up while the PPP session is down, so a
         # link only counts as connected once it also holds an address.

@@ -84,10 +84,14 @@ def is_gateway_device(device_data: dict[str, Any]) -> bool:
     Return True when a network device is a gateway/router.
 
     A gateway is recognised by model prefix, by "GATEWAY" anywhere in the
-    model (e.g. "Cloud Gateway Max"), by an advertised gateway/router
-    feature, or by carrying merged legacy WAN link data - only devices that
-    route WAN traffic report ``wan1..wanN``. "switching" alone is
-    deliberately not enough: plain switches are not gateways.
+    model (e.g. "Cloud Gateway Max"), or by an advertised gateway/router
+    feature. "switching" alone is deliberately not enough: plain switches
+    are not gateways.
+
+    Merged legacy WAN data (``wans``) is deliberately not a signal here:
+    it is only present when the legacy fetch succeeded, and this check also
+    decides which device site-level entities are grouped under, which must
+    not depend on whether one poll's legacy call happened to work.
     """
     model = device_data.get("model")
     model_str = model.upper() if isinstance(model, str) else ""
@@ -95,7 +99,6 @@ def is_gateway_device(device_data: dict[str, Any]) -> bool:
         model_str.startswith(GATEWAY_MODEL_PREFIXES)
         or "GATEWAY" in model_str
         or device_has_feature(device_data, "gateway", "router")
-        or bool(device_data.get("wans"))
     )
 
 
