@@ -265,7 +265,7 @@
         "name": "{wan_name} Connection"
       },
       "site_to_site_vpn": {
-        "name": "Site-to-Site VPN"
+        "name": "{tunnel_name} Site-to-Site VPN"
       },
       "camera_motion": {
         "name": "Motion Detection"

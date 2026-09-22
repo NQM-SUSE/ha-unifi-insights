@@ -151,13 +151,14 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "policy_based_routes", {}
             ),
             "vpn_clients": self._config_coordinator.data.get("vpn_clients", {}),
+            "site_vpns": self._config_coordinator.data.get("site_vpns", {}),
             "network_info": self._config_coordinator.data.get("network_info", {}),
             # From device coordinator
             "devices": self._device_coordinator.data.get("devices", {}),
             "clients": self._device_coordinator.data.get("clients", {}),
             "stats": self._device_coordinator.data.get("stats", {}),
             "vouchers": self._device_coordinator.data.get("vouchers", {}),
-            "site_health": self._device_coordinator.data.get("site_health", {}),
+            "vpn_connections": self._device_coordinator.data.get("vpn_connections", {}),
             # From protect coordinator
             "protect": (
                 self._protect_coordinator.data

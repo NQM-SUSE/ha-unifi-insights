@@ -147,7 +147,7 @@ After setup, open the integration's options flow (**Settings** → **Devices & S
 | Device Status     | Network device online/offline state                                                 |
 | WAN Status        | Gateway online state (for link state use WAN Connection)                            |
 | WAN Connection    | Per-WAN internet connection state (DHCP, static or PPPoE) as the gateway reports it |
-| Site-to-Site VPN  | On while all site-to-site VPN tunnels are up (site-wide tunnel counts)              |
+| Site-to-Site VPN  | Connection state of each site-to-site VPN tunnel (one sensor per tunnel)            |
 | Motion Detection  | Camera or sensor motion activity                                                    |
 | Person Detection  | AI person detection                                                                 |
 | Vehicle Detection | AI vehicle detection                                                                |

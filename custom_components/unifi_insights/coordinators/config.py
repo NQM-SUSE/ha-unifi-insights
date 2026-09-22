@@ -68,6 +68,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             "firewall_rules": {},
             "policy_based_routes": {},
             "vpn_clients": {},
+            "site_vpns": {},
             "network_info": {},
         }
         # Every site the console reports (id -> display name), before the
@@ -337,6 +338,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 self.data["firewall_rules"] = {}
                 self.data["policy_based_routes"] = {}
                 self.data["vpn_clients"] = {}
+                self.data["site_vpns"] = {}
                 self.data["network_info"] = {}
                 self._available = True
                 self.data["last_update"] = datetime.now(tz=UTC)
@@ -345,7 +347,13 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             # Per-site maps are updated in place below, so drop any site that
             # is no longer polled (removed from the console, or deselected)
             # rather than keep serving its last values.
-            for key in ("wifi", "firewall_rules", "policy_based_routes", "vpn_clients"):
+            for key in (
+                "wifi",
+                "firewall_rules",
+                "policy_based_routes",
+                "vpn_clients",
+                "site_vpns",
+            ):
                 self.data[key] = {
                     site_id: value
                     for site_id, value in self.data[key].items()
@@ -373,6 +381,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             failed_sections: set[tuple[str, str]] = set()
             routes_by_site: dict[str, dict[str, Any]] = {}
             vpn_clients_by_site: dict[str, dict[str, Any]] = {}
+            site_vpns_by_site: dict[str, dict[str, Any]] = {}
 
             for site_id in sites:
                 _LOGGER.debug(
@@ -532,11 +541,38 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 else:
                     vpn_clients_by_site[site_id] = {}
 
+                # Site-to-site VPN tunnels (names/types for per-tunnel entities;
+                # their live state comes from the device coordinator).
+                if legacy_name:
+                    try:
+                        vpn_endpoint = self.network_client.vpn_clients
+                        tunnels = await vpn_endpoint.list_site_to_site_vpns(legacy_name)
+                        site_vpns_by_site[site_id] = {
+                            tunnel["id"]: tunnel for tunnel in tunnels
+                        }
+                    except UniFiAuthenticationError:
+                        raise
+                    except Exception as err:
+                        _LOGGER.debug(
+                            "Config coordinator: Site-to-site VPNs unavailable "
+                            "for site %s: %s",
+                            site_id,
+                            err,
+                        )
+                        # Keep the last known tunnels: their sensors would
+                        # otherwise all go unavailable until the next poll.
+                        site_vpns_by_site[site_id] = self.data.get("site_vpns", {}).get(
+                            site_id, {}
+                        )
+                else:
+                    site_vpns_by_site[site_id] = {}
+
             self.data["sites"] = sites
             self.data["wifi"] = wifi_by_site
             self.data["firewall_rules"] = firewall_by_site
             self.data["policy_based_routes"] = routes_by_site
             self.data["vpn_clients"] = vpn_clients_by_site
+            self.data["site_vpns"] = site_vpns_by_site
             for section, site_id in self._failed_sections - failed_sections:
                 _LOGGER.info(
                     "Config coordinator: %s fetch for site %s recovered",

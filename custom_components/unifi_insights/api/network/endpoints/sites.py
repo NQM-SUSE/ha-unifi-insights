@@ -124,25 +124,3 @@ class SitesEndpoint:
         if isinstance(data, dict):
             return [data]
         return []
-
-    async def get_legacy_health(self, site_name: str) -> list[dict[str, Any]]:
-        """
-        List the health subsystems of a site from the legacy Network API.
-
-        Args:
-            site_name: The UniFi classic site name, for example ``default``.
-
-        Returns:
-            Raw subsystem dictionaries (``wan``, ``vpn``, ...) from
-            ``/stat/health``.
-
-        """
-        path = self._client.build_legacy_api_path(site_name, "/stat/health")
-        response = await self._client._get(path)
-
-        data = (
-            response.get("data", response) if isinstance(response, dict) else response
-        )
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-        return []

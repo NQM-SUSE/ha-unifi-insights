@@ -440,33 +440,34 @@ async def async_setup_entry(
                                 )
                             )
 
-                    # Site-to-site VPN status, one per site on its gateway
-                    site_health = coordinator.data.get("site_health", {})
-                    site_entry = (
-                        site_health.get(site_id)
-                        if isinstance(site_health, dict)
-                        else None
+                    # Site-to-site VPN tunnels, one sensor each, on the gateway.
+                    # Devices reporting WAN links route traffic even when their
+                    # model/features are not recognised.
+                    site_vpns = coordinator.data.get("site_vpns", {})
+                    tunnels = (
+                        site_vpns.get(site_id) if isinstance(site_vpns, dict) else None
                     )
-                    site_vpn = (
-                        site_entry.get("vpn") if isinstance(site_entry, dict) else None
-                    )
-                    vpn_key = (site_id, "site_to_site_vpn")
-                    if (
-                        isinstance(site_vpn, dict)
-                        and site_vpn.get("site_to_site_enabled")
-                        and vpn_key not in known_sensor_keys
-                        # Devices reporting WAN links route traffic even when
-                        # their model/features are not recognised.
-                        and (is_gateway_device(device_data) or wans)
+                    if isinstance(tunnels, dict) and (
+                        is_gateway_device(device_data) or wans
                     ):
-                        known_sensor_keys.add(vpn_key)
-                        entities.append(
-                            UnifiSiteToSiteVpnBinarySensor(
-                                coordinator=coordinator,
-                                site_id=site_id,
-                                device_id=device_id,
+                        for tunnel_id, tunnel in tunnels.items():
+                            if not isinstance(tunnel, dict) or not tunnel.get(
+                                "enabled", True
+                            ):
+                                continue
+                            vpn_key = (site_id, "site_to_site_vpn", tunnel_id)
+                            if vpn_key in known_sensor_keys:
+                                continue
+                            known_sensor_keys.add(vpn_key)
+                            entities.append(
+                                UnifiSiteToSiteVpnBinarySensor(
+                                    coordinator=coordinator,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                    tunnel_id=tunnel_id,
+                                    tunnel_name=tunnel.get("name") or tunnel_id,
+                                )
                             )
-                        )
 
         # Add binary sensors for Protect devices
         if coordinator.protect_client:
@@ -812,11 +813,11 @@ class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
 
 class UnifiSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
     """
-    Site-to-site VPN status of a site, shown on its gateway.
+    Connection state of one site-to-site VPN tunnel, shown on the gateway.
 
-    UniFi only reports site-wide active/inactive tunnel counts (legacy
-    stat/health "vpn" subsystem), not per-tunnel state, so this is on while at
-    least one tunnel is up and none are down.
+    State comes from the v2 ``vpn/connections`` list, which carries one entry
+    per live VPN keyed by the tunnel's networkconf id. A tunnel that is not in
+    the list, or is listed with a status other than CONNECTED, is off.
     """
 
     def __init__(
@@ -824,43 +825,60 @@ class UnifiSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
         coordinator: UnifiFacadeCoordinator,
         site_id: str,
         device_id: str,
+        tunnel_id: str,
+        tunnel_name: str,
     ) -> None:
-        """Initialize the site-to-site VPN binary sensor."""
+        """Initialize the site-to-site VPN tunnel binary sensor."""
         desc = UnifiInsightsBinarySensorEntityDescription(
-            key="site_to_site_vpn",
+            key=f"site_to_site_vpn_{tunnel_id}",
             translation_key="site_to_site_vpn",
             device_class=BinarySensorDeviceClass.CONNECTIVITY,
             icon="mdi:vpn",
             entity_type="device",
         )
         super().__init__(coordinator, desc, site_id, device_id)
+        self._tunnel_id = tunnel_id
+        self._attr_translation_placeholders = {"tunnel_name": tunnel_name}
 
-    def _vpn_health(self) -> dict[str, Any] | None:
-        """Return the site's vpn health subsystem from coordinator data."""
-        site_health = self.coordinator.data.get("site_health")
-        if not isinstance(site_health, dict):
-            return None
-        site = site_health.get(self._site_id)
-        vpn = site.get("vpn") if isinstance(site, dict) else None
-        return vpn if isinstance(vpn, dict) else None
+    def _tunnel(self) -> dict[str, Any] | None:
+        """Return this tunnel's configuration, if it still exists."""
+        site_vpns = self.coordinator.data.get("site_vpns")
+        site = site_vpns.get(self._site_id) if isinstance(site_vpns, dict) else None
+        tunnel = site.get(self._tunnel_id) if isinstance(site, dict) else None
+        return tunnel if isinstance(tunnel, dict) else None
+
+    def _connections(self) -> dict[str, Any] | None:
+        """Return the site's live VPN connections, or None when unknown."""
+        connections = self.coordinator.data.get("vpn_connections")
+        site = connections.get(self._site_id) if isinstance(connections, dict) else None
+        return site if isinstance(site, dict) else None
+
+    @property
+    def available(self) -> bool:
+        """Return False once the tunnel is removed from the console."""
+        return bool(super().available and self._tunnel() is not None)
 
     @property
     def is_on(self) -> bool | None:
-        """Return True when every site-to-site tunnel is up."""
-        vpn = self._vpn_health()
-        if vpn is None:
+        """Return True while the tunnel is connected."""
+        connections = self._connections()
+        if connections is None:
             return None
-        active = vpn.get("site_to_site_num_active") or 0
-        inactive = vpn.get("site_to_site_num_inactive") or 0
-        return active > 0 and inactive == 0
+        connection = connections.get(self._tunnel_id)
+        return (
+            isinstance(connection, dict)
+            and str(connection.get("status") or "").upper() == "CONNECTED"
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Return the site's tunnel counts."""
-        vpn = self._vpn_health()
-        if vpn is None:
-            return None
+        """Return the tunnel's type and raw connection status."""
+        tunnel = self._tunnel() or {}
+        connections = self._connections()
+        connection = connections.get(self._tunnel_id) if connections else None
         return {
-            "active_tunnels": vpn.get("site_to_site_num_active"),
-            "inactive_tunnels": vpn.get("site_to_site_num_inactive"),
+            "vpn_type": tunnel.get("vpn_type"),
+            "status": connection.get("status")
+            if isinstance(connection, dict)
+            else None,
         }

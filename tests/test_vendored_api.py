@@ -226,18 +226,31 @@ async def test_get_legacy_all_sites_returns_raw_site_dicts() -> None:
     ("response", "expected"),
     [
         (
-            {"data": [{"subsystem": "vpn"}, "junk", {"subsystem": "wan"}]},
-            [{"subsystem": "vpn"}, {"subsystem": "wan"}],
+            {
+                "connections": [
+                    {
+                        "network_id": "tun1",
+                        "type": "ipsec-vpn",
+                        "status": "CONNECTED",
+                        "remote_ip": "198.51.100.9",
+                        "local_ip": "198.51.100.7",
+                        "rx_rate_bps": 0,
+                    },
+                    {"type": "openvpn-client", "status": "CONNECTED"},
+                    "junk",
+                ]
+            },
+            [{"network_id": "tun1", "type": "ipsec-vpn", "status": "CONNECTED"}],
         ),
-        ([{"subsystem": "vpn"}], [{"subsystem": "vpn"}]),
-        ({"data": {"subsystem": "vpn"}}, []),
+        ({"connections": {}}, []),
+        ([], []),
         (None, []),
     ],
 )
-async def test_get_legacy_health_returns_subsystem_dicts(
+async def test_list_vpn_connections_keeps_identity_and_status_only(
     response: Any, expected: list[dict[str, Any]]
 ) -> None:
-    """Test legacy stat/health parsing keeps only subsystem dictionaries."""
+    """Test v2 vpn/connections parsing drops addresses and malformed entries."""
     client = UniFiNetworkClient(
         auth=ApiKeyAuth(api_key="test-key"),
         base_url="https://192.168.1.1",
@@ -245,10 +258,48 @@ async def test_get_legacy_health_returns_subsystem_dicts(
     )
     client._get = AsyncMock(return_value=response)
 
-    result = await client.sites.get_legacy_health("default")
+    result = await client.vpn_clients.list_vpn_connections("default")
 
     assert result == expected
-    client._get.assert_awaited_once_with("/proxy/network/api/s/default/stat/health")
+    client._get.assert_awaited_once_with(
+        "/proxy/network/v2/api/site/default/vpn/connections"
+    )
+
+
+async def test_list_site_to_site_vpns_filters_site_vpn_entries() -> None:
+    """Test only site-vpn networkconf entries are returned, without secrets."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    client._get = AsyncMock(
+        return_value={
+            "meta": {"rc": "ok"},
+            "data": [
+                {
+                    "_id": "tun1",
+                    "purpose": "site-vpn",
+                    "name": "Office",
+                    "vpn_type": "ipsec-vpn",
+                    "x_ipsec_pre_shared_key": "secret",
+                },
+                {"_id": "tun2", "purpose": "site-vpn", "enabled": False},
+                {"_id": "cli1", "purpose": "vpn-client", "name": "Example VPN"},
+                {"purpose": "site-vpn", "name": "no id"},
+            ],
+        }
+    )
+
+    result = await client.vpn_clients.list_site_to_site_vpns("default")
+
+    assert result == [
+        {"id": "tun1", "name": "Office", "vpn_type": "ipsec-vpn", "enabled": True},
+        {"id": "tun2", "name": None, "vpn_type": None, "enabled": False},
+    ]
+    client._get.assert_awaited_once_with(
+        "/proxy/network/api/s/default/rest/networkconf"
+    )
 
 
 async def test_sites_get_all_handles_missing_id_payload() -> None:

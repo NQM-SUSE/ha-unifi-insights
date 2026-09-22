@@ -42,9 +42,6 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Legacy stat/health subsystems kept in coordinator data ("vpn" feeds the
-# site-to-site VPN binary sensor).
-_SITE_HEALTH_SUBSYSTEMS = frozenset({"vpn"})
 
 # Stats keys the v1 statistics endpoint may already have populated. A legacy
 # reading only fills a gap, it never overwrites a value v1 supplied.
@@ -115,7 +112,7 @@ def _merge_legacy_system_stats(
 
 # How many consecutive polls a device's last good statistics are reused for
 # when its statistics call keeps failing, before its stats are dropped. Site
-# health is bounded the same way.
+# VPN connection state is bounded the same way.
 MAX_STATS_REUSE_POLLS = 3
 
 
@@ -161,14 +158,14 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         # the devices whose stats were reused (not refetched) this refresh.
         self._stats_failures: dict[str, int] = {}
         self._reused_stats: set[str] = set()
-        # Consecutive polls each site's health call has failed for.
-        self._health_failures: dict[str, int] = {}
+        # Consecutive polls each site's VPN connections call has failed for.
+        self._vpn_connection_failures: dict[str, int] = {}
         self.data: dict[str, Any] = {
             "devices": {},
             "clients": {},
             "stats": {},
             "vouchers": {},
-            "site_health": {},
+            "vpn_connections": {},
             "last_update": None,
         }
 
@@ -486,57 +483,53 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         if wans:
             device_dict["wans"] = wans
 
-    def _site_health_or_previous(
-        self, site_id: str, health: dict[str, dict[str, Any]] | None
-    ) -> dict[str, dict[str, Any]]:
+    def _vpn_connections_or_previous(
+        self, site_id: str, connections: dict[str, dict[str, Any]] | None
+    ) -> dict[str, dict[str, Any]] | None:
         """
-        Return fresh site health, or reuse the last good one for a few polls.
+        Return fresh VPN connections, or reuse the last good set for a few polls.
 
-        A single failed health call would otherwise flip the site-to-site VPN
-        sensor on -> unknown -> on and fire automations. The reuse is bounded
-        so a call that keeps failing cannot hold a stale "connected" forever.
+        A single failed call would otherwise flip every site-to-site VPN sensor
+        on -> unknown -> on and fire automations. The reuse is bounded so a call
+        that keeps failing cannot hold a stale "connected" forever; after that
+        the site's entry is dropped and the sensors read unknown.
         """
-        if health is not None:
-            self._health_failures.pop(site_id, None)
-            return health
-        failures = self._health_failures.get(site_id, 0) + 1
-        self._health_failures[site_id] = failures
-        previous = self.data["site_health"].get(site_id)
+        if connections is not None:
+            self._vpn_connection_failures.pop(site_id, None)
+            return connections
+        failures = self._vpn_connection_failures.get(site_id, 0) + 1
+        self._vpn_connection_failures[site_id] = failures
+        previous = self.data["vpn_connections"].get(site_id)
         if failures <= MAX_STATS_REUSE_POLLS and isinstance(previous, dict):
             return previous
-        return {}
+        return None
 
-    async def _fetch_site_health(
+    async def _fetch_vpn_connections(
         self, site_id: str, legacy_site_name: str | None
     ) -> dict[str, dict[str, Any]] | None:
         """
-        Return the site's health subsystems we use, keyed by subsystem name.
+        Return the site's live VPN connections keyed by network_id.
 
-        Returns None when the call failed, so the caller can tell a failure
-        from a site that reports nothing. Health only feeds optional entities,
-        so a failure here must never fail the device refresh - auth problems
-        surface through _process_site. Only the subsystems in
-        _SITE_HEALTH_SUBSYSTEMS are kept: the others carry ISP names,
-        nameservers and gateway MACs that nothing reads.
+        Returns None when the state cannot be read (call failed, or no classic
+        site name to ask with), so the caller can tell that apart from a site
+        with no connected VPNs ({}). This only feeds optional entities, so a
+        failure must never fail the device refresh - auth problems surface
+        through _process_site.
         """
         if legacy_site_name is None:
-            return {}
+            return None
         try:
-            subsystems = await self.network_client.sites.get_legacy_health(
+            connections = await self.network_client.vpn_clients.list_vpn_connections(
                 legacy_site_name
             )
         except Exception as err:
             _LOGGER.debug(
-                "Device coordinator: Site health unavailable for site %s: %s",
+                "Device coordinator: VPN connections unavailable for site %s: %s",
                 site_id,
                 err,
             )
             return None
-        return {
-            name: subsystem
-            for subsystem in subsystems
-            if (name := subsystem.get("subsystem")) in _SITE_HEALTH_SUBSYSTEMS
-        }
+        return {connection["network_id"]: connection for connection in connections}
 
     def _map_legacy_site_names(
         self,
@@ -938,15 +931,15 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             # Drop data for sites no longer polled so their entities stop
             # reporting last-known values. Site-level fetch failures below
             # still keep a polled site's previous data.
-            for key in ("devices", "stats", "clients", "site_health"):
+            for key in ("devices", "stats", "clients", "vpn_connections"):
                 self.data[key] = {
                     site_id: value
                     for site_id, value in self.data[key].items()
                     if site_id in site_ids
                 }
-            self._health_failures = {
+            self._vpn_connection_failures = {
                 site_id: count
-                for site_id, count in self._health_failures.items()
+                for site_id, count in self._vpn_connection_failures.items()
                 if site_id in site_ids
             }
 
@@ -983,13 +976,13 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 self._process_site(site_id, legacy_site_names.get(site_id))
                 for site_id in site_ids
             ]
-            health_tasks = [
-                self._fetch_site_health(site_id, legacy_site_names.get(site_id))
+            vpn_tasks = [
+                self._fetch_vpn_connections(site_id, legacy_site_names.get(site_id))
                 for site_id in site_ids
             ]
-            results, health_results = await asyncio.gather(
+            results, vpn_results = await asyncio.gather(
                 asyncio.gather(*tasks, return_exceptions=True),
-                asyncio.gather(*health_tasks),
+                asyncio.gather(*vpn_tasks),
             )
 
             # A site that could not be refreshed fails the whole update, and
@@ -1037,15 +1030,17 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             ]
 
             # Update data structure with results
-            for site_id, (devices_dict, stats_dict, clients_dict), health in zip(
-                site_ids, site_results, health_results, strict=True
+            for site_id, (devices_dict, stats_dict, clients_dict), vpn in zip(
+                site_ids, site_results, vpn_results, strict=True
             ):
                 self.data["devices"][site_id] = devices_dict
                 self.data["stats"][site_id] = stats_dict
                 self.data["clients"][site_id] = clients_dict
-                self.data["site_health"][site_id] = self._site_health_or_previous(
-                    site_id, health
-                )
+                connections = self._vpn_connections_or_previous(site_id, vpn)
+                if connections is None:
+                    self.data["vpn_connections"].pop(site_id, None)
+                else:
+                    self.data["vpn_connections"][site_id] = connections
 
                 _LOGGER.debug(
                     "Device coordinator: Processed site %s - %d devices, %d clients",

@@ -47,6 +47,8 @@ ENDPOINT_TRAFFIC_ROUTES: Final[str] = "trafficroutes"
 
 # Network legacy REST endpoints
 ENDPOINT_NETWORKCONF: Final[str] = "rest/networkconf"
+# Live state of VPN clients and site-to-site tunnels (v2, per connection).
+ENDPOINT_VPN_CONNECTIONS: Final[str] = "vpn/connections"
 
 # Protect Integration API path prefix (used for both local and remote)
 PROTECT_INTEGRATION_PATH: Final[str] = "/proxy/protect/integration/v1"

@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A **WAN Connection** binary sensor for each WAN in use on a gateway (named "WAN", "WAN2" like the UniFi UI), including PPPoE WANs. It follows the gateway's own per-WAN status rather than the port's link light, so a PPPoE session that drops while the cable stays connected shows as disconnected. The raw status, reachability check result and address are attributes. The existing **WAN Status** sensor keeps reporting whether the gateway itself is online. [#162](https://github.com/ruaan-deysel/ha-unifi-insights/issues/162)
-- A **Site-to-Site VPN** binary sensor on the gateway of each site that has site-to-site VPN enabled. UniFi only reports site-wide tunnel counts, not per-tunnel state, so the sensor is on while at least one tunnel is up and none are down; the active and inactive tunnel counts are attributes. [#162](https://github.com/ruaan-deysel/ha-unifi-insights/issues/162)
+- A **Site-to-Site VPN** binary sensor for each site-to-site VPN tunnel (such as IPsec or SD-WAN), named after the tunnel and attached to the gateway. It follows the gateway's live per-tunnel connection state and turns off when the tunnel is not connected; the tunnel type and raw status are attributes. The site-wide tunnel counts UniFi also reports were not used: they were found to stay at "0 active" even while an IPsec tunnel was up. [#162](https://github.com/ruaan-deysel/ha-unifi-insights/issues/162)
 
 ### Changed
 
