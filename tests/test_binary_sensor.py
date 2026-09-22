@@ -11,6 +11,7 @@ from custom_components.unifi_insights.binary_sensor import (
     UnifiInsightsBinarySensor,
     UnifiPortBinarySensor,
     UnifiProtectBinarySensor,
+    UnifiSiteToSiteVpnBinarySensor,
     UnifiWanLinkBinarySensor,
     _get_supported_smart_detect_types,
     _is_doorbell_camera,
@@ -802,6 +803,138 @@ class TestWanLinkBinarySensor:
             wan_name="WAN",
         )
         del mock_coordinator.data["devices"]["site1"]["gw"]["wans"]
+
+        assert sensor.is_on is None
+        assert sensor.extra_state_attributes is None
+
+
+class TestSiteToSiteVpnBinarySensor:
+    """Tests for the site-level site-to-site VPN binary sensor."""
+
+    @pytest.fixture
+    def mock_coordinator(self, hass: HomeAssistant):
+        """Create a coordinator with a switch, a gateway and VPN health."""
+        coordinator = MagicMock()
+        coordinator.hass = hass
+        coordinator.network_client = MagicMock()
+        coordinator.network_client.base_url = "https://192.168.1.1"
+        coordinator.protect_client = None
+        coordinator.data = {
+            "sites": {"site1": {"id": "site1"}},
+            "devices": {
+                "site1": {
+                    "sw": {
+                        "id": "sw",
+                        "name": "Switch",
+                        "model": "USW-24-POE",
+                        "state": "ONLINE",
+                        "macAddress": "AA:BB:CC:DD:EE:FF",
+                    },
+                    "gw": {
+                        "id": "gw",
+                        "name": "Gateway",
+                        "model": "UCG-Ultra",
+                        "state": "ONLINE",
+                        "macAddress": "11:22:33:44:55:66",
+                    },
+                },
+            },
+            "site_health": {
+                "site1": {
+                    "vpn": {
+                        "subsystem": "vpn",
+                        "site_to_site_enabled": True,
+                        "site_to_site_num_active": 1,
+                        "site_to_site_num_inactive": 0,
+                    }
+                }
+            },
+            "stats": {},
+            "clients": {},
+        }
+        return coordinator
+
+    @pytest.fixture
+    def mock_config_entry(self, mock_coordinator):
+        """Create mock config entry."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = mock_coordinator
+        return entry
+
+    async def _setup(self, hass, mock_config_entry) -> list:
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        return [
+            e for e in added_entities if isinstance(e, UnifiSiteToSiteVpnBinarySensor)
+        ]
+
+    async def test_created_once_on_the_gateway(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """One sensor per site, attached to the gateway, not re-added."""
+        sensors = await self._setup(hass, mock_config_entry)
+        mock_coordinator.async_add_listener.call_args[0][0]()
+
+        assert len(sensors) == 1
+        assert sensors[0]._device_id == "gw"
+        assert sensors[0].unique_id == "site1_gw_site_to_site_vpn"
+        assert sensors[0].translation_key == "site_to_site_vpn"
+        assert sensors[0].device_class == BinarySensorDeviceClass.CONNECTIVITY
+
+    @pytest.mark.parametrize(
+        ("active", "inactive", "expected"),
+        [(1, 0, True), (2, 1, False), (0, 1, False), (0, 0, False)],
+    )
+    async def test_state_from_tunnel_counts(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator,
+        mock_config_entry,
+        active,
+        inactive,
+        expected,
+    ):
+        """On only while at least one tunnel is up and none are down."""
+        vpn = mock_coordinator.data["site_health"]["site1"]["vpn"]
+        vpn["site_to_site_num_active"] = active
+        vpn["site_to_site_num_inactive"] = inactive
+
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        assert sensor.is_on is expected
+        assert sensor.extra_state_attributes == {
+            "active_tunnels": active,
+            "inactive_tunnels": inactive,
+        }
+
+    async def test_not_created_when_site_to_site_disabled(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Sites without site-to-site VPN get no sensor."""
+        vpn = mock_coordinator.data["site_health"]["site1"]["vpn"]
+        vpn["site_to_site_enabled"] = False
+
+        assert await self._setup(hass, mock_config_entry) == []
+
+    async def test_not_created_without_gateway(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Without a gateway to attach to, no sensor is created."""
+        del mock_coordinator.data["devices"]["site1"]["gw"]
+
+        assert await self._setup(hass, mock_config_entry) == []
+
+    async def test_unknown_when_health_disappears(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Missing health data reads unknown rather than disconnected."""
+        (sensor,) = await self._setup(hass, mock_config_entry)
+        mock_coordinator.data["site_health"] = {}
 
         assert sensor.is_on is None
         assert sensor.extra_state_attributes is None

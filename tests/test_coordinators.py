@@ -2153,6 +2153,62 @@ class TestUnifiDeviceCoordinator:
         assert "Error updating data" in str(exc_info.value)
         assert coordinator._available is False
 
+    @pytest.mark.asyncio
+    async def test_async_update_data_stores_vpn_site_health(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Only the vpn health subsystem is kept, keyed by site."""
+        coordinator.network_client.sites.get_legacy_health = AsyncMock(
+            return_value=[
+                {
+                    "subsystem": "vpn",
+                    "site_to_site_enabled": True,
+                    "site_to_site_num_active": 1,
+                    "site_to_site_num_inactive": 0,
+                },
+                {"subsystem": "wan", "status": "ok", "isp_name": "Example ISP"},
+                {"no_subsystem": True},
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["site_health"]["default"] == {
+            "vpn": {
+                "subsystem": "vpn",
+                "site_to_site_enabled": True,
+                "site_to_site_num_active": 1,
+                "site_to_site_num_inactive": 0,
+            }
+        }
+        coordinator.network_client.sites.get_legacy_health.assert_awaited_once_with(
+            "default"
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_site_health_failure_is_optional(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A failing health call never fails the device refresh."""
+        coordinator.network_client.sites.get_legacy_health = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["site_health"]["default"] == {}
+        assert result["devices"]["default"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_site_health_without_legacy_site(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Without a legacy site name there is nothing to ask for."""
+        coordinator.network_client.sites.get_legacy_health = AsyncMock()
+
+        assert await coordinator._fetch_site_health("default", None) == {}
+        coordinator.network_client.sites.get_legacy_health.assert_not_awaited()
+
     def test_merge_legacy_wan_data(self, coordinator: UnifiDeviceCoordinator):
         """Enabled legacy WAN blocks are merged; disabled ones are skipped."""
         device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
@@ -4785,6 +4841,7 @@ class TestUnifiFacadeCoordinator:
         assert "default" in facade_coordinator.data["devices"]
         assert "clients" in facade_coordinator.data
         assert "stats" in facade_coordinator.data
+        assert "site_health" in facade_coordinator.data
 
         # Check protect coordinator data
         assert "protect" in facade_coordinator.data

@@ -222,6 +222,35 @@ async def test_get_legacy_all_sites_returns_raw_site_dicts() -> None:
     client._get.assert_awaited_once_with("/proxy/network/api/self/sites")
 
 
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            {"data": [{"subsystem": "vpn"}, "junk", {"subsystem": "wan"}]},
+            [{"subsystem": "vpn"}, {"subsystem": "wan"}],
+        ),
+        ([{"subsystem": "vpn"}], [{"subsystem": "vpn"}]),
+        ({"data": {"subsystem": "vpn"}}, []),
+        (None, []),
+    ],
+)
+async def test_get_legacy_health_returns_subsystem_dicts(
+    response: Any, expected: list[dict[str, Any]]
+) -> None:
+    """Test legacy stat/health parsing keeps only subsystem dictionaries."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    client._get = AsyncMock(return_value=response)
+
+    result = await client.sites.get_legacy_health("default")
+
+    assert result == expected
+    client._get.assert_awaited_once_with("/proxy/network/api/s/default/stat/health")
+
+
 async def test_sites_get_all_handles_missing_id_payload() -> None:
     """Sites get_all should handle Dream 7 payloads missing id (Issue 80)."""
     client = _network_client()

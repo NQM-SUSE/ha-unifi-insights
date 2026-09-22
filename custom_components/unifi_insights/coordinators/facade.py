@@ -157,6 +157,7 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "clients": self._device_coordinator.data.get("clients", {}),
             "stats": self._device_coordinator.data.get("stats", {}),
             "vouchers": self._device_coordinator.data.get("vouchers", {}),
+            "site_health": self._device_coordinator.data.get("site_health", {}),
             # From protect coordinator
             "protect": (
                 self._protect_coordinator.data

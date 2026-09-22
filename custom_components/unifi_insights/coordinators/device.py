@@ -45,6 +45,10 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Legacy stat/health subsystems kept in coordinator data ("vpn" feeds the
+# site-to-site VPN binary sensor).
+_SITE_HEALTH_SUBSYSTEMS = frozenset({"vpn"})
+
 # Stats keys the v1 statistics endpoint may already have populated. A legacy
 # reading only fills a gap, it never overwrites a value v1 supplied.
 _CPU_STAT_KEYS = ("cpuUtilizationPct", "cpu_utilization_pct", "cpu_percent", "cpu")
@@ -164,6 +168,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             "clients": {},
             "stats": {},
             "vouchers": {},
+            "site_health": {},
             "last_update": None,
         }
 
@@ -485,6 +490,36 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         ]
         if wans:
             device_dict["wans"] = wans
+
+    async def _fetch_site_health(
+        self, site_id: str, legacy_site_name: str | None
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Return the site's health subsystems we use, keyed by subsystem name.
+
+        Health only feeds optional entities, so a failure here must never fail
+        the device refresh - auth problems surface through _process_site. Only
+        the subsystems in _SITE_HEALTH_SUBSYSTEMS are kept: the others carry
+        ISP names, nameservers and gateway MACs that nothing reads.
+        """
+        if legacy_site_name is None:
+            return {}
+        try:
+            subsystems = await self.network_client.sites.get_legacy_health(
+                legacy_site_name
+            )
+        except Exception as err:
+            _LOGGER.debug(
+                "Device coordinator: Site health unavailable for site %s: %s",
+                site_id,
+                err,
+            )
+            return {}
+        return {
+            name: subsystem
+            for subsystem in subsystems
+            if (name := subsystem.get("subsystem")) in _SITE_HEALTH_SUBSYSTEMS
+        }
 
     def _map_legacy_site_names(
         self,
@@ -883,7 +918,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             # Drop data for sites no longer polled so their entities stop
             # reporting last-known values. Site-level fetch failures below
             # still keep a polled site's previous data.
-            for key in ("devices", "stats", "clients"):
+            for key in ("devices", "stats", "clients", "site_health"):
                 self.data[key] = {
                     site_id: value
                     for site_id, value in self.data[key].items()
@@ -923,7 +958,14 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 self._process_site(site_id, legacy_site_names.get(site_id))
                 for site_id in site_ids
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            health_tasks = [
+                self._fetch_site_health(site_id, legacy_site_names.get(site_id))
+                for site_id in site_ids
+            ]
+            results, health_results = await asyncio.gather(
+                asyncio.gather(*tasks, return_exceptions=True),
+                asyncio.gather(*health_tasks),
+            )
 
             # A site that could not be refreshed fails the whole update, and
             # nothing is written until every site has succeeded. Reporting
@@ -970,12 +1012,13 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             ]
 
             # Update data structure with results
-            for site_id, (devices_dict, stats_dict, clients_dict) in zip(
-                site_ids, site_results, strict=True
+            for site_id, (devices_dict, stats_dict, clients_dict), health in zip(
+                site_ids, site_results, health_results, strict=True
             ):
                 self.data["devices"][site_id] = devices_dict
                 self.data["stats"][site_id] = stats_dict
                 self.data["clients"][site_id] = clients_dict
+                self.data["site_health"][site_id] = health
 
                 _LOGGER.debug(
                     "Device coordinator: Processed site %s - %d devices, %d clients",

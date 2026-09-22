@@ -440,6 +440,29 @@ async def async_setup_entry(
                                 )
                             )
 
+                    # Site-to-site VPN status, one per site on its gateway
+                    site_health = coordinator.data.get("site_health", {})
+                    site_vpn = (
+                        site_health.get(site_id, {}).get("vpn")
+                        if isinstance(site_health, dict)
+                        else None
+                    )
+                    vpn_key = (site_id, "site_to_site_vpn")
+                    if (
+                        isinstance(site_vpn, dict)
+                        and site_vpn.get("site_to_site_enabled")
+                        and vpn_key not in known_sensor_keys
+                        and is_gateway_device(device_data)
+                    ):
+                        known_sensor_keys.add(vpn_key)
+                        entities.append(
+                            UnifiSiteToSiteVpnBinarySensor(
+                                coordinator=coordinator,
+                                site_id=site_id,
+                                device_id=device_id,
+                            )
+                        )
+
         # Add binary sensors for Protect devices
         if coordinator.protect_client:
             protect = coordinator.data.get("protect", {})
@@ -779,4 +802,57 @@ class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
         return {
             key: wan.get(key)
             for key in ("type", "ip", "gateway", "ifname", "carrier_up")
+        }
+
+
+class UnifiSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
+    """
+    Site-to-site VPN status of a site, shown on its gateway.
+
+    UniFi only reports site-wide active/inactive tunnel counts (legacy
+    stat/health "vpn" subsystem), not per-tunnel state, so this is on while at
+    least one tunnel is up and none are down.
+    """
+
+    def __init__(
+        self,
+        coordinator: UnifiFacadeCoordinator,
+        site_id: str,
+        device_id: str,
+    ) -> None:
+        """Initialize the site-to-site VPN binary sensor."""
+        desc = UnifiInsightsBinarySensorEntityDescription(
+            key="site_to_site_vpn",
+            translation_key="site_to_site_vpn",
+            device_class=BinarySensorDeviceClass.CONNECTIVITY,
+            icon="mdi:vpn",
+            entity_type="device",
+        )
+        super().__init__(coordinator, desc, site_id, device_id)
+
+    def _vpn_health(self) -> dict[str, Any] | None:
+        """Return the site's vpn health subsystem from coordinator data."""
+        site_health = self.coordinator.data.get("site_health", {})
+        vpn = site_health.get(self._site_id, {}).get("vpn")
+        return vpn if isinstance(vpn, dict) else None
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when every site-to-site tunnel is up."""
+        vpn = self._vpn_health()
+        if vpn is None:
+            return None
+        active = vpn.get("site_to_site_num_active") or 0
+        inactive = vpn.get("site_to_site_num_inactive") or 0
+        return active > 0 and inactive == 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the site's tunnel counts."""
+        vpn = self._vpn_health()
+        if vpn is None:
+            return None
+        return {
+            "active_tunnels": vpn.get("site_to_site_num_active"),
+            "inactive_tunnels": vpn.get("site_to_site_num_inactive"),
         }
