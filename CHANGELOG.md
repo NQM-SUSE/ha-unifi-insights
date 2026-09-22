@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the redundant vendored API version module and consolidated its version
+  constant into the API constants module without changing runtime behavior.
+
 ## [2026.9.6] - 2026-09-22
 
 ### Changed

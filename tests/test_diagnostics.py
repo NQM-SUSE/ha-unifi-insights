@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.unifi_insights.api import __version__
 from custom_components.unifi_insights.api.network.models.client import Client
 from custom_components.unifi_insights.coordinators.config import (
     UnifiConfigCoordinator,
@@ -29,7 +30,7 @@ async def test_diagnostics(
     """Test diagnostics."""
     diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
 
-    assert "library_version" in diagnostics
+    assert diagnostics["library_version"] == __version__
     assert "connection" in diagnostics
     assert "entry" in diagnostics
     assert "data" in diagnostics

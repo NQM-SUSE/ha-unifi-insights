@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Final
 
-from ._version import __version__
+__version__: Final[str] = "1.2.0+vendored"
 
 
 class ConnectionType(str, Enum):

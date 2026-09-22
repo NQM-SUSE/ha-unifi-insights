@@ -39,9 +39,8 @@ Example (Remote/Cloud Connection):
 
 from __future__ import annotations
 
-from ._version import __version__
 from .auth import ApiKeyAuth, ApiKeyType, LocalAuth
-from .const import ConnectionType
+from .const import ConnectionType, __version__
 from .exceptions import (
     UniFiAuthenticationError,
     UniFiConnectionError,
