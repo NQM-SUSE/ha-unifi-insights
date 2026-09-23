@@ -37,13 +37,18 @@ from .const import (
     CAMERA_TYPE_DOORBELL_WITH_PACKAGE_DETECTION,
     DEVICE_TYPE_CAMERA,
     DEVICE_TYPE_SENSOR,
-    GATEWAY_MODEL_PREFIXES,
     SMART_DETECT_ANIMAL,
     SMART_DETECT_PACKAGE,
     SMART_DETECT_PERSON,
     SMART_DETECT_VEHICLE,
 )
-from .entity import UnifiInsightsEntity, UnifiProtectEntity, get_field, is_device_online
+from .entity import (
+    UnifiInsightsEntity,
+    UnifiProtectEntity,
+    get_field,
+    is_device_online,
+    is_gateway_device,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -362,13 +367,9 @@ async def async_setup_entry(
                     for description in BINARY_SENSOR_TYPES:
                         if description.entity_type == "device":
                             # Skip WAN status sensor for non-gateway devices
-                            model = device_data.get("model")
-                            model_str = model.upper() if isinstance(model, str) else ""
-                            is_gateway = (
-                                model_str.startswith(GATEWAY_MODEL_PREFIXES)
-                                or "GATEWAY" in model_str
-                            )
-                            if description.key == "wan_status" and not is_gateway:
+                            if description.key == "wan_status" and not (
+                                is_gateway_device(device_data)
+                            ):
                                 _LOGGER.debug(
                                     "Skipping WAN status sensor for non-gateway device "
                                     "%s (%s)",
@@ -416,6 +417,55 @@ async def async_setup_entry(
                                     device_id=device_id,
                                     port_idx=port_idx,
                                     port_label=port_name,
+                                )
+                            )
+
+                    # Per-WAN link connectivity (merged legacy WAN data)
+                    wans = device_data.get("wans", [])
+                    if isinstance(wans, list):
+                        for wan in wans:
+                            if not isinstance(wan, dict) or not wan.get("key"):
+                                continue
+                            wan_key = (site_id, device_id, wan["key"], "wan_link")
+                            if wan_key in known_sensor_keys:
+                                continue
+                            known_sensor_keys.add(wan_key)
+                            entities.append(
+                                UnifiInsightsWanLinkBinarySensor(
+                                    coordinator=coordinator,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                    wan_key=wan["key"],
+                                    wan_name=wan.get("name") or wan["key"].upper(),
+                                )
+                            )
+
+                    # Site-to-site VPN tunnels, one sensor each, on the gateway.
+                    # Devices reporting WAN links route traffic even when their
+                    # model/features are not recognised.
+                    site_vpns = coordinator.data.get("site_vpns", {})
+                    tunnels = (
+                        site_vpns.get(site_id) if isinstance(site_vpns, dict) else None
+                    )
+                    if isinstance(tunnels, dict) and (
+                        is_gateway_device(device_data) or wans
+                    ):
+                        for tunnel_id, tunnel in tunnels.items():
+                            if not isinstance(tunnel, dict) or not tunnel.get(
+                                "enabled", True
+                            ):
+                                continue
+                            vpn_key = (site_id, "site_to_site_vpn", tunnel_id)
+                            if vpn_key in known_sensor_keys:
+                                continue
+                            known_sensor_keys.add(vpn_key)
+                            entities.append(
+                                UnifiInsightsSiteToSiteVpnBinarySensor(
+                                    coordinator=coordinator,
+                                    site_id=site_id,
+                                    device_id=device_id,
+                                    tunnel_id=tunnel_id,
+                                    tunnel_name=tunnel.get("name") or tunnel_id,
                                 )
                             )
 
@@ -707,3 +757,128 @@ class UnifiPortBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
             if val:
                 attrs[label] = val
         return attrs or None
+
+
+class UnifiInsightsWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
+    """Connectivity of one gateway WAN connection (DHCP, static or PPPoE)."""
+
+    def __init__(
+        self,
+        coordinator: UnifiFacadeCoordinator,
+        site_id: str,
+        device_id: str,
+        wan_key: str,
+        wan_name: str,
+    ) -> None:
+        """Initialize the WAN link binary sensor."""
+        desc = UnifiInsightsBinarySensorEntityDescription(
+            key=f"wan_link_{wan_key}",
+            translation_key="wan_link",
+            device_class=BinarySensorDeviceClass.CONNECTIVITY,
+            entity_type="device",
+        )
+        super().__init__(coordinator, desc, site_id, device_id)
+        self._wan_key = wan_key
+        self._attr_translation_placeholders = {"wan_name": wan_name}
+
+    def _find_wan(self) -> dict[str, Any] | None:
+        """Return this sensor's WAN link from coordinator data."""
+        device_data = (
+            self.coordinator.data.get("devices", {})
+            .get(self._site_id, {})
+            .get(self._device_id, {})
+        )
+        wans = device_data.get("wans")
+        if not isinstance(wans, list):
+            return None
+        for wan in wans:
+            if isinstance(wan, dict) and wan.get("key") == self._wan_key:
+                return wan
+        return None
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True when the WAN link is connected."""
+        wan = self._find_wan()
+        return None if wan is None else bool(wan.get("connected"))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return WAN link details."""
+        wan = self._find_wan()
+        if wan is None:
+            return None
+        return {key: wan.get(key) for key in ("status", "alive", "ip")}
+
+
+class UnifiInsightsSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
+    """
+    Connection state of one site-to-site VPN tunnel, shown on the gateway.
+
+    State comes from the v2 ``vpn/connections`` list, which carries one entry
+    per live VPN keyed by the tunnel's networkconf id. A tunnel that is not in
+    the list, or is listed with a status other than CONNECTED, is off.
+    """
+
+    def __init__(
+        self,
+        coordinator: UnifiFacadeCoordinator,
+        site_id: str,
+        device_id: str,
+        tunnel_id: str,
+        tunnel_name: str,
+    ) -> None:
+        """Initialize the site-to-site VPN tunnel binary sensor."""
+        desc = UnifiInsightsBinarySensorEntityDescription(
+            key=f"site_to_site_vpn_{tunnel_id}",
+            translation_key="site_to_site_vpn",
+            device_class=BinarySensorDeviceClass.CONNECTIVITY,
+            icon="mdi:vpn",
+            entity_type="device",
+        )
+        super().__init__(coordinator, desc, site_id, device_id)
+        self._tunnel_id = tunnel_id
+        self._attr_translation_placeholders = {"tunnel_name": tunnel_name}
+
+    def _tunnel(self) -> dict[str, Any] | None:
+        """Return this tunnel's configuration, if it still exists."""
+        site_vpns = self.coordinator.data.get("site_vpns")
+        site = site_vpns.get(self._site_id) if isinstance(site_vpns, dict) else None
+        tunnel = site.get(self._tunnel_id) if isinstance(site, dict) else None
+        return tunnel if isinstance(tunnel, dict) else None
+
+    def _connections(self) -> dict[str, Any] | None:
+        """Return the site's live VPN connections, or None when unknown."""
+        connections = self.coordinator.data.get("vpn_connections")
+        site = connections.get(self._site_id) if isinstance(connections, dict) else None
+        return site if isinstance(site, dict) else None
+
+    @property
+    def available(self) -> bool:
+        """Return False once the tunnel is removed from the console."""
+        return bool(super().available and self._tunnel() is not None)
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True while the tunnel is connected."""
+        connections = self._connections()
+        if connections is None:
+            return None
+        connection = connections.get(self._tunnel_id)
+        return (
+            isinstance(connection, dict)
+            and str(connection.get("status") or "").upper() == "CONNECTED"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the tunnel's type and raw connection status."""
+        tunnel = self._tunnel() or {}
+        connections = self._connections()
+        connection = connections.get(self._tunnel_id) if connections else None
+        return {
+            "vpn_type": tunnel.get("vpn_type"),
+            "status": connection.get("status")
+            if isinstance(connection, dict)
+            else None,
+        }

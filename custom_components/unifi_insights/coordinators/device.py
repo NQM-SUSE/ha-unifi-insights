@@ -24,6 +24,7 @@ from custom_components.unifi_insights.api.network.models import (
     parse_outlet_metrics,
 )
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
+from custom_components.unifi_insights.data_transforms import normalize_legacy_wans
 from custom_components.unifi_insights.helpers import async_get_device_entry
 
 from .base import UnifiBaseCoordinator
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from .config import UnifiConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
 
 # Stats keys the v1 statistics endpoint may already have populated. A legacy
 # reading only fills a gap, it never overwrites a value v1 supplied.
@@ -109,7 +111,8 @@ def _merge_legacy_system_stats(
 
 
 # How many consecutive polls a device's last good statistics are reused for
-# when its statistics call keeps failing, before its stats are dropped.
+# when its statistics call keeps failing, before its stats are dropped. Site
+# VPN connection state is bounded the same way.
 MAX_STATS_REUSE_POLLS = 3
 
 
@@ -155,11 +158,16 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         # the devices whose stats were reused (not refetched) this refresh.
         self._stats_failures: dict[str, int] = {}
         self._reused_stats: set[str] = set()
+        # Consecutive polls each site's VPN connections call has failed for.
+        self._vpn_connection_failures: dict[str, int] = {}
+        # Consecutive polls each site's legacy device call has failed for.
+        self._legacy_wan_failures: dict[str, int] = {}
         self.data: dict[str, Any] = {
             "devices": {},
             "clients": {},
             "stats": {},
             "vouchers": {},
+            "vpn_connections": {},
             "last_update": None,
         }
 
@@ -458,6 +466,93 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             device_dict["outlet_ac_power_budget"] = outlet_metrics.ac_power_budget
             device_dict["ac_power_budget"] = outlet_metrics.ac_power_budget
 
+    @classmethod
+    def _merge_legacy_wan_data(
+        cls,
+        device_dict: dict[str, Any],
+        legacy_devices_by_mac: dict[str, dict[str, Any]],
+    ) -> None:
+        """Merge per-WAN connection state from legacy gateway data."""
+        mac_address = cls._normalize_mac(
+            device_dict.get("macAddress") or device_dict.get("mac")
+        )
+        if mac_address is None:
+            return
+        legacy_device = legacy_devices_by_mac.get(mac_address)
+        if legacy_device is None:
+            return
+        wans = normalize_legacy_wans(legacy_device)
+        if wans:
+            device_dict["wans"] = wans
+
+    def _vpn_connections_or_previous(
+        self, site_id: str, connections: dict[str, dict[str, Any]] | None
+    ) -> dict[str, dict[str, Any]] | None:
+        """
+        Return fresh VPN connections, or reuse the last good set for a few polls.
+
+        A single failed call would otherwise flip every site-to-site VPN sensor
+        on -> unknown -> on and fire automations. The reuse is bounded so a call
+        that keeps failing cannot hold a stale "connected" forever; after that
+        the site's entry is dropped and the sensors read unknown.
+        """
+        if connections is not None:
+            self._vpn_connection_failures.pop(site_id, None)
+            return connections
+        failures = self._vpn_connection_failures.get(site_id, 0) + 1
+        self._vpn_connection_failures[site_id] = failures
+        previous = self.data["vpn_connections"].get(site_id)
+        if failures <= MAX_STATS_REUSE_POLLS and isinstance(previous, dict):
+            return previous
+        return None
+
+    def _reuse_previous_wans(self, site_id: str, devices: list[dict[str, Any]]) -> None:
+        """
+        Carry each device's last WAN links over a failed legacy fetch.
+
+        WAN links only come from the legacy device call, so one failed call
+        would otherwise flip every WAN Connection sensor on -> unknown -> on.
+        Like VPN connections, the reuse is bounded so a call that keeps
+        failing cannot hold a stale state forever.
+        """
+        failures = self._legacy_wan_failures.get(site_id, 0) + 1
+        self._legacy_wan_failures[site_id] = failures
+        if failures > MAX_STATS_REUSE_POLLS:
+            return
+        previous_devices = self.data["devices"].get(site_id, {})
+        for device in devices:
+            previous = previous_devices.get(device.get("id", ""))
+            wans = previous.get("wans") if isinstance(previous, dict) else None
+            if isinstance(wans, list):
+                device["wans"] = wans
+
+    async def _fetch_vpn_connections(
+        self, site_id: str, legacy_site_name: str | None
+    ) -> dict[str, dict[str, Any]] | None:
+        """
+        Return the site's live VPN connections keyed by network_id.
+
+        Returns None when the state cannot be read (call failed, or no classic
+        site name to ask with), so the caller can tell that apart from a site
+        with no connected VPNs ({}). This only feeds optional entities, so a
+        failure must never fail the device refresh - auth problems surface
+        through _process_site.
+        """
+        if legacy_site_name is None:
+            return None
+        try:
+            connections = await self.network_client.vpn_clients.list_vpn_connections(
+                legacy_site_name
+            )
+        except Exception as err:
+            _LOGGER.debug(
+                "Device coordinator: VPN connections unavailable for site %s: %s",
+                site_id,
+                err,
+            )
+            return None
+        return {connection["network_id"]: connection for connection in connections}
+
     def _map_legacy_site_names(
         self,
         site_ids: list[str],
@@ -737,6 +832,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
         legacy_devices: list[dict[str, Any]] = []
         legacy_as_primary = False
+        legacy_failed = False
         if legacy_site_name is not None:
             try:
                 legacy_devices = (
@@ -757,6 +853,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                     # refresh fails and the previous device state is kept,
                     # rather than wiping the device registry with empty data.
                     raise v1_devices_error from err
+                legacy_failed = True
 
         # When v1 devices failed with 5xx, use legacy devices as the primary
         # device list, mapped to v1-shaped dicts.
@@ -796,11 +893,20 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             is not None
         }
 
-        if legacy_devices_by_mac and not legacy_as_primary:
+        if legacy_devices_by_mac:
             for device in devices:
-                self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
-                self._merge_legacy_port_data(device, legacy_devices_by_mac)
-                self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+                if not legacy_as_primary:
+                    self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
+                    self._merge_legacy_port_data(device, legacy_devices_by_mac)
+                    self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+                # The legacy-to-v1 mapping does not carry WAN links, so they
+                # are merged whichever source is primary.
+                self._merge_legacy_wan_data(device, legacy_devices_by_mac)
+
+        if legacy_failed:
+            self._reuse_previous_wans(site_id, devices)
+        else:
+            self._legacy_wan_failures.pop(site_id, None)
 
         _LOGGER.debug(
             "Device coordinator: Site %s - Found %d devices and %d clients",
@@ -854,12 +960,22 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             # Drop data for sites no longer polled so their entities stop
             # reporting last-known values. Site-level fetch failures below
             # still keep a polled site's previous data.
-            for key in ("devices", "stats", "clients"):
+            for key in ("devices", "stats", "clients", "vpn_connections"):
                 self.data[key] = {
                     site_id: value
                     for site_id, value in self.data[key].items()
                     if site_id in site_ids
                 }
+            self._vpn_connection_failures = {
+                site_id: count
+                for site_id, count in self._vpn_connection_failures.items()
+                if site_id in site_ids
+            }
+            self._legacy_wan_failures = {
+                site_id: count
+                for site_id, count in self._legacy_wan_failures.items()
+                if site_id in site_ids
+            }
 
             if not site_ids:
                 # Deliberately no stale-device cleanup here: an empty site
@@ -894,7 +1010,14 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 self._process_site(site_id, legacy_site_names.get(site_id))
                 for site_id in site_ids
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            vpn_tasks = [
+                self._fetch_vpn_connections(site_id, legacy_site_names.get(site_id))
+                for site_id in site_ids
+            ]
+            results, vpn_results = await asyncio.gather(
+                asyncio.gather(*tasks, return_exceptions=True),
+                asyncio.gather(*vpn_tasks),
+            )
 
             # A site that could not be refreshed fails the whole update, and
             # nothing is written until every site has succeeded. Reporting
@@ -941,12 +1064,17 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             ]
 
             # Update data structure with results
-            for site_id, (devices_dict, stats_dict, clients_dict) in zip(
-                site_ids, site_results, strict=True
+            for site_id, (devices_dict, stats_dict, clients_dict), vpn in zip(
+                site_ids, site_results, vpn_results, strict=True
             ):
                 self.data["devices"][site_id] = devices_dict
                 self.data["stats"][site_id] = stats_dict
                 self.data["clients"][site_id] = clients_dict
+                connections = self._vpn_connections_or_previous(site_id, vpn)
+                if connections is None:
+                    self.data["vpn_connections"].pop(site_id, None)
+                else:
+                    self.data["vpn_connections"][site_id] = connections
 
                 _LOGGER.debug(
                     "Device coordinator: Processed site %s - %d devices, %d clients",

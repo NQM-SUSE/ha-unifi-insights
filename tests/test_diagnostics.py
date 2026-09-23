@@ -264,6 +264,42 @@ async def test_diagnostics_keeps_hardware_names_readable(
     assert device["macAddress"].startswith("**REDACTED-MAC-")
 
 
+async def test_diagnostics_redacts_wan_link_addresses(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test merged WAN link addresses are redacted but link state is kept."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["devices"] = {
+        "site-1": {
+            "device-1": {
+                "id": "device-1",
+                "model": "UCG-Ultra",
+                "features": {"gateway": True},
+                "wans": [
+                    {
+                        "key": "wan",
+                        "name": "WAN",
+                        "status": "online",
+                        "ip": "198.51.100.7",
+                        "connected": True,
+                    }
+                ],
+            }
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    device = diagnostics["data"]["devices"]["site-1"]["device-1"]
+    wan = device["wans"][0]
+    assert wan["ip"] == REDACTED
+    assert device["features"] == {"gateway": True}
+    assert wan["status"] == "online"
+    assert wan["connected"] is True
+
+
 async def test_diagnostics_mac_placeholders_are_stable_and_distinct(
     hass: HomeAssistant,
     init_integration: MockConfigEntry,

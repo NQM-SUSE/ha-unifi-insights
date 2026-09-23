@@ -2,6 +2,7 @@
 
 from custom_components.unifi_insights.data_transforms import (
     map_device_status,
+    normalize_legacy_wans,
     transform_network_device,
     transform_protect_camera,
     transform_protect_chime,
@@ -127,3 +128,85 @@ def test_transform_protect_camera_missing_fields():
     assert result["state"] == "UNKNOWN"  # Default when status missing
     assert result["hdr_mode"] == "AUTO"  # Default when hdr missing
     assert result["video_mode"] == "DEFAULT"  # Default when video_mode missing
+
+
+def test_normalize_legacy_wans_uses_controller_status():
+    """Each WAN named in last_wan_status becomes one connection entry."""
+    wans = normalize_legacy_wans(
+        {
+            # The physical port block is ignored: it cannot see a PPP session.
+            "wan1": {"type": "ethernet", "name": "eth8", "up": True},
+            "last_wan_status": {"WAN": "online", "WAN2": "offline"},
+            "last_wan_interfaces": {
+                "WAN": {"ip": "198.51.100.7", "alive": True},
+                "WAN2": {"ip": "", "alive": False},
+            },
+        }
+    )
+    assert wans == [
+        {
+            "key": "wan",
+            "name": "WAN",
+            "status": "online",
+            "alive": True,
+            "ip": "198.51.100.7",
+            "connected": True,
+        },
+        {
+            "key": "wan2",
+            "name": "WAN2",
+            "status": "offline",
+            "alive": False,
+            "ip": None,
+            "connected": False,
+        },
+    ]
+
+
+def test_normalize_legacy_wans_status_wins_over_alive():
+    """The controller's status decides even when the probe disagrees."""
+    (wan,) = normalize_legacy_wans(
+        {
+            "last_wan_status": {"WAN": "Offline"},
+            "last_wan_interfaces": {"WAN": {"ip": "198.51.100.7", "alive": True}},
+        }
+    )
+    assert wan["connected"] is False
+
+
+def test_normalize_legacy_wans_falls_back_to_alive():
+    """Without a status string, the reachability probe decides."""
+    wans = normalize_legacy_wans(
+        {
+            "last_wan_interfaces": {
+                "WAN": {"ip": "198.51.100.7", "alive": True},
+                "WAN2": {"alive": "yes"},
+            }
+        }
+    )
+    assert [(w["key"], w["connected"], w["alive"]) for w in wans] == [
+        ("wan", True, True),
+        ("wan2", False, None),
+    ]
+
+
+def test_normalize_legacy_wans_unspecified_address_is_none():
+    """Placeholder addresses a down link reports are not exposed as its IP."""
+    # 0.0.0.0 is a payload value compared against here, not an address bound.
+    for missing_ip in ("", "0.0.0.0", "::", None):  # noqa: S104
+        (wan,) = normalize_legacy_wans(
+            {"last_wan_interfaces": {"WAN": {"ip": missing_ip, "alive": False}}}
+        )
+        assert wan["ip"] is None
+
+
+def test_normalize_legacy_wans_without_wan_data():
+    """Non-gateways and malformed payloads yield no WAN entries."""
+    assert normalize_legacy_wans({"port_table": []}) == []
+    assert normalize_legacy_wans({"last_wan_status": ["WAN"]}) == []
+    assert (
+        normalize_legacy_wans(
+            {"last_wan_status": {"": "online", 3: "online"}, "last_wan_interfaces": 1}
+        )
+        == []
+    )

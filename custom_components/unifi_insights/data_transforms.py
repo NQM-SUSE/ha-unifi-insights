@@ -6,6 +6,11 @@ response formats to the internal data structures expected by entities,
 maintaining backward compatibility.
 """
 
+from __future__ import annotations
+
+import ipaddress
+from typing import Any
+
 
 def map_device_status(lib_status: str | None) -> str:
     """
@@ -150,3 +155,57 @@ def transform_protect_chime(lib_chime: dict) -> dict:
         "repeat_times": lib_chime.get("repeat"),
         "ringtone_id": lib_chime.get("ringtone"),
     }
+
+
+def _is_unspecified_address(value: str) -> bool:
+    """Return True for 0.0.0.0 / ::, the placeholder a down link reports."""
+    try:
+        return ipaddress.ip_address(value).is_unspecified
+    except ValueError:
+        return False
+
+
+def normalize_legacy_wans(legacy_device: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return per-WAN connection state from a legacy gateway record.
+
+    The gateway's ``wan1..wanN`` blocks describe the physical ports (type
+    "ethernet", name "eth8"), not the internet connection, so they cannot
+    tell a dropped PPPoE session from a connected one. The controller's own
+    per-WAN verdict lives in ``last_wan_status`` ({"WAN": "online"}) and
+    ``last_wan_interfaces`` ({"WAN": {"ip": ..., "alive": true}}), keyed by
+    the same WAN names the UniFi UI shows. A WAN that is configured but not
+    in use does not appear in either.
+    """
+    statuses = legacy_device.get("last_wan_status")
+    interfaces = legacy_device.get("last_wan_interfaces")
+    statuses = statuses if isinstance(statuses, dict) else {}
+    interfaces = interfaces if isinstance(interfaces, dict) else {}
+
+    wans: list[dict[str, Any]] = []
+    for name in dict.fromkeys((*statuses, *interfaces)):
+        if not isinstance(name, str) or not name:
+            continue
+        status = statuses.get(name)
+        status = status if isinstance(status, str) else None
+        interface = interfaces.get(name)
+        interface = interface if isinstance(interface, dict) else {}
+        alive = interface.get("alive")
+        alive = alive if isinstance(alive, bool) else None
+        ip = interface.get("ip")
+        has_ip = isinstance(ip, str) and bool(ip) and not _is_unspecified_address(ip)
+        wans.append(
+            {
+                "key": name.lower(),
+                "name": name,
+                "status": status,
+                "alive": alive,
+                "ip": ip if has_ip else None,
+                # The controller's status is authoritative; "alive" (its
+                # reachability probe) only decides when no status is given.
+                "connected": (
+                    status.lower() == "online" if status is not None else alive is True
+                ),
+            }
+        )
+    return wans

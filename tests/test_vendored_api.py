@@ -222,6 +222,100 @@ async def test_get_legacy_all_sites_returns_raw_site_dicts() -> None:
     client._get.assert_awaited_once_with("/proxy/network/api/self/sites")
 
 
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            {
+                "connections": [
+                    {
+                        "network_id": "tun1",
+                        "type": "ipsec-vpn",
+                        "status": "CONNECTED",
+                        "remote_ip": "198.51.100.9",
+                        "local_ip": "198.51.100.7",
+                        "rx_rate_bps": 0,
+                    },
+                    {"type": "openvpn-client", "status": "CONNECTED"},
+                    "junk",
+                ]
+            },
+            [{"network_id": "tun1", "type": "ipsec-vpn", "status": "CONNECTED"}],
+        ),
+        ({"connections": []}, []),
+    ],
+)
+async def test_list_vpn_connections_keeps_identity_and_status_only(
+    response: Any, expected: list[dict[str, Any]]
+) -> None:
+    """Test v2 vpn/connections parsing drops addresses and malformed entries."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    client._get = AsyncMock(return_value=response)
+
+    result = await client.vpn_clients.list_vpn_connections("default")
+
+    assert result == expected
+    client._get.assert_awaited_once_with(
+        "/proxy/network/v2/api/site/default/vpn/connections"
+    )
+
+
+@pytest.mark.parametrize("response", [{"connections": {}}, {"data": []}, [], None])
+async def test_list_vpn_connections_raises_on_unexpected_payload(
+    response: Any,
+) -> None:
+    """An unreadable payload raises rather than reading as "none connected"."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    client._get = AsyncMock(return_value=response)
+
+    with pytest.raises(UniFiResponseError):
+        await client.vpn_clients.list_vpn_connections("default")
+
+
+async def test_list_site_to_site_vpns_filters_site_vpn_entries() -> None:
+    """Test only site-vpn networkconf entries are returned, without secrets."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    client._get = AsyncMock(
+        return_value={
+            "meta": {"rc": "ok"},
+            "data": [
+                {
+                    "_id": "tun1",
+                    "purpose": "site-vpn",
+                    "name": "Office",
+                    "vpn_type": "ipsec-vpn",
+                    "x_ipsec_pre_shared_key": "secret",
+                },
+                {"_id": "tun2", "purpose": "site-vpn", "enabled": False},
+                {"_id": "cli1", "purpose": "vpn-client", "name": "Example VPN"},
+                {"purpose": "site-vpn", "name": "no id"},
+            ],
+        }
+    )
+
+    result = await client.vpn_clients.list_site_to_site_vpns("default")
+
+    assert result == [
+        {"id": "tun1", "name": "Office", "vpn_type": "ipsec-vpn", "enabled": True},
+        {"id": "tun2", "name": None, "vpn_type": None, "enabled": False},
+    ]
+    client._get.assert_awaited_once_with(
+        "/proxy/network/api/s/default/rest/networkconf"
+    )
+
+
 async def test_sites_get_all_handles_missing_id_payload() -> None:
     """Sites get_all should handle Dream 7 payloads missing id (Issue 80)."""
     client = _network_client()

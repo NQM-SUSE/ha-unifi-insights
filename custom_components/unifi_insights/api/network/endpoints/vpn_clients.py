@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from custom_components.unifi_insights.api.const import ENDPOINT_NETWORKCONF
+from custom_components.unifi_insights.api.const import (
+    ENDPOINT_NETWORKCONF,
+    ENDPOINT_VPN_CONNECTIONS,
+)
 from custom_components.unifi_insights.api.exceptions import UniFiResponseError
 from custom_components.unifi_insights.api.network.models.vpn_client import VpnClient
 
@@ -51,6 +54,82 @@ class VpnClientsEndpoint:
             return [item for item in response if isinstance(item, dict)]
 
         return []
+
+    async def list_site_to_site_vpns(
+        self, site_name: str = "default"
+    ) -> list[dict[str, Any]]:
+        """
+        List the site-to-site VPN tunnels configured for a site.
+
+        These are the ``rest/networkconf`` entries with purpose ``site-vpn``
+        (IPsec, OpenVPN and SD-WAN hub-and-spoke tunnels alike). Only the
+        fields entities need are returned, so no keys or peer secrets are
+        carried into coordinator data.
+
+        Args:
+            site_name: The UniFi classic site name (default: "default").
+
+        Returns:
+            Dicts with ``id``, ``name``, ``vpn_type`` and ``enabled``.
+
+        """
+        path = self._client.build_legacy_api_path(site_name, ENDPOINT_NETWORKCONF)
+        items = self._extract_items(await self._client._get(path))
+        return [
+            {
+                "id": tunnel_id,
+                "name": item.get("name"),
+                "vpn_type": item.get("vpn_type"),
+                "enabled": item.get("enabled") is not False,
+            }
+            for item in items
+            if item.get("purpose") == "site-vpn"
+            and isinstance(tunnel_id := item.get("_id") or item.get("id"), str)
+        ]
+
+    async def list_vpn_connections(
+        self, site_name: str = "default"
+    ) -> list[dict[str, Any]]:
+        """
+        List the live connection state of VPN clients and site-to-site tunnels.
+
+        Targets ``/proxy/network/v2/api/site/{site_name}/vpn/connections``,
+        which reports one entry per connected (or connecting) VPN, keyed by
+        the ``network_id`` of its ``rest/networkconf`` entry. Addresses and
+        traffic rates are dropped: only identity, type and status are kept.
+
+        Args:
+            site_name: The UniFi classic site name (default: "default").
+
+        Returns:
+            Dicts with ``network_id``, ``type`` and ``status``.
+
+        Raises:
+            UniFiResponseError: If the response has no ``connections`` list.
+
+        """
+        path = self._client.build_legacy_v2_api_path(
+            site_name, ENDPOINT_VPN_CONNECTIONS
+        )
+        response = await self._client._get(path)
+        connections = (
+            response.get("connections") if isinstance(response, dict) else None
+        )
+        if not isinstance(connections, list):
+            # An unreadable payload must not read as "no VPN connected",
+            # which would report every tunnel as disconnected.
+            msg = "Unexpected VPN connections response"
+            raise UniFiResponseError(msg, status_code=200)
+        return [
+            {
+                "network_id": connection["network_id"],
+                "type": connection.get("type"),
+                "status": connection.get("status"),
+            }
+            for connection in connections
+            if isinstance(connection, dict)
+            and isinstance(connection.get("network_id"), str)
+        ]
 
     async def list_vpn_clients(self, site_name: str = "default") -> list[VpnClient]:
         """

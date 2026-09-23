@@ -11,6 +11,8 @@ from custom_components.unifi_insights.binary_sensor import (
     UnifiInsightsBinarySensor,
     UnifiPortBinarySensor,
     UnifiProtectBinarySensor,
+    UnifiInsightsSiteToSiteVpnBinarySensor,
+    UnifiInsightsWanLinkBinarySensor,
     _get_supported_smart_detect_types,
     _is_doorbell_camera,
     _is_smart_detect_active,
@@ -612,6 +614,33 @@ class TestAsyncSetupEntry:
         ]
         assert len(device_sensors) > 0
 
+    async def test_setup_entry_wan_status_for_feature_only_gateway(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A gateway recognised only by its features still gets WAN status."""
+        mock_coordinator.data["devices"]["site1"]["device2"] = {
+            "id": "device2",
+            "name": "Gateway",
+            "model": "Unknown",
+            "features": ["gateway"],
+            "state": "ONLINE",
+            "macAddress": "11:22:33:44:55:66",
+        }
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        wan_status_devices = {
+            e._device_id
+            for e in added_entities
+            if isinstance(e, UnifiInsightsBinarySensor)
+            and e.entity_description.key == "wan_status"
+        }
+        assert wan_status_devices == {"device2"}
+
     async def test_setup_entry_creates_protect_sensors(
         self, hass: HomeAssistant, mock_coordinator, mock_config_entry
     ):
@@ -652,6 +681,341 @@ class TestAsyncSetupEntry:
             e for e in added_entities if isinstance(e, UnifiProtectBinarySensor)
         ]
         assert len(protect_sensors) == 0
+
+
+class TestWanLinkBinarySensor:
+    """Tests for the per-WAN link connectivity binary sensor."""
+
+    @pytest.fixture
+    def mock_coordinator(self, hass: HomeAssistant):
+        """Create a coordinator holding one gateway with two WAN links."""
+        coordinator = MagicMock()
+        coordinator.hass = hass
+        coordinator.network_client = MagicMock()
+        coordinator.network_client.base_url = "https://192.168.1.1"
+        coordinator.protect_client = None
+        coordinator.data = {
+            "sites": {"site1": {"id": "site1"}},
+            "devices": {
+                "site1": {
+                    "gw": {
+                        "id": "gw",
+                        "name": "Gateway",
+                        "model": "UCG-Ultra",
+                        "state": "ONLINE",
+                        "macAddress": "11:22:33:44:55:66",
+                        "wans": [
+                            {
+                                "key": "wan",
+                                "name": "WAN",
+                                "status": "online",
+                                "alive": True,
+                                "ip": "198.51.100.7",
+                                "connected": True,
+                            },
+                            {
+                                "key": "wan2",
+                                "name": "WAN2",
+                                "status": "offline",
+                                "alive": False,
+                                "ip": None,
+                                "connected": False,
+                            },
+                        ],
+                    },
+                },
+            },
+            "stats": {},
+            "clients": {},
+        }
+        return coordinator
+
+    @pytest.fixture
+    def mock_config_entry(self, mock_coordinator):
+        """Create mock config entry."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = mock_coordinator
+        return entry
+
+    async def test_setup_entry_creates_one_sensor_per_wan(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Each merged WAN link gets its own connectivity sensor."""
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        wan = {
+            e._wan_key: e
+            for e in added_entities
+            if isinstance(e, UnifiInsightsWanLinkBinarySensor)
+        }
+        assert set(wan) == {"wan", "wan2"}
+        assert wan["wan"].unique_id == "site1_gw_wan_link_wan"
+        assert wan["wan"].device_class == BinarySensorDeviceClass.CONNECTIVITY
+        assert wan["wan"].translation_key == "wan_link"
+        assert wan["wan"].translation_placeholders == {"wan_name": "WAN"}
+        assert wan["wan2"].translation_placeholders == {"wan_name": "WAN2"}
+        assert wan["wan"].is_on is True
+        assert wan["wan2"].is_on is False
+        assert wan["wan"].extra_state_attributes == {
+            "status": "online",
+            "alive": True,
+            "ip": "198.51.100.7",
+        }
+
+    async def test_setup_entry_does_not_duplicate_on_refresh(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Rediscovery on later coordinator updates adds no duplicates."""
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        listener = mock_coordinator.async_add_listener.call_args[0][0]
+        listener()
+
+        wan_sensors = [
+            e for e in added_entities if isinstance(e, UnifiInsightsWanLinkBinarySensor)
+        ]
+        assert len(wan_sensors) == 2
+
+    async def test_state_unknown_when_wan_disappears(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """A WAN missing from the latest data reports unknown, not off."""
+        sensor = UnifiInsightsWanLinkBinarySensor(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            device_id="gw",
+            wan_key="wan",
+            wan_name="WAN",
+        )
+        del mock_coordinator.data["devices"]["site1"]["gw"]["wans"]
+
+        assert sensor.is_on is None
+        assert sensor.extra_state_attributes is None
+
+        mock_coordinator.data["devices"]["site1"]["gw"]["wans"] = None
+        assert sensor.is_on is None
+
+        mock_coordinator.data["devices"]["site1"]["gw"]["wans"] = [{"key": "wan2"}]
+        assert sensor.is_on is None
+
+    async def test_setup_entry_skips_malformed_wans(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Malformed WAN entries or a non-list WAN field create no sensors."""
+        gw = mock_coordinator.data["devices"]["site1"]["gw"]
+        gw["wans"] = ["wan", {"name": "No key"}, {"key": "wan", "name": "WAN"}]
+        mock_coordinator.data["devices"]["site1"]["gw_other"] = {
+            **gw,
+            "id": "gw_other",
+            "wans": {"wan": {"status": "online"}},
+        }
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        wan_sensors = [
+            e for e in added_entities if isinstance(e, UnifiInsightsWanLinkBinarySensor)
+        ]
+        assert [(e._device_id, e._wan_key) for e in wan_sensors] == [("gw", "wan")]
+
+
+class TestSiteToSiteVpnBinarySensor:
+    """Tests for the per-tunnel site-to-site VPN binary sensor."""
+
+    @pytest.fixture
+    def mock_coordinator(self, hass: HomeAssistant):
+        """Create a coordinator with a switch, a gateway and two tunnels."""
+        coordinator = MagicMock()
+        coordinator.hass = hass
+        coordinator.network_client = MagicMock()
+        coordinator.network_client.base_url = "https://192.168.1.1"
+        coordinator.protect_client = None
+        coordinator.data = {
+            "sites": {"site1": {"id": "site1"}},
+            "devices": {
+                "site1": {
+                    "sw": {
+                        "id": "sw",
+                        "name": "Switch",
+                        "model": "USW-24-POE",
+                        "state": "ONLINE",
+                        "macAddress": "AA:BB:CC:DD:EE:FF",
+                    },
+                    "gw": {
+                        "id": "gw",
+                        "name": "Gateway",
+                        "model": "UCG-Ultra",
+                        "state": "ONLINE",
+                        "macAddress": "11:22:33:44:55:66",
+                    },
+                },
+            },
+            "site_vpns": {
+                "site1": {
+                    "tun1": {
+                        "id": "tun1",
+                        "name": "Office",
+                        "vpn_type": "ipsec-vpn",
+                        "enabled": True,
+                    },
+                    "tun2": {
+                        "id": "tun2",
+                        "name": "Old Branch",
+                        "vpn_type": "ipsec-vpn",
+                        "enabled": False,
+                    },
+                }
+            },
+            "vpn_connections": {
+                "site1": {
+                    "tun1": {
+                        "network_id": "tun1",
+                        "type": "ipsec-vpn",
+                        "status": "CONNECTED",
+                    }
+                }
+            },
+            "stats": {},
+            "clients": {},
+        }
+        return coordinator
+
+    @pytest.fixture
+    def mock_config_entry(self, mock_coordinator):
+        """Create mock config entry."""
+        entry = MagicMock()
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = mock_coordinator
+        return entry
+
+    async def _setup(self, hass, mock_config_entry) -> list:
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+        return [
+            e
+            for e in added_entities
+            if isinstance(e, UnifiInsightsSiteToSiteVpnBinarySensor)
+        ]
+
+    async def test_one_sensor_per_enabled_tunnel_on_the_gateway(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Each enabled tunnel gets one sensor on the gateway, never re-added."""
+        sensors = await self._setup(hass, mock_config_entry)
+        mock_coordinator.async_add_listener.call_args[0][0]()
+
+        (sensor,) = sensors
+        assert sensor._device_id == "gw"
+        assert sensor.unique_id == "site1_gw_site_to_site_vpn_tun1"
+        assert sensor.translation_key == "site_to_site_vpn"
+        assert sensor.translation_placeholders == {"tunnel_name": "Office"}
+        assert sensor.device_class == BinarySensorDeviceClass.CONNECTIVITY
+
+    async def test_connected_tunnel_is_on(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A tunnel listed as CONNECTED is on."""
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        assert sensor.is_on is True
+        assert sensor.extra_state_attributes == {
+            "vpn_type": "ipsec-vpn",
+            "status": "CONNECTED",
+        }
+
+    @pytest.mark.parametrize(
+        "connections",
+        [
+            {},
+            {"tun1": {"network_id": "tun1", "status": "DISCONNECTED"}},
+            {"tun1": {"network_id": "tun1", "status": None}},
+            {"tun1": "junk"},
+        ],
+    )
+    async def test_missing_or_not_connected_tunnel_is_off(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry, connections
+    ):
+        """A tunnel absent from the list, or not CONNECTED, is off."""
+        mock_coordinator.data["vpn_connections"]["site1"] = connections
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        assert sensor.is_on is False
+
+    @pytest.mark.parametrize("vpn_connections", [{}, {"site1": None}, None])
+    async def test_unknown_when_connection_state_is_unknown(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry, vpn_connections
+    ):
+        """Unreadable connection state reads unknown rather than disconnected."""
+        (sensor,) = await self._setup(hass, mock_config_entry)
+        mock_coordinator.data["vpn_connections"] = vpn_connections
+
+        assert sensor.is_on is None
+        assert sensor.extra_state_attributes == {
+            "vpn_type": "ipsec-vpn",
+            "status": None,
+        }
+
+    async def test_unavailable_once_tunnel_is_removed(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A tunnel deleted on the console makes its sensor unavailable."""
+        (sensor,) = await self._setup(hass, mock_config_entry)
+        assert sensor.available is True
+
+        del mock_coordinator.data["site_vpns"]["site1"]["tun1"]
+        assert sensor.available is False
+        mock_coordinator.data["site_vpns"] = None
+        assert sensor.available is False
+
+    async def test_created_on_device_reporting_wans(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """An unrecognised model that reports WAN links still gets the sensors."""
+        gw = mock_coordinator.data["devices"]["site1"]["gw"]
+        gw["model"] = "Unknown"
+        gw["wans"] = [{"key": "wan", "name": "WAN", "connected": True}]
+
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        assert sensor._device_id == "gw"
+
+    async def test_not_created_without_gateway_or_tunnels(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """No gateway, or no configured tunnels, means no sensors."""
+        mock_coordinator.data["site_vpns"] = {"site1": {}}
+        assert await self._setup(hass, mock_config_entry) == []
+
+        mock_coordinator.data["site_vpns"] = {"site1": {"tun1": {"name": "Office"}}}
+        del mock_coordinator.data["devices"]["site1"]["gw"]
+        assert await self._setup(hass, mock_config_entry) == []
+
+    async def test_name_falls_back_to_tunnel_id(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """A tunnel without a name is labelled by its id."""
+        mock_coordinator.data["site_vpns"]["site1"]["tun1"]["name"] = None
+
+        (sensor,) = await self._setup(hass, mock_config_entry)
+
+        assert sensor.translation_placeholders == {"tunnel_name": "tun1"}
 
 
 class TestGetSupportedSmartDetectTypes:

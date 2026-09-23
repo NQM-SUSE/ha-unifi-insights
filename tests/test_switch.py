@@ -43,6 +43,7 @@ from custom_components.unifi_insights.switch import (
     UnifiProtectStatusLightSwitch,
     UnifiVpnClientSwitch,
     UnifiWifiSwitch,
+    _find_gateway_device_id,
     _prune_orphaned_switch_entities,
     async_setup_entry,
 )
@@ -3997,3 +3998,31 @@ class TestUnifiOutletCycleSwitch:
             ]
             is True
         )
+
+
+class TestFindGatewayDeviceId:
+    """Tests for grouping site-level switches under the site's gateway."""
+
+    @staticmethod
+    def _coordinator(devices: dict) -> MagicMock:
+        coordinator = MagicMock()
+        coordinator.data = {"devices": {"site1": devices}}
+        return coordinator
+
+    def test_recognised_gateway(self):
+        """A gateway model is found."""
+        coordinator = self._coordinator(
+            {"sw": {"model": "USW-24"}, "gw": {"model": "UCG-Ultra"}}
+        )
+        assert _find_gateway_device_id(coordinator, "site1") == "gw"
+
+    def test_wan_data_alone_does_not_regroup_entities(self):
+        """Merged WAN data must not move entities onto an unrecognised device.
+
+        It is only present when that poll's legacy fetch worked, so grouping
+        on it would move entities between devices across restarts.
+        """
+        coordinator = self._coordinator(
+            {"gw": {"model": "Unknown", "wans": [{"key": "wan1"}]}}
+        )
+        assert _find_gateway_device_id(coordinator, "site1") is None

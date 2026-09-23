@@ -798,6 +798,84 @@ class TestUnifiConfigCoordinator:
         assert coordinator._available is True
 
     @pytest.mark.asyncio
+    async def test_async_update_data_stores_site_to_site_vpns(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Configured site-to-site tunnels are stored per site by id."""
+        tunnel = {
+            "id": "tun1",
+            "name": "Office",
+            "vpn_type": "ipsec-vpn",
+            "enabled": True,
+        }
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            return_value=[tunnel]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["site_vpns"]["default"] == {"tun1": tunnel}
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_site_to_site_vpns_error_keeps_last_known(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """A failed tunnel fetch keeps the last known tunnels, not an empty set."""
+        tunnel = {
+            "id": "tun1",
+            "name": "Office",
+            "vpn_type": "ipsec-vpn",
+            "enabled": True,
+        }
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            return_value=[tunnel]
+        )
+        await coordinator._async_update_data()
+
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            side_effect=Exception("networkconf unavailable")
+        )
+        result = await coordinator._async_update_data()
+
+        assert result["site_vpns"]["default"] == {"tun1": tunnel}
+        assert coordinator._available is True
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_site_mapping_error_keeps_site_vpns(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """A failed legacy site mapping keeps the last known tunnels."""
+        tunnel = {
+            "id": "tun1",
+            "name": "Office",
+            "vpn_type": "ipsec-vpn",
+            "enabled": True,
+        }
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            return_value=[tunnel]
+        )
+        await coordinator._async_update_data()
+
+        coordinator.network_client.sites.get_legacy_all = AsyncMock(
+            side_effect=Exception("legacy sites unavailable")
+        )
+        result = await coordinator._async_update_data()
+
+        assert result["site_vpns"]["default"] == {"tun1": tunnel}
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_site_to_site_vpns_auth_error(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """An auth error on the tunnel fetch triggers reauth, not last-known."""
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            side_effect=UniFiAuthenticationError("Invalid API key")
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+    @pytest.mark.asyncio
     async def test_async_update_data_vpn_clients_auth_error(
         self, coordinator: UnifiConfigCoordinator
     ) -> None:
@@ -2152,6 +2230,234 @@ class TestUnifiDeviceCoordinator:
 
         assert "Error updating data" in str(exc_info.value)
         assert coordinator._available is False
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_stores_vpn_connections(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Live VPN connections are stored per site, keyed by network_id."""
+        coordinator.network_client.vpn_clients.list_vpn_connections = AsyncMock(
+            return_value=[
+                {"network_id": "tun1", "type": "ipsec-vpn", "status": "CONNECTED"},
+                {"network_id": "cli1", "type": "openvpn-client", "status": "CONNECTED"},
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["vpn_connections"]["default"] == {
+            "tun1": {"network_id": "tun1", "type": "ipsec-vpn", "status": "CONNECTED"},
+            "cli1": {
+                "network_id": "cli1",
+                "type": "openvpn-client",
+                "status": "CONNECTED",
+            },
+        }
+        coordinator.network_client.vpn_clients.list_vpn_connections.assert_awaited_once_with(
+            "default"
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_vpn_connections_failure_is_optional(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A failing connections call never fails the device refresh."""
+        coordinator.network_client.vpn_clients.list_vpn_connections = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+
+        result = await coordinator._async_update_data()
+
+        # No previous value to reuse, so the site's state is unknown.
+        assert "default" not in result["vpn_connections"]
+        assert result["devices"]["default"]
+
+    @pytest.mark.asyncio
+    async def test_vpn_connections_reused_for_bounded_polls_then_dropped(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A failing call reuses the last good connections for a few polls."""
+        good = {"network_id": "tun1", "type": "ipsec-vpn", "status": "CONNECTED"}
+        coordinator.network_client.vpn_clients.list_vpn_connections = AsyncMock(
+            return_value=[good]
+        )
+        await coordinator._async_update_data()
+
+        coordinator.network_client.vpn_clients.list_vpn_connections = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        for _ in range(MAX_STATS_REUSE_POLLS):
+            result = await coordinator._async_update_data()
+            assert result["vpn_connections"]["default"] == {"tun1": good}
+
+        result = await coordinator._async_update_data()
+        assert "default" not in result["vpn_connections"]
+
+        # A success resets the failure count.
+        coordinator.network_client.vpn_clients.list_vpn_connections = AsyncMock(
+            return_value=[]
+        )
+        result = await coordinator._async_update_data()
+        assert result["vpn_connections"]["default"] == {}
+        assert coordinator._vpn_connection_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_vpn_connections_dropped_for_sites_no_longer_polled(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """VPN state of a site that is no longer polled is purged."""
+        coordinator.data["vpn_connections"]["gone"] = {"tun1": {"status": "CONNECTED"}}
+        coordinator._vpn_connection_failures["gone"] = 1
+
+        result = await coordinator._async_update_data()
+
+        assert "gone" not in result["vpn_connections"]
+        assert "gone" not in coordinator._vpn_connection_failures
+
+    @pytest.mark.asyncio
+    async def test_legacy_primary_devices_still_get_wans(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """WAN links are merged when legacy devices replace a failing v1 list."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Gateway",
+                    "model": "UCG-Ultra",
+                    "type": "ugw",
+                    "up": True,
+                    "last_wan_status": {"WAN": "online"},
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        (device,) = result["devices"]["default"].values()
+        assert device["wans"][0]["key"] == "wan"
+        assert device["wans"][0]["connected"] is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_vpn_connections_without_legacy_site(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Without a legacy site name the state is unknown, not "no VPNs"."""
+        coordinator.network_client.vpn_clients.list_vpn_connections = AsyncMock()
+
+        assert await coordinator._fetch_vpn_connections("default", None) is None
+        coordinator.network_client.vpn_clients.list_vpn_connections.assert_not_awaited()
+
+    def test_merge_legacy_wan_data(self, coordinator: UnifiDeviceCoordinator):
+        """The gateway's per-WAN connection state is merged by MAC."""
+        device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {
+                "wan1": {"type": "ethernet", "name": "eth8", "up": True},
+                "last_wan_status": {"WAN": "online"},
+                "last_wan_interfaces": {"WAN": {"ip": "198.51.100.7", "alive": True}},
+            }
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_wan_data(
+            device_dict, legacy_devices_by_mac
+        )
+
+        assert [wan["key"] for wan in device_dict["wans"]] == ["wan"]
+        assert device_dict["wans"][0]["connected"] is True
+        assert device_dict["wans"][0]["name"] == "WAN"
+
+    def test_merge_legacy_wan_data_without_wan_blocks(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Devices without WAN blocks, or without legacy data, are untouched."""
+        switch: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        unmatched: dict[str, Any] = {"macAddress": "11:22:33:44:55:66"}
+        no_mac: dict[str, Any] = {}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {"port_table": []}
+        }
+
+        for device_dict in (switch, unmatched, no_mac):
+            UnifiDeviceCoordinator._merge_legacy_wan_data(
+                device_dict, legacy_devices_by_mac
+            )
+            assert "wans" not in device_dict
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_merges_legacy_wans(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """Legacy WAN link state reaches the gateway device through a refresh."""
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "last_wan_status": {"WAN": "online"},
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        wans = result["devices"]["default"]["device1"]["wans"]
+        assert wans[0]["key"] == "wan"
+        assert wans[0]["connected"] is True
+
+    @pytest.mark.asyncio
+    async def test_wans_reused_for_bounded_polls_then_dropped(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A failing legacy call keeps the last WAN links for a few polls."""
+        # Real models dump a fresh dict per poll; the shared fixture dict
+        # would otherwise carry reused WAN links into later polls.
+        for model in coordinator.network_client.devices.get_all.return_value:
+            dumped = model.model_dump.return_value
+            model.model_dump = MagicMock(
+                side_effect=lambda *_a, d=dumped, **_k: dict(d)
+            )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "last_wan_status": {"WAN": "online"},
+                }
+            ]
+        )
+        result = await coordinator._async_update_data()
+        good = result["devices"]["default"]["device1"]["wans"]
+
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        for _ in range(MAX_STATS_REUSE_POLLS):
+            result = await coordinator._async_update_data()
+            assert result["devices"]["default"]["device1"]["wans"] == good
+
+        result = await coordinator._async_update_data()
+        assert "wans" not in result["devices"]["default"]["device1"]
+
+        # A success resets the failure count.
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[]
+        )
+        await coordinator._async_update_data()
+        assert coordinator._legacy_wan_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_legacy_wan_failures_dropped_for_sites_no_longer_polled(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """The WAN failure count of a site that is no longer polled is purged."""
+        coordinator._legacy_wan_failures["gone"] = 1
+
+        await coordinator._async_update_data()
+
+        assert "gone" not in coordinator._legacy_wan_failures
 
     def test_merge_legacy_port_data_includes_poe_good(
         self, coordinator: UnifiDeviceCoordinator
@@ -4729,6 +5035,8 @@ class TestUnifiFacadeCoordinator:
         assert "default" in facade_coordinator.data["devices"]
         assert "clients" in facade_coordinator.data
         assert "stats" in facade_coordinator.data
+        assert "vpn_connections" in facade_coordinator.data
+        assert "site_vpns" in facade_coordinator.data
 
         # Check protect coordinator data
         assert "protect" in facade_coordinator.data
