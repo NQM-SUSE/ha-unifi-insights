@@ -20,6 +20,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.util.hass_dict import HassKey
 
 from .const import DOMAIN
+from .helpers import async_get_device_entry
 from .topology import (
     MAX_CLIENTS_PER_SITE,
     build_site_topology,
@@ -81,15 +82,23 @@ def _resolve_entry(hass: HomeAssistant, entry_id: str) -> UnifiInsightsConfigEnt
 
 
 def _ha_device_ids(
-    hass: HomeAssistant, data: dict[str, Any], site_id: str
+    hass: HomeAssistant, data: dict[str, Any], site_id: str, entry_id: str
 ) -> dict[str, str]:
-    """Map the site's device ids to their Home Assistant device registry ids."""
+    """
+    Map the site's device ids to their Home Assistant device registry ids.
+
+    Scoped to this config entry: device identifiers and connections are no
+    longer unique across entries (HA 2026.9+), so an unscoped lookup could
+    return another loaded UniFi Insights console's device with the same
+    site/device id pair. async_get_device_entry also keeps this off the
+    deprecated DeviceRegistry.async_get_device path (removed in 2027.8).
+    """
     registry = dr.async_get(hass)
     devices = data.get("devices", {}).get(site_id, {})
     result: dict[str, str] = {}
     for device_id in devices if isinstance(devices, dict) else ():
-        device = registry.async_get_device(
-            identifiers={(DOMAIN, f"{site_id}_{device_id}")}
+        device = async_get_device_entry(
+            registry, (DOMAIN, f"{site_id}_{device_id}"), entry_id
         )
         if device is not None:
             result[device_id] = device.id
@@ -112,7 +121,7 @@ def _build_snapshot(
         facade.data,
         entry.entry_id,
         site_id,
-        ha_device_ids=_ha_device_ids(hass, facade.data, site_id),
+        ha_device_ids=_ha_device_ids(hass, facade.data, site_id, entry.entry_id),
         max_clients=max_clients,
         devices_available=facade.device_available,
     )

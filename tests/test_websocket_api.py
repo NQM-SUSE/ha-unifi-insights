@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
@@ -130,6 +130,44 @@ async def test_get_returns_snapshot(
     assert ap["ha_device_id"] == registry_device.id
     assert "10.2.0.9" not in str(snapshot)
     assert GW_MAC not in str(snapshot)
+
+
+async def test_get_does_not_use_deprecated_registry_lookup(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """
+    Device lookups go through the entry-scoped helper, not async_get_device.
+
+    HA 2026.9 deprecated DeviceRegistry.async_get_device (removal in
+    2027.8) because identifiers are no longer unique across config entries.
+    Patching it to blow up proves the snapshot build never calls it.
+    """
+    _seed(init_integration)
+    registry_device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, f"{SITE}_uuid-ap")},
+    )
+    client = await hass_ws_client(hass)
+
+    with patch.object(
+        dr.DeviceRegistry,
+        "async_get_device",
+        Mock(side_effect=AssertionError("deprecated async_get_device was called")),
+    ):
+        await client.send_json(
+            {
+                "id": 1,
+                "type": "unifi_insights/topology/get",
+                "entry_id": init_integration.entry_id,
+                "site_id": SITE,
+            }
+        )
+        msg = await client.receive_json()
+
+    assert msg["success"]
+    snapshot = msg["result"]
+    ap = next(node for node in snapshot["nodes"] if node["id"] == "dev:uuid-ap")
+    assert ap["ha_device_id"] == registry_device.id
 
 
 async def test_get_non_admin_user_allowed(
