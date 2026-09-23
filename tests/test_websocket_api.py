@@ -488,7 +488,13 @@ async def test_subscribe_builder_error_does_not_break_listeners(
     hass_ws_client,
     caplog,
 ) -> None:
-    """A builder bug is logged; other coordinator listeners still run."""
+    """
+    A builder bug gets the guard's own per-site log line.
+
+    Home Assistant already isolates listener failures, so "other listeners
+    still run" holds with or without the guard; what the guard adds is a
+    message naming the feature and site instead of HA's generic one.
+    """
     _seed(init_integration)
     facade = init_integration.runtime_data.coordinator
     client = await hass_ws_client(hass)
@@ -507,4 +513,5 @@ async def test_subscribe_builder_error_does_not_break_listeners(
         facade.async_update_listeners()
 
     assert calls == ["entity"]
-    assert "topology" in caplog.text.lower()
+    assert f"Failed to rebuild the topology snapshot for {SITE}" in caplog.text
+    assert "Unexpected error updating listener" not in caplog.text

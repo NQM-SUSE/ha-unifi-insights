@@ -305,9 +305,10 @@ def ws_topology_subscribe(
                 entry.entry_id, site_id, site_name, ISSUE_SITE_UNAVAILABLE
             )
         except Exception:
-            # Never let a builder bug escape: this runs inside the
-            # coordinator's listener loop, and raising would stop every
-            # entity on the entry from updating.
+            # Home Assistant already isolates listener failures, but its log
+            # line names neither the feature nor the site. Log a clear
+            # per-site error instead; last_revision is untouched, so the
+            # next good build is compared against what the card last got.
             _LOGGER.exception("Failed to rebuild the topology snapshot for %s", site_id)
             return
         if update["revision"] == last_revision:
