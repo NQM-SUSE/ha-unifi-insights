@@ -388,6 +388,17 @@ def test_gateway_without_uplink_is_root() -> None:
     assert snapshot["edges"] == []
 
 
+def test_gateway_with_unknown_upstream_is_root() -> None:
+    """A gateway uplinked to a non-UniFi router (e.g. via LLDP) is still the root."""
+    data = _live_layout()
+    data["devices"][SITE]["uuid-gw"]["topology"]["uplink_mac"] = "02:ff:ff:ff:ff:ff"
+    snapshot = _build(data)
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["unresolved"] == []
+    assert not [e for e in snapshot["edges"] if e["source"] == "dev:uuid-gw"]
+
+
 def test_self_edge_is_skipped() -> None:
     """A device that claims itself as parent gets no edge."""
     snapshot = _build(
