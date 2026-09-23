@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry as MockConfigEntryForTest,
@@ -217,3 +220,171 @@ async def test_get_errors(
     await hass.async_block_till_done()
     unloaded = await _get(4, init_integration.entry_id, SITE)
     assert unloaded["error"]["code"] == "entry_not_loaded"
+
+
+async def _subscribe(client, entry: MockConfigEntry, msg_id: int = 1) -> dict:
+    """Subscribe and return the initial snapshot event."""
+    await client.send_json(
+        {
+            "id": msg_id,
+            "type": "unifi_insights/topology/subscribe",
+            "entry_id": entry.entry_id,
+            "site_id": SITE,
+        }
+    )
+    ack = await client.receive_json()
+    assert ack["success"], ack
+    event = await client.receive_json()
+    assert event["type"] == "event"
+    return event["event"]
+
+
+async def _assert_no_event(client, ping_id: int) -> None:
+    """Prove nothing was pushed: the next message is the ping's pong."""
+    await client.send_json({"id": ping_id, "type": "ping"})
+    msg = await client.receive_json()
+    assert msg["type"] == "pong", msg
+
+
+async def test_subscribe_pushes_only_on_change(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Initial snapshot, then one push per real change, none for no-ops."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    # Settle dynamic entity/device discovery for the newly seeded site before
+    # measuring: the platforms' own coordinator listeners (e.g. sensor.py's
+    # async_discover_sensors) create HA device-registry entries for site-1's
+    # devices on their first run after _seed(), which would otherwise look
+    # like a spurious content change on the *next* listener call below.
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+
+    initial = await _subscribe(client, init_integration)
+    assert initial["status"] == "ok"
+
+    facade.async_update_listeners()
+    await _assert_no_event(client, 50)
+
+    data["devices"][SITE]["uuid-ap"]["name"] = "Hallway AP"
+    facade.async_update_listeners()
+    pushed = await client.receive_json()
+    assert pushed["type"] == "event"
+    assert pushed["event"]["revision"] != initial["revision"]
+    names = {node["id"]: node["name"] for node in pushed["event"]["nodes"]}
+    assert names["dev:uuid-ap"] == "Hallway AP"
+
+
+async def test_subscribe_errors_use_get_codes(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Subscribe rejects the same bad requests as get."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "unifi_insights/topology/subscribe",
+            "entry_id": init_integration.entry_id,
+            "site_id": "site-9",
+        }
+    )
+    msg = await client.receive_json()
+
+    assert msg["error"]["code"] == "site_not_selected"
+
+
+async def test_unsubscribe_stops_pushes(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """After unsubscribe_events, changes are no longer pushed."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration, msg_id=7)
+
+    await client.send_json({"id": 8, "type": "unsubscribe_events", "subscription": 7})
+    assert (await client.receive_json())["success"]
+
+    data["devices"][SITE]["uuid-ap"]["name"] = "Changed"
+    facade.async_update_listeners()
+    await _assert_no_event(client, 9)
+
+
+async def test_subscribe_entry_unload_sends_final_snapshot(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Unloading the entry pushes an unavailable snapshot and ends the stream."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration)
+
+    await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()
+
+    final = await client.receive_json()
+    assert final["type"] == "event"
+    assert final["event"]["status"] == "unavailable"
+    assert final["event"]["issues"] == [{"code": "entry_unloaded", "severity": "error"}]
+    assert final["event"]["site_name"] == "Home"
+
+
+async def test_subscribe_unload_then_close_is_safe(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Unload followed by connection close never removes the listener twice."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration)
+
+    await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()
+    await client.receive_json()  # final unavailable snapshot
+
+    await client.close()
+    await hass.async_block_till_done()  # raises if remove_listener ran twice
+
+
+async def test_subscribe_close_then_unload_is_safe(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Connection close followed by unload never removes the listener twice."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration)
+
+    await client.close()
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()
+
+    assert init_integration.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_subscribe_builder_error_does_not_break_listeners(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    caplog,
+) -> None:
+    """A builder bug is logged; other coordinator listeners still run."""
+    _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration)
+
+    calls: list[str] = []
+    facade.async_add_listener(lambda: calls.append("entity"))
+    with (
+        caplog.at_level(logging.ERROR),
+        patch(
+            "custom_components.unifi_insights.websocket_api.build_site_topology",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        facade.async_update_listeners()
+
+    assert calls == ["entity"]
+    assert "topology" in caplog.text.lower()

@@ -8,6 +8,7 @@ from scoping every request to one loaded entry and one selected site.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
@@ -17,13 +18,20 @@ from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
 
 from .const import DOMAIN
-from .topology import MAX_CLIENTS_PER_SITE, build_site_topology, site_display_name
+from .topology import (
+    MAX_CLIENTS_PER_SITE,
+    build_site_topology,
+    build_unavailable_topology,
+    site_display_name,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
     from . import UnifiInsightsConfigEntry
     from .topology import SiteTopology
+
+_LOGGER = logging.getLogger(__name__)
 
 ERR_ENTRY_NOT_FOUND = "entry_not_found"
 ERR_ENTRY_NOT_LOADED = "entry_not_loaded"
@@ -50,6 +58,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register the topology WebSocket commands (once per HA instance)."""
     websocket_api.async_register_command(hass, ws_topology_sources)
     websocket_api.async_register_command(hass, ws_topology_get)
+    websocket_api.async_register_command(hass, ws_topology_subscribe)
 
 
 def _resolve_entry(hass: HomeAssistant, entry_id: str) -> UnifiInsightsConfigEntry:
@@ -151,3 +160,89 @@ def ws_topology_get(
         connection.send_error(msg["id"], err.code, str(err))
         return
     connection.send_result(msg["id"], snapshot)
+
+
+ISSUE_ENTRY_UNLOADED = "entry_unloaded"
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "unifi_insights/topology/subscribe", **_SNAPSHOT_SCHEMA}
+)
+@callback
+def ws_topology_subscribe(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """
+    Stream one site's snapshot, pushing only when its revision changes.
+
+    The listener rides on the facade coordinator, which never polls on its
+    own, so a subscription adds no API traffic. It is removed when the client
+    unsubscribes, when the connection closes, or when the entry unloads -
+    whichever comes first; the removal is idempotent because Home Assistant's
+    remove-listener callback raises if called twice.
+    """
+    msg_id: int = msg["id"]
+    site_id: str = msg["site_id"]
+    max_clients: int = msg["max_clients"]
+    try:
+        entry = _resolve_entry(hass, msg["entry_id"])
+        snapshot = _build_snapshot(hass, entry, site_id, max_clients)
+    except _RequestError as err:
+        connection.send_error(msg_id, err.code, str(err))
+        return
+
+    last_revision = snapshot["revision"]
+    site_name = snapshot["site_name"]
+    removed = False
+
+    @callback
+    def _async_forward() -> None:
+        nonlocal last_revision
+        try:
+            update = _build_snapshot(hass, entry, site_id, max_clients)
+        except _RequestError:
+            # The site was deselected; the options change reloads the entry,
+            # which ends this subscription through _async_entry_unloaded.
+            return
+        except Exception:
+            # Never let a builder bug escape: this runs inside the
+            # coordinator's listener loop, and raising would stop every
+            # entity on the entry from updating.
+            _LOGGER.exception("Failed to rebuild the topology snapshot for %s", site_id)
+            return
+        if update["revision"] == last_revision:
+            return
+        last_revision = update["revision"]
+        connection.send_message(websocket_api.event_message(msg_id, update))
+
+    remove_listener = entry.runtime_data.coordinator.async_add_listener(_async_forward)
+
+    @callback
+    def _async_unsubscribe() -> None:
+        nonlocal removed
+        if removed:
+            return
+        removed = True
+        remove_listener()
+
+    @callback
+    def _async_entry_unloaded() -> None:
+        if removed:
+            return
+        _async_unsubscribe()
+        connection.subscriptions.pop(msg_id, None)
+        connection.send_message(
+            websocket_api.event_message(
+                msg_id,
+                build_unavailable_topology(
+                    entry.entry_id, site_id, site_name, ISSUE_ENTRY_UNLOADED
+                ),
+            )
+        )
+
+    connection.subscriptions[msg_id] = _async_unsubscribe
+    entry.async_on_unload(_async_entry_unloaded)
+    connection.send_result(msg_id)
+    connection.send_message(websocket_api.event_message(msg_id, snapshot))
