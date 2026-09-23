@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.9.7] - 2026-09-24
+
 ### Added
 
 - A **WAN Connection** binary sensor for each WAN in use on a gateway (named "WAN", "WAN2" like the UniFi UI), including PPPoE WANs. It follows the gateway's own per-WAN status rather than the port's link light, so a PPPoE session that drops while the cable stays connected shows as disconnected. The raw status, reachability check result and address are attributes. The existing **WAN Status** sensor keeps reporting whether the gateway itself is online. [#162](https://github.com/ruaan-deysel/ha-unifi-insights/issues/162)
