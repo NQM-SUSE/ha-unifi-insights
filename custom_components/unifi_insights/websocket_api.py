@@ -17,6 +17,7 @@ from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
+from homeassistant.util.hass_dict import HassKey
 
 from .const import DOMAIN
 from .topology import (
@@ -211,7 +212,9 @@ ISSUE_ENTRY_UNLOADED = "entry_unloaded"
 ISSUE_SITE_UNAVAILABLE = "site_unavailable"
 
 # hass.data key: entry_id -> callbacks to run when that entry unloads.
-_UNLOAD_WATCHERS = f"{DOMAIN}_topology_unload_watchers"
+_UNLOAD_WATCHERS: HassKey[dict[str, set[Callable[[], None]]]] = HassKey(
+    f"{DOMAIN}_topology_unload_watchers"
+)
 
 
 @callback
@@ -229,9 +232,7 @@ def _async_watch_unload(
     hook that drains a watcher set; subscriptions add and discard themselves.
     Unloading pops the set, so a reloaded entry gets a fresh hook.
     """
-    watchers: dict[str, set[Callable[[], None]]] = hass.data.setdefault(
-        _UNLOAD_WATCHERS, {}
-    )
+    watchers = hass.data.setdefault(_UNLOAD_WATCHERS, {})
     entry_watchers = watchers.get(entry.entry_id)
     if entry_watchers is None:
         entry_watchers = watchers[entry.entry_id] = set()
@@ -261,10 +262,14 @@ def ws_topology_subscribe(
     The listener rides on the facade coordinator, which never polls on its
     own, so a subscription adds no API traffic. It is removed when the client
     unsubscribes, when the connection closes, or when the entry unloads -
-    whichever comes first; the removal is idempotent because Home Assistant's
-    remove-listener callback raises if called twice. Unload is observed via
-    one shared hook per entry (_async_watch_unload), and unsubscribing stops
-    watching, so repeated subscriptions leave nothing behind on the entry.
+    whichever comes first, and only once (Home Assistant's remove-listener
+    callback raises if called twice). The paths cannot overlap: unload pops
+    the subscription from connection.subscriptions before the connection
+    could call it, and unsubscribing stops watching the entry, so the unload
+    hook never reaches it afterwards. The ``removed`` flag is belt and
+    braces on top of that. Unload is observed via one shared hook per entry
+    (_async_watch_unload), so repeated subscriptions leave nothing behind on
+    the entry.
     """
     msg_id: int = msg["id"]
     site_id: str = msg["site_id"]
