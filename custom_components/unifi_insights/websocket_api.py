@@ -117,6 +117,48 @@ def _build_snapshot(
     )
 
 
+def _snapshot_inputs(
+    hass: HomeAssistant, entry: UnifiInsightsConfigEntry, site_id: str
+) -> tuple[object, ...]:
+    """
+    Return what one site's snapshot is built from, for cheap change detection.
+
+    The coordinators publish each poll by replacing the per-site dicts (the
+    device coordinator builds fresh ``devices``/``clients`` dicts per site,
+    the config coordinator a fresh ``sites`` dict), never by mutating them in
+    place, so object identity says whether the data changed. The registry
+    size stands in for the ``ha_device_id`` links: it changes when a device
+    is first registered or removed. Any other registry-only change is picked
+    up at the next data poll.
+    """
+    runtime = entry.runtime_data
+    data = runtime.coordinator.data
+    per_site = []
+    for section in ("devices", "clients", "client_links"):
+        by_site = data.get(section)
+        per_site.append(by_site.get(site_id) if isinstance(by_site, dict) else None)
+    return (
+        data.get("sites"),
+        *per_site,
+        runtime.coordinator.device_available,
+        site_id in runtime.config_coordinator.get_site_ids(),
+        len(dr.async_get(hass).devices),
+    )
+
+
+def _same_inputs(old: tuple[object, ...], new: tuple[object, ...]) -> bool:
+    """
+    Compare inputs by identity (data dicts) or value (flags and counts).
+
+    The previous inputs hold the dicts themselves rather than their id(), so
+    a replaced dict stays alive and its address cannot be reused by a new
+    one and mistaken for "unchanged".
+    """
+    return all(
+        a is b or (isinstance(a, int) and a == b) for a, b in zip(old, new, strict=True)
+    )
+
+
 @websocket_api.websocket_command(
     {vol.Required("type"): "unifi_insights/topology/sources"}
 )
@@ -235,12 +277,20 @@ def ws_topology_subscribe(
         return
 
     last_revision = snapshot["revision"]
+    last_inputs = _snapshot_inputs(hass, entry, site_id)
     site_name = snapshot["site_name"]
     removed = False
 
     @callback
     def _async_forward() -> None:
-        nonlocal last_revision, site_name
+        nonlocal last_inputs, last_revision, site_name
+        # The facade notifies on every sub-coordinator update, including each
+        # Protect WebSocket message, so skip the rebuild (registry lookups,
+        # JSON and a hash) unless something the snapshot reads has changed.
+        inputs = _snapshot_inputs(hass, entry, site_id)
+        if _same_inputs(inputs, last_inputs):
+            return
+        last_inputs = inputs
         try:
             update = _build_snapshot(hass, entry, site_id, max_clients)
         except _RequestError:

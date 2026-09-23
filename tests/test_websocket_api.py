@@ -13,6 +13,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.topology import build_site_topology
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -239,6 +240,12 @@ async def _subscribe(client, entry: MockConfigEntry, msg_id: int = 1) -> dict:
     return event["event"]
 
 
+def _rename_ap(data: dict[str, Any], name: str) -> None:
+    """Publish a renamed AP the way the coordinator does: a new site dict."""
+    devices = data["devices"][SITE]
+    data["devices"][SITE] = {**devices, "uuid-ap": {**devices["uuid-ap"], "name": name}}
+
+
 async def _assert_no_event(client, ping_id: int) -> None:
     """Prove nothing was pushed: the next message is the ping's pong."""
     await client.send_json({"id": ping_id, "type": "ping"})
@@ -267,7 +274,10 @@ async def test_subscribe_pushes_only_on_change(
     facade.async_update_listeners()
     await _assert_no_event(client, 50)
 
-    data["devices"][SITE]["uuid-ap"]["name"] = "Hallway AP"
+    # Replace the site dict rather than mutating it in place: that is how the
+    # device coordinator publishes each poll, and the subscription only
+    # rebuilds when the per-site dict's identity changes.
+    _rename_ap(data, "Hallway AP")
     facade.async_update_listeners()
     pushed = await client.receive_json()
     assert pushed["type"] == "event"
@@ -315,6 +325,43 @@ async def test_subscribe_site_vanishes_then_recovers(
     assert back["event"]["revision"] == initial["revision"]
 
 
+async def test_subscribe_skips_rebuild_when_inputs_unchanged(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Facade updates that touch nothing the snapshot reads cost no rebuild."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration)
+
+    with patch(
+        "custom_components.unifi_insights.websocket_api.build_site_topology",
+        wraps=build_site_topology,
+    ) as builder:
+        for _ in range(3):
+            facade.async_update_listeners()
+        await _assert_no_event(client, 70)
+        assert builder.call_count == 0
+
+        # A poll that republishes identical content rebuilds once but pushes
+        # nothing: the revision still gates what reaches the card.
+        data["devices"][SITE] = dict(data["devices"][SITE])
+        facade.async_update_listeners()
+        await _assert_no_event(client, 71)
+        assert builder.call_count == 1
+
+        _rename_ap(data, "Hallway AP")
+        facade.async_update_listeners()
+        pushed = await client.receive_json()
+        assert builder.call_count == 2
+
+    assert pushed["type"] == "event"
+    names = {node["id"]: node["name"] for node in pushed["event"]["nodes"]}
+    assert names["dev:uuid-ap"] == "Hallway AP"
+
+
 async def test_subscribe_errors_use_get_codes(
     hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
 ) -> None:
@@ -347,7 +394,7 @@ async def test_unsubscribe_stops_pushes(
     await client.send_json({"id": 8, "type": "unsubscribe_events", "subscription": 7})
     assert (await client.receive_json())["success"]
 
-    data["devices"][SITE]["uuid-ap"]["name"] = "Changed"
+    _rename_ap(data, "Changed")
     facade.async_update_listeners()
     await _assert_no_event(client, 9)
 
@@ -449,6 +496,7 @@ async def test_subscribe_builder_error_does_not_break_listeners(
 
     calls: list[str] = []
     facade.async_add_listener(lambda: calls.append("entity"))
+    _rename_ap(init_integration.runtime_data.coordinator.data, "Changed")
     with (
         caplog.at_level(logging.ERROR),
         patch(
