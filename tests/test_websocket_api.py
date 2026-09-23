@@ -13,7 +13,12 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.helpers import async_get_device_entry
 from custom_components.unifi_insights.topology import build_site_topology
+from custom_components.unifi_insights.websocket_api import (
+    ws_topology_sources,
+    ws_topology_subscribe,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -97,6 +102,24 @@ async def test_sources_lists_loaded_entries(
     assert {"id": SITE, "name": "Home"} in source["sites"]
 
 
+async def test_sources_skips_loaded_entry_without_runtime_data(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """A briefly unloading entry cannot be offered as a topology source."""
+    _seed(init_integration)
+    connection = Mock()
+    unloaded_entry = Mock(runtime_data=None)
+    with patch.object(
+        hass.config_entries,
+        "async_loaded_entries",
+        return_value=[unloaded_entry, init_integration],
+    ):
+        ws_topology_sources(hass, connection, {"id": 1})
+
+    (sources,) = connection.send_result.call_args.args[1:]
+    assert [source["entry_id"] for source in sources] == [init_integration.entry_id]
+
+
 async def test_get_returns_snapshot(
     hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
 ) -> None:
@@ -132,15 +155,14 @@ async def test_get_returns_snapshot(
     assert GW_MAC not in str(snapshot)
 
 
-async def test_get_does_not_use_deprecated_registry_lookup(
+async def test_get_uses_entry_scoped_registry_lookup(
     hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
 ) -> None:
     """
-    Device lookups go through the entry-scoped helper, not async_get_device.
+    Device lookups go through the entry-scoped helper.
 
-    HA 2026.9 deprecated DeviceRegistry.async_get_device (removal in
-    2027.8) because identifiers are no longer unique across config entries.
-    Patching it to blow up proves the snapshot build never calls it.
+    The helper selects the best API available in the installed HA version;
+    the snapshot builder must pass the current config entry for scoping.
     """
     _seed(init_integration)
     registry_device = dr.async_get(hass).async_get_or_create(
@@ -149,11 +171,10 @@ async def test_get_does_not_use_deprecated_registry_lookup(
     )
     client = await hass_ws_client(hass)
 
-    with patch.object(
-        dr.DeviceRegistry,
-        "async_get_device",
-        Mock(side_effect=AssertionError("deprecated async_get_device was called")),
-    ):
+    with patch(
+        "custom_components.unifi_insights.websocket_api.async_get_device_entry",
+        wraps=async_get_device_entry,
+    ) as lookup:
         await client.send_json(
             {
                 "id": 1,
@@ -165,6 +186,10 @@ async def test_get_does_not_use_deprecated_registry_lookup(
         msg = await client.receive_json()
 
     assert msg["success"]
+    assert any(
+        call.args[1:] == ((DOMAIN, f"{SITE}_uuid-ap"), init_integration.entry_id)
+        for call in lookup.call_args_list
+    )
     snapshot = msg["result"]
     ap = next(node for node in snapshot["nodes"] if node["id"] == "dev:uuid-ap")
     assert ap["ha_device_id"] == registry_device.id
@@ -435,6 +460,35 @@ async def test_unsubscribe_stops_pushes(
     _rename_ap(data, "Changed")
     facade.async_update_listeners()
     await _assert_no_event(client, 9)
+
+
+async def test_subscription_cleanup_callbacks_are_idempotent(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Overlapping unsubscribe and unload callbacks leave one clean listener."""
+    _seed(init_integration)
+    connection = Mock()
+    connection.subscriptions = {}
+    ws_topology_subscribe(
+        hass,
+        connection,
+        {
+            "id": 7,
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+            "max_clients": 500,
+        },
+    )
+    watchers = hass.data[f"{DOMAIN}_topology_unload_watchers"]
+    (unload_callback,) = watchers[init_integration.entry_id]
+    unsubscribe = connection.subscriptions[7]
+
+    unsubscribe()
+    unsubscribe()
+    unload_callback()
+
+    assert not watchers[init_integration.entry_id]
+    assert connection.send_message.call_count == 1
 
 
 async def test_subscribe_entry_unload_sends_final_snapshot(
