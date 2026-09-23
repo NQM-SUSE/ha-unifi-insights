@@ -70,6 +70,7 @@ def test_opaque_node_id_keeps_uuid_and_hashes_mac() -> None:
         ({"type": "accessPoint"}, "access_point"),
         ({"features": ["accessPoint"]}, "access_point"),
         ({"features": ["switching"]}, "switch"),
+        ({"type": "sensor", "features": []}, "other"),
         ({"topology": {"legacy_type": "uph"}}, "other"),
         ({}, "other"),
     ],
@@ -309,6 +310,62 @@ def test_device_edge_enrichment() -> None:
     assert "poe_power_w" not in _edge(snapshot, "dev:uuid-pdu")
 
 
+@pytest.mark.parametrize(
+    ("poe_enabled", "power", "expected_watts"),
+    [
+        (False, "9.44", None),
+        (True, "9.44", 9.4),
+        (True, "invalid", None),
+    ],
+)
+def test_legacy_port_poe_and_uplink_fallback(
+    *, poe_enabled: bool, power: str, expected_watts: float | None
+) -> None:
+    """Legacy PoE fields and a later uplink port enrich the device edge."""
+    gateway = _device(
+        "uuid-gw",
+        "Gateway",
+        mac=GW_MAC,
+        legacy_type="udm",
+        ports=[{"idx": 7, "poeEnabled": poe_enabled, "poePower": power}],
+    )
+    switch = _device(
+        "uuid-switch",
+        "Switch",
+        mac=CORE_MAC,
+        legacy_type="usw",
+        uplink_mac=GW_MAC,
+        remote_port=7,
+        ports=[{"idx": 1}, {"idx": 2, "isUplink": True}],
+    )
+    switch["topology"]["uplink_type"] = "mesh"
+    edge = _edge(
+        _build(_data({"uuid-gw": gateway, "uuid-switch": switch})), "dev:uuid-switch"
+    )
+
+    assert edge["medium"] == "wireless"
+    assert edge["child_port"] == 2
+    assert edge["parent_port"] == 7
+    if expected_watts is None:
+        assert "poe_power_w" not in edge
+    else:
+        assert edge["poe_power_w"] == expected_watts
+
+
+def test_unrecognized_uplink_medium_is_unknown() -> None:
+    """A new legacy uplink type does not become a guessed wired link."""
+    gateway = _device("uuid-gw", "Gateway", mac=GW_MAC, legacy_type="udm")
+    switch = _device(
+        "uuid-switch", "Switch", mac=CORE_MAC, legacy_type="usw", uplink_mac=GW_MAC
+    )
+    switch["topology"]["uplink_type"] = "fiber"
+
+    edge = _edge(
+        _build(_data({"uuid-gw": gateway, "uuid-switch": switch})), "dev:uuid-switch"
+    )
+    assert edge["medium"] == "unknown"
+
+
 def test_client_edges_and_nodes() -> None:
     """Clients attach through uplinkDeviceId with their connection medium."""
     snapshot = _build(_live_layout())
@@ -327,6 +384,21 @@ def test_client_edges_and_nodes() -> None:
         "state": "online",
         "connection": "wireless",
     }
+
+
+@pytest.mark.parametrize("client_type", ["BLUETOOTH", None])
+def test_unknown_client_connection_is_omitted_from_node(
+    client_type: str | None,
+) -> None:
+    """Unknown and absent connection types produce an unknown link medium."""
+    gateway = _device("uuid-gw", "Gateway", mac=GW_MAC, legacy_type="udm")
+    client = _client("cli-a", "Client", uplink="uuid-gw")
+    client["type"] = client_type
+    snapshot = _build(_data({"uuid-gw": gateway}, {"cli-a": client}))
+
+    node = next(node for node in snapshot["nodes"] if node["id"] == "cli:cli-a")
+    assert "connection" not in node
+    assert _edge(snapshot, "cli:cli-a")["medium"] == "unknown"
 
 
 def test_every_edge_endpoint_exists_in_nodes() -> None:
@@ -470,6 +542,17 @@ def test_mac_keyed_device_resolves_and_is_opaque() -> None:
     assert _edge(snapshot, "dev:uuid-ap")["target"] == parent_node
     assert _edge(snapshot, parent_node)["target"] == "dev:uuid-gw"
     assert "aa:bb:cc" not in json.dumps(snapshot).lower()
+
+
+def test_device_without_mac_is_included_without_mac_index() -> None:
+    """A device with a UUID id and no MAC remains visible in the graph."""
+    snapshot = _build(_data({"uuid-device": {"name": "Device", "type": "switch"}}))
+
+    assert {node["id"] for node in snapshot["nodes"]} == {"dev:uuid-device"}
+    assert snapshot["edges"] == []
+    assert snapshot["unresolved"] == [
+        {"node_id": "dev:uuid-device", "reason": "no_uplink_data"}
+    ]
 
 
 def test_client_name_mac_shaped_is_replaced() -> None:
