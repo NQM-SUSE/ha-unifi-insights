@@ -417,6 +417,38 @@ async def test_subscribe_entry_unload_sends_final_snapshot(
     assert final["event"]["site_name"] == "Home"
 
 
+async def test_subscribe_after_reload_gets_unload_snapshot(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A subscription made after a reload still hears the next unload."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+    await _subscribe(client, init_integration, msg_id=1)
+
+    assert await hass.config_entries.async_reload(init_integration.entry_id)
+    await hass.async_block_till_done()
+    first_final = await client.receive_json()
+    assert first_final["id"] == 1
+    assert first_final["event"]["issues"] == [
+        {"code": "entry_unloaded", "severity": "error"}
+    ]
+
+    _seed(init_integration)
+    await _subscribe(client, init_integration, msg_id=2)
+
+    assert await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()
+    # The ping is answered after anything the unload pushed, so a missing
+    # final snapshot shows up as the pong arriving first instead of a hang.
+    await client.send_json({"id": 3, "type": "ping"})
+    final = await client.receive_json()
+    assert final["type"] == "event", final
+    assert final["id"] == 2
+    assert final["event"]["status"] == "unavailable"
+    assert final["event"]["issues"] == [{"code": "entry_unloaded", "severity": "error"}]
+    assert (await client.receive_json())["type"] == "pong"
+
+
 async def test_subscribe_unload_then_close_is_safe(
     hass: HomeAssistant,
     init_integration: MockConfigEntry,
