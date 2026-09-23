@@ -823,3 +823,19 @@ def test_links_never_leak_macs() -> None:
 
     assert "02:00:00" not in payload
     assert "12:00:00" not in payload
+
+
+def test_client_link_enrichment_without_known_connection() -> None:
+    """VLAN/network name still land on a node whose connection type is unknown."""
+    data = _live_layout()
+    data["clients"][SITE]["cli-tv"]["type"] = "UNKNOWN"
+    _with_links(
+        data,
+        {"12:00:00:00:00:01": {"vlan": 3, "network_name": "Media"}},
+    )
+    snapshot = _build(data)
+
+    tv = next(n for n in snapshot["nodes"] if n["id"] == "cli:cli-tv")
+    assert "connection" not in tv
+    assert tv["vlan_id"] == 3
+    assert tv["network_name"] == "Media"
