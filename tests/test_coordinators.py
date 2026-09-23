@@ -841,6 +841,29 @@ class TestUnifiConfigCoordinator:
         assert coordinator._available is True
 
     @pytest.mark.asyncio
+    async def test_async_update_data_site_mapping_error_keeps_site_vpns(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """A failed legacy site mapping keeps the last known tunnels."""
+        tunnel = {
+            "id": "tun1",
+            "name": "Office",
+            "vpn_type": "ipsec-vpn",
+            "enabled": True,
+        }
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            return_value=[tunnel]
+        )
+        await coordinator._async_update_data()
+
+        coordinator.network_client.sites.get_legacy_all = AsyncMock(
+            side_effect=Exception("legacy sites unavailable")
+        )
+        result = await coordinator._async_update_data()
+
+        assert result["site_vpns"]["default"] == {"tun1": tunnel}
+
+    @pytest.mark.asyncio
     async def test_async_update_data_site_to_site_vpns_auth_error(
         self, coordinator: UnifiConfigCoordinator
     ) -> None:
@@ -2384,6 +2407,57 @@ class TestUnifiDeviceCoordinator:
         wans = result["devices"]["default"]["device1"]["wans"]
         assert wans[0]["key"] == "wan"
         assert wans[0]["connected"] is True
+
+    @pytest.mark.asyncio
+    async def test_wans_reused_for_bounded_polls_then_dropped(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """A failing legacy call keeps the last WAN links for a few polls."""
+        # Real models dump a fresh dict per poll; the shared fixture dict
+        # would otherwise carry reused WAN links into later polls.
+        for model in coordinator.network_client.devices.get_all.return_value:
+            dumped = model.model_dump.return_value
+            model.model_dump = MagicMock(
+                side_effect=lambda *_a, d=dumped, **_k: dict(d)
+            )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "last_wan_status": {"WAN": "online"},
+                }
+            ]
+        )
+        result = await coordinator._async_update_data()
+        good = result["devices"]["default"]["device1"]["wans"]
+
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        for _ in range(MAX_STATS_REUSE_POLLS):
+            result = await coordinator._async_update_data()
+            assert result["devices"]["default"]["device1"]["wans"] == good
+
+        result = await coordinator._async_update_data()
+        assert "wans" not in result["devices"]["default"]["device1"]
+
+        # A success resets the failure count.
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[]
+        )
+        await coordinator._async_update_data()
+        assert coordinator._legacy_wan_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_legacy_wan_failures_dropped_for_sites_no_longer_polled(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """The WAN failure count of a site that is no longer polled is purged."""
+        coordinator._legacy_wan_failures["gone"] = 1
+
+        await coordinator._async_update_data()
+
+        assert "gone" not in coordinator._legacy_wan_failures
 
     def test_merge_legacy_port_data_includes_poe_good(
         self, coordinator: UnifiDeviceCoordinator

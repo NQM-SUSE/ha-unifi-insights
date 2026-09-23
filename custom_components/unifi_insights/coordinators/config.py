@@ -363,10 +363,12 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             # Resolve classic site names so we can enrich WiFi data with secrets
             # and per-SSID client counts that the official API does not expose.
             legacy_site_names: dict[str, str] = {}
+            legacy_mapping_failed = False
             try:
                 legacy_sites = await self.network_client.sites.get_legacy_all()
                 legacy_site_names = self._map_legacy_site_names(sites, legacy_sites)
             except Exception as err:
+                legacy_mapping_failed = True
                 _LOGGER.debug(
                     "Config coordinator: Unable to fetch legacy site mapping: %s",
                     err,
@@ -564,6 +566,11 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                         site_vpns_by_site[site_id] = self.data.get("site_vpns", {}).get(
                             site_id, {}
                         )
+                elif legacy_mapping_failed:
+                    # Same reason: the tunnels were not re-read, not deleted.
+                    site_vpns_by_site[site_id] = self.data.get("site_vpns", {}).get(
+                        site_id, {}
+                    )
                 else:
                     site_vpns_by_site[site_id] = {}
 

@@ -11,8 +11,8 @@ from custom_components.unifi_insights.binary_sensor import (
     UnifiInsightsBinarySensor,
     UnifiPortBinarySensor,
     UnifiProtectBinarySensor,
-    UnifiSiteToSiteVpnBinarySensor,
-    UnifiWanLinkBinarySensor,
+    UnifiInsightsSiteToSiteVpnBinarySensor,
+    UnifiInsightsWanLinkBinarySensor,
     _get_supported_smart_detect_types,
     _is_doorbell_camera,
     _is_smart_detect_active,
@@ -752,7 +752,7 @@ class TestWanLinkBinarySensor:
         wan = {
             e._wan_key: e
             for e in added_entities
-            if isinstance(e, UnifiWanLinkBinarySensor)
+            if isinstance(e, UnifiInsightsWanLinkBinarySensor)
         }
         assert set(wan) == {"wan", "wan2"}
         assert wan["wan"].unique_id == "site1_gw_wan_link_wan"
@@ -782,7 +782,7 @@ class TestWanLinkBinarySensor:
         listener()
 
         wan_sensors = [
-            e for e in added_entities if isinstance(e, UnifiWanLinkBinarySensor)
+            e for e in added_entities if isinstance(e, UnifiInsightsWanLinkBinarySensor)
         ]
         assert len(wan_sensors) == 2
 
@@ -790,7 +790,7 @@ class TestWanLinkBinarySensor:
         self, hass: HomeAssistant, mock_coordinator
     ):
         """A WAN missing from the latest data reports unknown, not off."""
-        sensor = UnifiWanLinkBinarySensor(
+        sensor = UnifiInsightsWanLinkBinarySensor(
             coordinator=mock_coordinator,
             site_id="site1",
             device_id="gw",
@@ -827,7 +827,7 @@ class TestWanLinkBinarySensor:
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
         wan_sensors = [
-            e for e in added_entities if isinstance(e, UnifiWanLinkBinarySensor)
+            e for e in added_entities if isinstance(e, UnifiInsightsWanLinkBinarySensor)
         ]
         assert [(e._device_id, e._wan_key) for e in wan_sensors] == [("gw", "wan")]
 
@@ -909,7 +909,9 @@ class TestSiteToSiteVpnBinarySensor:
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
         return [
-            e for e in added_entities if isinstance(e, UnifiSiteToSiteVpnBinarySensor)
+            e
+            for e in added_entities
+            if isinstance(e, UnifiInsightsSiteToSiteVpnBinarySensor)
         ]
 
     async def test_one_sensor_per_enabled_tunnel_on_the_gateway(

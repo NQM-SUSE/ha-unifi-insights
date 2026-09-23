@@ -104,6 +104,9 @@ class VpnClientsEndpoint:
         Returns:
             Dicts with ``network_id``, ``type`` and ``status``.
 
+        Raises:
+            UniFiResponseError: If the response has no ``connections`` list.
+
         """
         path = self._client.build_legacy_v2_api_path(
             site_name, ENDPOINT_VPN_CONNECTIONS
@@ -113,7 +116,10 @@ class VpnClientsEndpoint:
             response.get("connections") if isinstance(response, dict) else None
         )
         if not isinstance(connections, list):
-            return []
+            # An unreadable payload must not read as "no VPN connected",
+            # which would report every tunnel as disconnected.
+            msg = "Unexpected VPN connections response"
+            raise UniFiResponseError(msg, status_code=200)
         return [
             {
                 "network_id": connection["network_id"],

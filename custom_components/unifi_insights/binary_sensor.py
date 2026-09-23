@@ -431,7 +431,7 @@ async def async_setup_entry(
                                 continue
                             known_sensor_keys.add(wan_key)
                             entities.append(
-                                UnifiWanLinkBinarySensor(
+                                UnifiInsightsWanLinkBinarySensor(
                                     coordinator=coordinator,
                                     site_id=site_id,
                                     device_id=device_id,
@@ -460,7 +460,7 @@ async def async_setup_entry(
                                 continue
                             known_sensor_keys.add(vpn_key)
                             entities.append(
-                                UnifiSiteToSiteVpnBinarySensor(
+                                UnifiInsightsSiteToSiteVpnBinarySensor(
                                     coordinator=coordinator,
                                     site_id=site_id,
                                     device_id=device_id,
@@ -759,7 +759,7 @@ class UnifiPortBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
         return attrs or None
 
 
-class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
+class UnifiInsightsWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
     """Connectivity of one gateway WAN connection (DHCP, static or PPPoE)."""
 
     def __init__(
@@ -811,7 +811,7 @@ class UnifiWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
         return {key: wan.get(key) for key in ("status", "alive", "ip")}
 
 
-class UnifiSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
+class UnifiInsightsSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
     """
     Connection state of one site-to-site VPN tunnel, shown on the gateway.
 

@@ -242,9 +242,7 @@ async def test_get_legacy_all_sites_returns_raw_site_dicts() -> None:
             },
             [{"network_id": "tun1", "type": "ipsec-vpn", "status": "CONNECTED"}],
         ),
-        ({"connections": {}}, []),
-        ([], []),
-        (None, []),
+        ({"connections": []}, []),
     ],
 )
 async def test_list_vpn_connections_keeps_identity_and_status_only(
@@ -264,6 +262,22 @@ async def test_list_vpn_connections_keeps_identity_and_status_only(
     client._get.assert_awaited_once_with(
         "/proxy/network/v2/api/site/default/vpn/connections"
     )
+
+
+@pytest.mark.parametrize("response", [{"connections": {}}, {"data": []}, [], None])
+async def test_list_vpn_connections_raises_on_unexpected_payload(
+    response: Any,
+) -> None:
+    """An unreadable payload raises rather than reading as "none connected"."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    client._get = AsyncMock(return_value=response)
+
+    with pytest.raises(UniFiResponseError):
+        await client.vpn_clients.list_vpn_connections("default")
 
 
 async def test_list_site_to_site_vpns_filters_site_vpn_entries() -> None:

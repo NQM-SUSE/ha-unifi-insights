@@ -160,6 +160,8 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         self._reused_stats: set[str] = set()
         # Consecutive polls each site's VPN connections call has failed for.
         self._vpn_connection_failures: dict[str, int] = {}
+        # Consecutive polls each site's legacy device call has failed for.
+        self._legacy_wan_failures: dict[str, int] = {}
         self.data: dict[str, Any] = {
             "devices": {},
             "clients": {},
@@ -504,6 +506,26 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             return previous
         return None
 
+    def _reuse_previous_wans(self, site_id: str, devices: list[dict[str, Any]]) -> None:
+        """
+        Carry each device's last WAN links over a failed legacy fetch.
+
+        WAN links only come from the legacy device call, so one failed call
+        would otherwise flip every WAN Connection sensor on -> unknown -> on.
+        Like VPN connections, the reuse is bounded so a call that keeps
+        failing cannot hold a stale state forever.
+        """
+        failures = self._legacy_wan_failures.get(site_id, 0) + 1
+        self._legacy_wan_failures[site_id] = failures
+        if failures > MAX_STATS_REUSE_POLLS:
+            return
+        previous_devices = self.data["devices"].get(site_id, {})
+        for device in devices:
+            previous = previous_devices.get(device.get("id", ""))
+            wans = previous.get("wans") if isinstance(previous, dict) else None
+            if isinstance(wans, list):
+                device["wans"] = wans
+
     async def _fetch_vpn_connections(
         self, site_id: str, legacy_site_name: str | None
     ) -> dict[str, dict[str, Any]] | None:
@@ -810,6 +832,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
         legacy_devices: list[dict[str, Any]] = []
         legacy_as_primary = False
+        legacy_failed = False
         if legacy_site_name is not None:
             try:
                 legacy_devices = (
@@ -830,6 +853,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                     # refresh fails and the previous device state is kept,
                     # rather than wiping the device registry with empty data.
                     raise v1_devices_error from err
+                legacy_failed = True
 
         # When v1 devices failed with 5xx, use legacy devices as the primary
         # device list, mapped to v1-shaped dicts.
@@ -878,6 +902,11 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 # The legacy-to-v1 mapping does not carry WAN links, so they
                 # are merged whichever source is primary.
                 self._merge_legacy_wan_data(device, legacy_devices_by_mac)
+
+        if legacy_failed:
+            self._reuse_previous_wans(site_id, devices)
+        else:
+            self._legacy_wan_failures.pop(site_id, None)
 
         _LOGGER.debug(
             "Device coordinator: Site %s - Found %d devices and %d clients",
@@ -940,6 +969,11 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             self._vpn_connection_failures = {
                 site_id: count
                 for site_id, count in self._vpn_connection_failures.items()
+                if site_id in site_ids
+            }
+            self._legacy_wan_failures = {
+                site_id: count
+                for site_id, count in self._legacy_wan_failures.items()
                 if site_id in site_ids
             }
 
