@@ -16,8 +16,8 @@ from custom_components.unifi_insights.api import (
     UniFiTimeoutError,
 )
 from custom_components.unifi_insights.const import CONF_SITE_IDS, SCAN_INTERVAL_CONFIG
+from custom_components.unifi_insights.topology_contract import normalize_mac
 
-from ..topology_contract import normalize_mac
 from .base import UnifiBaseCoordinator
 
 if TYPE_CHECKING:
@@ -298,10 +298,15 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 mac = normalize_mac(client.get(key))
                 if mac is not None:
                     link[key] = mac
-            for key in ("sw_port", "vlan"):
-                value = client.get(key)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    link[key] = value
+            sw_port = client.get("sw_port")
+            if isinstance(sw_port, int) and not isinstance(sw_port, bool):
+                link["sw_port"] = sw_port
+            # VLAN 0 is an 802.1Q priority tag, not a real VLAN; untagged
+            # (the default network) reports no vlan key at all on real
+            # hardware, so only a VLAN id of 1 or higher is kept.
+            vlan = client.get("vlan")
+            if isinstance(vlan, int) and not isinstance(vlan, bool) and vlan >= 1:
+                link["vlan"] = vlan
             network_name = client.get("network")
             if isinstance(network_name, str) and network_name:
                 link["network_name"] = network_name
@@ -374,6 +379,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 self.data["vpn_clients"] = {}
                 self.data["site_vpns"] = {}
                 self.data["network_info"] = {}
+                self.data["client_links"] = {}
                 self._available = True
                 self.data["last_update"] = datetime.now(tz=UTC)
                 return self.data

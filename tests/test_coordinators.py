@@ -7,7 +7,7 @@ import copy
 import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
@@ -1162,6 +1162,14 @@ class TestUnifiConfigCoordinator:
                     "ap_mac": "02:00:00:00:00:08",
                     "network": "Default",
                 },
+                {
+                    "mac": "aa:bb:cc:00:00:03",
+                    "is_wired": True,
+                    "sw_mac": "28:70:4e:00:00:01",
+                    "sw_port": 5,
+                    "vlan": 0,
+                    "network": "Default",
+                },
                 {"mac": "not-a-mac"},
                 "garbage",
             ]
@@ -1176,6 +1184,11 @@ class TestUnifiConfigCoordinator:
             },
             "12:00:00:00:00:02": {
                 "ap_mac": "02:00:00:00:00:08",
+                "network_name": "Default",
+            },
+            "aa:bb:cc:00:00:03": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 5,
                 "network_name": "Default",
             },
         }
@@ -1203,9 +1216,12 @@ class TestUnifiConfigCoordinator:
             "8c:ed:e1:00:00:01": {"sw_mac": "28:70:4e:00:00:01", "sw_port": 3}
         }
         # The fixture polls two sites, so this call also runs for "site2";
-        # assert_any_await pins the one call this test cares about without
-        # over-specifying total call count, which is incidental here.
-        client.clients.get_active_legacy.assert_any_await("default")
+        # count the "default" calls specifically to pin the spec's "one
+        # /stat/sta call per site" invariant without over-specifying the
+        # total call count across sites, which is incidental here.
+        assert (
+            client.clients.get_active_legacy.await_args_list.count(call("default")) == 1
+        )
 
     @pytest.mark.asyncio
     async def test_async_update_data_keeps_client_links_on_failure(
@@ -1240,9 +1256,28 @@ class TestUnifiConfigCoordinator:
 
         assert result["wifi"]["default"]["wifi1"]["num_connected_clients"] == 1
         # The fixture polls two sites, so this call also runs for "site2";
-        # assert_any_await pins the one call this test cares about without
-        # over-specifying total call count, which is incidental here.
-        client.clients.get_active_legacy.assert_any_await("default")
+        # count the "default" calls specifically to pin the spec's "one
+        # /stat/sta call per site" invariant without over-specifying the
+        # total call count across sites, which is incidental here.
+        assert (
+            client.clients.get_active_legacy.await_args_list.count(call("default")) == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_clears_client_links_with_no_sites(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """The no-sites early return blanks client_links like its siblings."""
+        coordinator.data["client_links"] = {
+            "default": {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+        }
+        coordinator.network_client.sites.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("Not found", status_code=404)
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"] == {}
 
 
 # ============================================================================
