@@ -166,6 +166,7 @@ def ws_topology_get(
 
 
 ISSUE_ENTRY_UNLOADED = "entry_unloaded"
+ISSUE_SITE_UNAVAILABLE = "site_unavailable"
 
 # hass.data key: entry_id -> callbacks to run when that entry unloads.
 _UNLOAD_WATCHERS = f"{DOMAIN}_topology_unload_watchers"
@@ -239,13 +240,20 @@ def ws_topology_subscribe(
 
     @callback
     def _async_forward() -> None:
-        nonlocal last_revision
+        nonlocal last_revision, site_name
         try:
             update = _build_snapshot(hass, entry, site_id, max_clients)
         except _RequestError:
-            # The site was deselected; the options change reloads the entry,
-            # which ends this subscription through _async_entry_unloaded.
-            return
+            # The site left the selection without an entry reload: it was
+            # deleted on the console, or the Network API went away and the
+            # config coordinator dropped its sites. Report that once (the
+            # revision dedupes repeats) and keep listening, so the stream
+            # recovers on its own when the site comes back. Deselecting the
+            # site in the options reloads the entry instead, which ends the
+            # stream through _async_entry_unloaded.
+            update = build_unavailable_topology(
+                entry.entry_id, site_id, site_name, ISSUE_SITE_UNAVAILABLE
+            )
         except Exception:
             # Never let a builder bug escape: this runs inside the
             # coordinator's listener loop, and raising would stop every
@@ -255,6 +263,7 @@ def ws_topology_subscribe(
         if update["revision"] == last_revision:
             return
         last_revision = update["revision"]
+        site_name = update["site_name"]
         connection.send_message(websocket_api.event_message(msg_id, update))
 
     remove_listener = entry.runtime_data.coordinator.async_add_listener(_async_forward)

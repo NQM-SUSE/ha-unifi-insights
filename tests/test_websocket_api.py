@@ -276,6 +276,45 @@ async def test_subscribe_pushes_only_on_change(
     assert names["dev:uuid-ap"] == "Hallway AP"
 
 
+async def test_subscribe_site_vanishes_then_recovers(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A site dropped without a reload is reported once, and the stream recovers."""
+    _seed(init_integration)
+    runtime = init_integration.runtime_data
+    facade = runtime.coordinator
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+    initial = await _subscribe(client, init_integration)
+
+    # The site disappears from the selection without an entry reload (deleted
+    # on the console, or the Network API went away).
+    sites = runtime.config_coordinator.data["sites"]
+    runtime.config_coordinator.data["sites"] = {
+        site_id: site for site_id, site in sites.items() if site_id != SITE
+    }
+    facade.async_update_listeners()
+    gone = await client.receive_json()
+    assert gone["type"] == "event"
+    assert gone["event"]["status"] == "unavailable"
+    assert gone["event"]["issues"] == [
+        {"code": "site_unavailable", "severity": "error"}
+    ]
+    assert gone["event"]["site_name"] == "Home"
+    assert gone["event"]["nodes"] == []
+
+    facade.async_update_listeners()
+    await _assert_no_event(client, 60)
+
+    runtime.config_coordinator.data["sites"] = sites
+    facade.async_update_listeners()
+    back = await client.receive_json()
+    assert back["type"] == "event"
+    assert back["event"]["status"] == "ok"
+    assert back["event"]["revision"] == initial["revision"]
+
+
 async def test_subscribe_errors_use_get_codes(
     hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
 ) -> None:
