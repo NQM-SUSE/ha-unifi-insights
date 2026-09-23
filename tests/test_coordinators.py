@@ -2533,6 +2533,157 @@ class TestUnifiDeviceCoordinator:
         assert len(ports) == 1
         assert ports[0]["port_idx"] == 1
 
+    def test_legacy_topology_block_reads_uplink(self):
+        """The parent link and legacy type are copied from /stat/device."""
+        block = UnifiDeviceCoordinator._legacy_topology_block(
+            {
+                "mac": "58:d6:1f:00:00:02",
+                "type": "USW",
+                "uplink": {
+                    "uplink_mac": "28:70:4E:00:00:01",
+                    "uplink_remote_port": 6,
+                    "port_idx": 8,
+                    "type": "wire",
+                    "speed": 1000,
+                    "ip": "10.1.0.105",
+                    "mac": "58:d6:1f:00:00:02",
+                },
+            }
+        )
+
+        assert block == {
+            "legacy_type": "usw",
+            "uplink_mac": "28:70:4e:00:00:01",
+            "uplink_remote_port": 6,
+            "uplink_port_idx": 8,
+            "uplink_type": "wire",
+            "uplink_speed": 1000,
+        }
+
+    def test_legacy_topology_block_falls_back_to_last_uplink(self):
+        """An offline device keeps its parent through last_uplink."""
+        block = UnifiDeviceCoordinator._legacy_topology_block(
+            {
+                "type": "uap",
+                "uplink": {"type": "wire"},
+                "last_uplink": {
+                    "uplink_mac": "28:70:4e:00:00:01",
+                    "uplink_remote_port": 20,
+                    "port_idx": 1,
+                    "type": "wire",
+                },
+            }
+        )
+
+        assert block["uplink_mac"] == "28:70:4e:00:00:01"
+        assert block["uplink_remote_port"] == 20
+        assert block["uplink_port_idx"] == 1
+
+    def test_legacy_topology_block_gateway_and_garbage(self):
+        """A gateway has a type but no parent; malformed values are dropped."""
+        assert UnifiDeviceCoordinator._legacy_topology_block(
+            {"type": "udm", "uplink": {"type": "wire", "speed": 2500}}
+        ) == {"legacy_type": "udm", "uplink_type": "wire", "uplink_speed": 2500}
+        assert (
+            UnifiDeviceCoordinator._legacy_topology_block(
+                {
+                    "type": "",
+                    "uplink": {
+                        "uplink_mac": 5,
+                        "uplink_remote_port": True,
+                        "speed": "fast",
+                    },
+                }
+            )
+            == {}
+        )
+
+    def test_merge_legacy_uplink_data_matches_by_mac(self):
+        """The block lands on the v1 device whose MAC matches, case-insensitively."""
+        device = {"id": "uuid-child", "macAddress": "58:D6:1F:00:00:02", "uplink": None}
+        legacy = {
+            "mac": "58:d6:1f:00:00:02",
+            "type": "usw",
+            "uplink": {"uplink_mac": "28:70:4e:00:00:01", "uplink_remote_port": 6},
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_uplink_data(
+            device, {"58:d6:1f:00:00:02": legacy}
+        )
+
+        assert device["topology"]["uplink_mac"] == "28:70:4e:00:00:01"
+        # The v1 field is left alone.
+        assert device["uplink"] is None
+
+    def test_merge_legacy_uplink_data_without_match_is_noop(self):
+        """No legacy record, or an empty block, adds nothing."""
+        device = {"id": "uuid-x", "macAddress": "aa:bb:cc:dd:ee:ff"}
+        UnifiDeviceCoordinator._merge_legacy_uplink_data(device, {})
+        UnifiDeviceCoordinator._merge_legacy_uplink_data(
+            device, {"aa:bb:cc:dd:ee:ff": {"mac": "aa:bb:cc:dd:ee:ff"}}
+        )
+        assert "topology" not in device
+
+    def test_legacy_device_to_v1_dict_carries_topology(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """The legacy-only fallback produces the same block as the merge path."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "_id": "60a1b2c3d4e5f67890123456",
+                "mac": "58:d6:1f:00:00:02",
+                "type": "usw",
+                "uplink": {"uplink_mac": "28:70:4e:00:00:01", "port_idx": 8},
+            }
+        )
+
+        assert mapped["topology"] == {
+            "legacy_type": "usw",
+            "uplink_mac": "28:70:4e:00:00:01",
+            "uplink_port_idx": 8,
+        }
+
+    @pytest.mark.asyncio
+    async def test_process_site_merges_legacy_uplink(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """The real refresh path attaches the block to v1 devices."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            return_value=[
+                {
+                    "id": "uuid-child",
+                    "name": "Ultra",
+                    "model": "USW Ultra",
+                    "macAddress": "58:d6:1f:00:00:02",
+                    "state": "ONLINE",
+                    "uplink": None,
+                }
+            ]
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "legacy-child",
+                    "mac": "58:d6:1f:00:00:02",
+                    "type": "usw",
+                    "uplink": {
+                        "uplink_mac": "28:70:4e:00:00:01",
+                        "uplink_remote_port": 6,
+                    },
+                }
+            ]
+        )
+
+        devices_dict, _stats, _clients = await coordinator._process_site(
+            "default", legacy_site_name="default"
+        )
+
+        assert devices_dict["uuid-child"]["topology"] == {
+            "legacy_type": "usw",
+            "uplink_mac": "28:70:4e:00:00:01",
+            "uplink_remote_port": 6,
+        }
+
 
 # ============================================================================
 # UnifiProtectCoordinator Tests

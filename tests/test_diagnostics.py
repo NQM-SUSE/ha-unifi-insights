@@ -462,3 +462,36 @@ async def test_diagnostics_keeps_malformed_mac_values_distinct(
     for value in (first["macAddress"], first["apMac"]):
         assert value.startswith("**REDACTED-MAC-")
     assert "not-a-mac" not in _strings(diagnostics)
+
+
+async def test_diagnostics_placeholders_topology_uplink_mac(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """The copied legacy parent MAC is placeholdered like every other MAC."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["devices"] = {
+        "site-1": {
+            "uuid-child": {
+                "name": "Ultra",
+                "macAddress": "58:d6:1f:00:00:02",
+                "topology": {
+                    "legacy_type": "usw",
+                    "uplink_mac": "28:70:4e:00:00:01",
+                    "uplink_remote_port": 6,
+                },
+            },
+            "uuid-parent": {"name": "Core", "macAddress": "28:70:4e:00:00:01"},
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    devices = diagnostics["data"]["devices"]["site-1"]
+    uplink_mac = devices["uuid-child"]["topology"]["uplink_mac"]
+
+    assert uplink_mac.startswith("**REDACTED-MAC-")
+    # Same MAC, same placeholder: the parent link stays traceable.
+    assert uplink_mac == devices["uuid-parent"]["macAddress"]
+    assert devices["uuid-child"]["topology"]["uplink_remote_port"] == 6
+    assert "28:70:4e:00:00:01" not in _strings(diagnostics)
