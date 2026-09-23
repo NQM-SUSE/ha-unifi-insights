@@ -9,6 +9,7 @@ from scoping every request to one loaded entry and one selected site.
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
@@ -26,6 +27,8 @@ from .topology import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.core import HomeAssistant
 
     from . import UnifiInsightsConfigEntry
@@ -164,6 +167,41 @@ def ws_topology_get(
 
 ISSUE_ENTRY_UNLOADED = "entry_unloaded"
 
+# hass.data key: entry_id -> callbacks to run when that entry unloads.
+_UNLOAD_WATCHERS = f"{DOMAIN}_topology_unload_watchers"
+
+
+@callback
+def _async_watch_unload(
+    hass: HomeAssistant,
+    entry: UnifiInsightsConfigEntry,
+    watcher: Callable[[], None],
+) -> Callable[[], None]:
+    """
+    Call watcher when the entry unloads and return a callback that cancels it.
+
+    ConfigEntry.async_on_unload has no remover, so registering one hook per
+    subscription would leave a dead closure on the entry for every
+    subscribe/unsubscribe cycle. Instead each loaded entry gets a single
+    hook that drains a watcher set; subscriptions add and discard themselves.
+    Unloading pops the set, so a reloaded entry gets a fresh hook.
+    """
+    watchers: dict[str, set[Callable[[], None]]] = hass.data.setdefault(
+        _UNLOAD_WATCHERS, {}
+    )
+    entry_watchers = watchers.get(entry.entry_id)
+    if entry_watchers is None:
+        entry_watchers = watchers[entry.entry_id] = set()
+
+        @callback
+        def _async_notify() -> None:
+            for pending in list(watchers.pop(entry.entry_id, ())):
+                pending()
+
+        entry.async_on_unload(_async_notify)
+    entry_watchers.add(watcher)
+    return partial(entry_watchers.discard, watcher)
+
 
 @websocket_api.websocket_command(
     {vol.Required("type"): "unifi_insights/topology/subscribe", **_SNAPSHOT_SCHEMA}
@@ -181,7 +219,9 @@ def ws_topology_subscribe(
     own, so a subscription adds no API traffic. It is removed when the client
     unsubscribes, when the connection closes, or when the entry unloads -
     whichever comes first; the removal is idempotent because Home Assistant's
-    remove-listener callback raises if called twice.
+    remove-listener callback raises if called twice. Unload is observed via
+    one shared hook per entry (_async_watch_unload), and unsubscribing stops
+    watching, so repeated subscriptions leave nothing behind on the entry.
     """
     msg_id: int = msg["id"]
     site_id: str = msg["site_id"]
@@ -226,6 +266,7 @@ def ws_topology_subscribe(
             return
         removed = True
         remove_listener()
+        stop_watching()
 
     @callback
     def _async_entry_unloaded() -> None:
@@ -242,7 +283,7 @@ def ws_topology_subscribe(
             )
         )
 
+    stop_watching = _async_watch_unload(hass, entry, _async_entry_unloaded)
     connection.subscriptions[msg_id] = _async_unsubscribe
-    entry.async_on_unload(_async_entry_unloaded)
     connection.send_result(msg_id)
     connection.send_message(websocket_api.event_message(msg_id, snapshot))

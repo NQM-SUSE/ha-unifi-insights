@@ -332,7 +332,10 @@ async def test_subscribe_entry_unload_sends_final_snapshot(
 
 
 async def test_subscribe_unload_then_close_is_safe(
-    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    caplog,
 ) -> None:
     """Unload followed by connection close never removes the listener twice."""
     _seed(init_integration)
@@ -343,8 +346,15 @@ async def test_subscribe_unload_then_close_is_safe(
     await hass.async_block_till_done()
     await client.receive_json()  # final unavailable snapshot
 
-    await client.close()
-    await hass.async_block_till_done()  # raises if remove_listener ran twice
+    # A second remove_listener() raises KeyError, but ActiveConnection's close
+    # handler catches every unsubscribe error and only logs it - so the proof
+    # that nothing ran twice is the absence of an ERROR record, not a raise.
+    with caplog.at_level(logging.ERROR):
+        await client.close()
+        await hass.async_block_till_done()
+
+    errors = [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+    assert not errors, [rec.getMessage() for rec in errors]
 
 
 async def test_subscribe_close_then_unload_is_safe(
@@ -361,6 +371,29 @@ async def test_subscribe_close_then_unload_is_safe(
     await hass.async_block_till_done()
 
     assert init_integration.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_subscribe_cycles_share_one_unload_hook(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Repeated subscribe/unsubscribe adds at most one unload hook per entry."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+    # _on_unload is private, but async_on_unload returns no remover, so the
+    # hook list itself is the only place a per-subscription leak would show.
+    hooks_before = len(init_integration._on_unload or [])
+
+    for cycle in range(3):
+        sub_id = 10 + cycle * 2
+        await _subscribe(client, init_integration, msg_id=sub_id)
+        await client.send_json(
+            {"id": sub_id + 1, "type": "unsubscribe_events", "subscription": sub_id}
+        )
+        assert (await client.receive_json())["success"]
+
+    assert len(init_integration._on_unload or []) <= hooks_before + 1
+    watchers = hass.data[f"{DOMAIN}_topology_unload_watchers"]
+    assert not watchers[init_integration.entry_id]
 
 
 async def test_subscribe_builder_error_does_not_break_listeners(
