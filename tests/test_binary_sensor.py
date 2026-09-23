@@ -805,6 +805,32 @@ class TestWanLinkBinarySensor:
         mock_coordinator.data["devices"]["site1"]["gw"]["wans"] = None
         assert sensor.is_on is None
 
+        mock_coordinator.data["devices"]["site1"]["gw"]["wans"] = [{"key": "wan2"}]
+        assert sensor.is_on is None
+
+    async def test_setup_entry_skips_malformed_wans(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """Malformed WAN entries or a non-list WAN field create no sensors."""
+        gw = mock_coordinator.data["devices"]["site1"]["gw"]
+        gw["wans"] = ["wan", {"name": "No key"}, {"key": "wan", "name": "WAN"}]
+        mock_coordinator.data["devices"]["site1"]["gw_other"] = {
+            **gw,
+            "id": "gw_other",
+            "wans": {"wan": {"status": "online"}},
+        }
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        wan_sensors = [
+            e for e in added_entities if isinstance(e, UnifiWanLinkBinarySensor)
+        ]
+        assert [(e._device_id, e._wan_key) for e in wan_sensors] == [("gw", "wan")]
+
 
 class TestSiteToSiteVpnBinarySensor:
     """Tests for the per-tunnel site-to-site VPN binary sensor."""

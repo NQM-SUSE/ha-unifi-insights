@@ -841,6 +841,18 @@ class TestUnifiConfigCoordinator:
         assert coordinator._available is True
 
     @pytest.mark.asyncio
+    async def test_async_update_data_site_to_site_vpns_auth_error(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """An auth error on the tunnel fetch triggers reauth, not last-known."""
+        coordinator.network_client.vpn_clients.list_site_to_site_vpns = AsyncMock(
+            side_effect=UniFiAuthenticationError("Invalid API key")
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+    @pytest.mark.asyncio
     async def test_async_update_data_vpn_clients_auth_error(
         self, coordinator: UnifiConfigCoordinator
     ) -> None:
