@@ -52,6 +52,7 @@ from .probe import (
     async_probe_protect,
 )
 from .services import async_setup_services
+from .websocket_api import async_register_websocket_commands
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -115,6 +116,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # noqa: ARG00
     # validatable) even when no config entry is loaded (Quality Scale:
     # action-setup).
     await async_setup_services(hass)
+    # The topology WebSocket commands, like service actions, are registered
+    # once per Home Assistant instance, not once per config entry.
+    async_register_websocket_commands(hass)
     return True
 
 
