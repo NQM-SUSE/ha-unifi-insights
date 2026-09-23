@@ -43,6 +43,8 @@ class TopologyNode(TypedDict):
     model: NotRequired[str]
     ha_device_id: NotRequired[str]
     connection: NotRequired[ClientConnection]
+    vlan_id: NotRequired[int]
+    network_name: NotRequired[str]
 
 
 class TopologyEdge(TypedDict):
