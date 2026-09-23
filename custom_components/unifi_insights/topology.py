@@ -18,6 +18,11 @@ Relationship sources, verified against real hardware:
 The coordinator only holds clients the controller currently reports, so
 offline clients never appear in the graph.
 
+The legacy ``/stat/device`` poll is best-effort: when one poll fails, devices
+carry no ``topology`` block for that cycle and the snapshot reports
+``legacy_uplink_missing`` (a flat graph); the next successful poll restores
+the tree.
+
 The snapshot is an allowlisted contract for the frontend: MAC addresses, IP
 addresses, hostnames, firmware and traffic counters are never emitted, and
 MAC-shaped identifiers are replaced by opaque hashes.
@@ -92,7 +97,14 @@ class TopologyTruncation(TypedDict):
 
 
 class SiteTopology(TypedDict):
-    """One site's topology snapshot (contract version 1)."""
+    """
+    One site's topology snapshot (contract version 1).
+
+    ``status: "unavailable"`` comes in two shapes. With the
+    ``devices_unavailable`` issue the nodes and edges are the last-known data
+    (the device coordinator keeps its previous data when a poll fails). With
+    ``entry_unloaded`` or ``site_unavailable`` they are empty.
+    """
 
     schema_version: int
     entry_id: str
