@@ -13,6 +13,7 @@ integration imports), so ``coordinators/config.py`` can use
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict
 
@@ -126,12 +127,19 @@ def normalize_mac(value: Any) -> str | None:
     return ":".join(digits[index : index + 2] for index in range(0, 12, 2))
 
 
-def opaque_node_id(prefix: str, entry_id: str, raw_id: str) -> str:
-    """Return a node id that never exposes a MAC address."""
+def opaque_node_id(prefix: str, key: bytes, raw_id: str) -> str:
+    """
+    Return a node id that never exposes a MAC address.
+
+    MAC-shaped ids are keyed with a per-entry secret (HMAC-SHA-256): the MAC
+    space is small enough to enumerate, especially per vendor prefix, so an
+    unkeyed hash of a public value plus the MAC could be reversed by anyone
+    who receives the snapshot. Other ids (v1 UUIDs) pass through unchanged.
+    """
     mac = normalize_mac(raw_id)
     if mac is None:
         return f"{prefix}:{raw_id}"
-    digest = hashlib.sha256(f"{entry_id}:{mac}".encode()).hexdigest()[:16]
+    digest = hmac.new(key, mac.encode(), hashlib.sha256).hexdigest()[:16]
     return f"{prefix}:h{digest}"
 
 

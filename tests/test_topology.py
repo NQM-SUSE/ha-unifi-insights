@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import random
 
@@ -21,6 +23,7 @@ from custom_components.unifi_insights.topology_contract import (
 )
 
 ENTRY = "entry-1"
+KEY = bytes(range(32))
 SITE = "site-1"
 
 
@@ -46,15 +49,29 @@ def test_normalize_mac(value, expected) -> None:
 
 def test_opaque_node_id_keeps_uuid_and_hashes_mac() -> None:
     """UUIDs pass through; MAC-shaped ids never appear in the node id."""
-    assert opaque_node_id("dev", ENTRY, "uuid-1") == "dev:uuid-1"
-    assert opaque_node_id("cli", ENTRY, "uuid-9") == "cli:uuid-9"
-    hashed = opaque_node_id("dev", ENTRY, "AA:BB:CC:DD:EE:FF")
+    assert opaque_node_id("dev", KEY, "uuid-1") == "dev:uuid-1"
+    assert opaque_node_id("cli", KEY, "uuid-9") == "cli:uuid-9"
+    hashed = opaque_node_id("dev", KEY, "AA:BB:CC:DD:EE:FF")
     assert hashed.startswith("dev:h")
     assert len(hashed) == len("dev:h") + 16
     assert "aa:bb" not in hashed.lower()
-    # Stable across spellings of the same MAC, scoped per entry.
-    assert hashed == opaque_node_id("dev", ENTRY, "aabbccddeeff")
-    assert hashed != opaque_node_id("dev", "entry-2", "aabbccddeeff")
+    # Stable across spellings of the same MAC, scoped per key.
+    assert hashed == opaque_node_id("dev", KEY, "aabbccddeeff")
+    assert hashed != opaque_node_id("dev", bytes(32), "aabbccddeeff")
+
+
+def test_opaque_node_id_is_keyed() -> None:
+    """
+    A MAC id is an HMAC under the entry key, not a hash of public inputs.
+
+    The MAC space is small enough to enumerate, so an unkeyed digest of the
+    public entry id plus the MAC could be reversed by any snapshot recipient.
+    """
+    mac = "aa:bb:cc:dd:ee:ff"
+    digest = hmac.new(KEY, mac.encode(), hashlib.sha256).hexdigest()[:16]
+    assert opaque_node_id("cli", KEY, mac) == f"cli:h{digest}"
+    unkeyed = hashlib.sha256(f"{ENTRY}:{mac}".encode()).hexdigest()[:16]
+    assert opaque_node_id("cli", KEY, mac) != f"cli:h{unkeyed}"
 
 
 @pytest.mark.parametrize(
@@ -256,6 +273,7 @@ def _live_layout() -> dict:
 
 def _build(data: dict, **kwargs):
     kwargs.setdefault("ha_device_ids", {})
+    kwargs.setdefault("node_key", KEY)
     return build_site_topology(data, ENTRY, SITE, **kwargs)
 
 
@@ -539,7 +557,7 @@ def test_mac_keyed_device_resolves_and_is_opaque() -> None:
     )
     snapshot = _build(data)
 
-    parent_node = opaque_node_id("dev", ENTRY, parent_mac)
+    parent_node = opaque_node_id("dev", KEY, parent_mac)
     assert parent_node.startswith("dev:h")
     assert _edge(snapshot, "dev:uuid-ap")["target"] == parent_node
     assert _edge(snapshot, parent_node)["target"] == "dev:uuid-gw"
@@ -659,7 +677,9 @@ def test_devices_unavailable() -> None:
     assert snapshot["status"] == "unavailable"
     assert {"code": "devices_unavailable", "severity": "error"} in snapshot["issues"]
 
-    missing = build_site_topology(_live_layout(), ENTRY, "other-site", ha_device_ids={})
+    missing = build_site_topology(
+        _live_layout(), ENTRY, "other-site", node_key=KEY, ha_device_ids={}
+    )
     assert missing["status"] == "unavailable"
     assert missing["nodes"] == []
 
@@ -676,7 +696,7 @@ def test_multi_site_isolation() -> None:
     data["clients"]["site-2"] = {}
 
     home = _build(data)
-    cabin = build_site_topology(data, ENTRY, "site-2", ha_device_ids={})
+    cabin = build_site_topology(data, ENTRY, "site-2", node_key=KEY, ha_device_ids={})
 
     assert "dev:uuid-cabin" not in {n["id"] for n in home["nodes"]}
     assert [n["id"] for n in cabin["nodes"]] == ["dev:uuid-cabin"]

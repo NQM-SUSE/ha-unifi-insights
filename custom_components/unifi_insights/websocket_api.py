@@ -23,6 +23,7 @@ from .const import DOMAIN
 from .helpers import async_get_device_entry
 from .topology import build_site_topology, build_unavailable_topology
 from .topology_contract import MAX_CLIENTS_PER_SITE, site_display_name
+from .topology_keys import async_get_node_key
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -117,6 +118,7 @@ def _build_snapshot(
         facade.data,
         entry.entry_id,
         site_id,
+        node_key=async_get_node_key(hass, entry.entry_id),
         ha_device_ids=_ha_device_ids(hass, facade.data, site_id, entry.entry_id),
         max_clients=max_clients,
         devices_available=facade.device_available,

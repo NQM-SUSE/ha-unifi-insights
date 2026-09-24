@@ -233,11 +233,17 @@ def build_site_topology(
     entry_id: str,
     site_id: str,
     *,
+    node_key: bytes,
     ha_device_ids: Mapping[str, str],
     max_clients: int = MAX_CLIENTS_PER_SITE,
     devices_available: bool = True,
 ) -> SiteTopology:
-    """Build the allowlisted topology snapshot for one site."""
+    """
+    Build the allowlisted topology snapshot for one site.
+
+    ``node_key`` is the entry's secret for opaque MAC-derived node ids; it must
+    stay the same across calls for node ids to be stable.
+    """
     devices = _site_map(data, "devices", site_id)
     clients = _site_map(data, "clients", site_id)
     nodes: list[TopologyNode] = []
@@ -250,7 +256,7 @@ def build_site_topology(
     for device_id, device in devices.items():
         if not isinstance(device, dict):
             continue
-        node_id = opaque_node_id("dev", entry_id, device_id)
+        node_id = opaque_node_id("dev", node_key, device_id)
         device_node_ids[device_id] = node_id
         devices_by_node[node_id] = device
         nodes.append(_device_node(device, device_id, node_id, ha_device_ids))
@@ -269,7 +275,7 @@ def build_site_topology(
 
     included, clients_total = _select_clients(clients, max_clients)
     for client_id, client in included:
-        node_id = opaque_node_id("cli", entry_id, client_id)
+        node_id = opaque_node_id("cli", node_key, client_id)
         nodes.append(_client_node(client, node_id))
         uplink = first_present(client, "uplinkDeviceId", "uplink_device_id")
         if not isinstance(uplink, str):
