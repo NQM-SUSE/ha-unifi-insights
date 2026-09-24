@@ -1,0 +1,54 @@
+name: Enhancement request
+description: Suggest an improvement for UniFi Insights
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement.
+        Please describe the problem, the outcome you want, and any constraints that matter.
+  - type: input
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the integration does this request affect?
+      placeholder: Sensors, config flow, services, diagnostics, and so on
+    validations:
+      required: true
+  - type: textarea
+    id: problem_statement
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve?
+      placeholder: Why is the current behavior not enough?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution
+      description: Describe the change you would like to see.
+      placeholder: What should UniFi Insights do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workarounds or other options you considered.
+      placeholder: Any other approach you have tried or ruled out.
+  - type: textarea
+    id: user_impact
+    attributes:
+      label: User impact
+      description: Who benefits from this change and how?
+      placeholder: What gets better for users?
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: Additional context or references
+      description: Add links, examples, screenshots, or API references.
+      placeholder: Related issues, docs, or screenshots.

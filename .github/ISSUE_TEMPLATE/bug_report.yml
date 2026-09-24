@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a problem with UniFi Insights
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+        Please fill out the details below so the issue can be reproduced and triaged quickly.
+  - type: input
+    id: integration_version
+    attributes:
+      label: Integration version
+      description: The version of UniFi Insights you are using.
+      placeholder: 2026.9.0
+    validations:
+      required: true
+  - type: input
+    id: home_assistant_version
+    attributes:
+      label: Home Assistant version
+      description: The Home Assistant version where the issue happens.
+      placeholder: 2026.9.1
+    validations:
+      required: true
+  - type: input
+    id: unifi_version
+    attributes:
+      label: UniFi Network or Protect version
+      description: The UniFi console, Network, or Protect version involved.
+      placeholder: Network 10.4.57
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the problem in one or two sentences.
+      placeholder: What is failing?
+    validations:
+      required: true
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+      placeholder: What should have happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual behavior
+      description: What actually happened?
+      placeholder: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Steps to reproduce
+      description: List the shortest set of steps needed to reproduce the issue.
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or errors
+      description: Paste any relevant log entries, stack traces, or screenshots.
+      render: shell
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add any other context that may help explain the issue.
+      placeholder: Links, screenshots, configuration details, or observations.
