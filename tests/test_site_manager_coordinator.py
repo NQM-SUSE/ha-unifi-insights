@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,6 +20,7 @@ from custom_components.unifi_insights.coordinators.site_manager import (
 from custom_components.unifi_insights.diagnostics import _site_manager_summary
 
 if TYPE_CHECKING:
+    import pytest
     from homeassistant.core import HomeAssistant
 
 
@@ -59,7 +61,9 @@ def _client() -> MagicMock:
     return client
 
 
-async def test_partial_failure_keeps_last_good_collection(hass: HomeAssistant) -> None:
+async def test_partial_failure_keeps_last_good_collection(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
     """A failed sites call must not erase inventory or newer ISP data."""
     client = _client()
     coordinator = UnifiInsightsSiteManagerCoordinator(hass, client)
@@ -78,12 +82,33 @@ async def test_partial_failure_keeps_last_good_collection(hass: HomeAssistant) -
 
     client.list_sites.side_effect = UniFiResponseError("temporary", status_code=502)
     client.list_hosts.return_value = [{"id": "new-host"}]
+    caplog.set_level(
+        logging.INFO,
+        logger="custom_components.unifi_insights.coordinators.site_manager",
+    )
     second = await coordinator._async_update_data()
 
     assert second["sites"] == first["sites"]
     assert second["hosts"] == {"new-host": {"id": "new-host"}}
     assert second["collections"]["sites"]["available"] is False
     assert second["collections"]["sites"]["error"] == "UniFiResponseError"
+    assert (
+        caplog.messages.count("Site Manager sites unavailable (UniFiResponseError)")
+        == 1
+    )
+    assert "temporary" not in caplog.text
+
+    coordinator.data = second
+    await coordinator._async_update_data()
+    assert (
+        caplog.messages.count("Site Manager sites unavailable (UniFiResponseError)")
+        == 1
+    )
+
+    client.list_sites.side_effect = None
+    recovered = await coordinator._async_update_data()
+    assert recovered["collections"]["sites"]["available"] is True
+    assert caplog.messages.count("Site Manager sites available again") == 1
 
 
 async def test_rate_limit_skips_requests_until_retry_after(hass: HomeAssistant) -> None:

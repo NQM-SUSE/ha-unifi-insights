@@ -60,6 +60,7 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         config_coordinator: UnifiConfigCoordinator,
         device_coordinator: UnifiDeviceCoordinator,
         protect_coordinator: UnifiProtectCoordinator | None,
+        *,
         site_manager_coordinator: UnifiInsightsSiteManagerCoordinator | None = None,
     ) -> None:
         """Initialize the facade coordinator."""

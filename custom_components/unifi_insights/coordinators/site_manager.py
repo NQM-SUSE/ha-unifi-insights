@@ -142,6 +142,12 @@ class UnifiInsightsSiteManagerCoordinator(DataUpdateCoordinator[dict[str, Any]])
             if isinstance(result, asyncio.CancelledError):
                 raise result
             if isinstance(result, BaseException):
+                if state["error"] is None:
+                    _LOGGER.warning(
+                        "Site Manager %s unavailable (%s)",
+                        name,
+                        type(result).__name__,
+                    )
                 state["available"] = False
                 state["error"] = type(result).__name__
                 if isinstance(result, UniFiRateLimitError):
@@ -163,9 +169,17 @@ class UnifiInsightsSiteManagerCoordinator(DataUpdateCoordinator[dict[str, Any]])
                 else:
                     snapshot[name] = _by_id(result, "id")
             except (AttributeError, TypeError, ValueError) as err:
+                if state["error"] is None:
+                    _LOGGER.warning(
+                        "Site Manager %s unavailable (%s)",
+                        name,
+                        type(err).__name__,
+                    )
                 state["available"] = False
                 state["error"] = type(err).__name__
                 continue
+            if state["error"] is not None:
+                _LOGGER.info("Site Manager %s available again", name)
             state.update(available=True, updated_at=now.isoformat(), error=None)
 
         snapshot["cooldown_until"] = (

@@ -287,12 +287,12 @@ async def test_setup_entry_no_sites_found(
 
 
 @pytest.mark.parametrize("site_manager_outage", [False, True])
+@pytest.mark.usefixtures("enable_custom_integrations")
 async def test_setup_entry_remote_connection(
     hass: HomeAssistant,
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
-    enable_custom_integrations,
     site_manager_outage: bool,  # noqa: FBT001
 ) -> None:
     """Site Manager data is optional for a working remote console."""
