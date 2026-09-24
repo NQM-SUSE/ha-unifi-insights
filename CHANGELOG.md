@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Network topology WebSocket API (`unifi_insights/topology/sources`,
+  `unifi_insights/topology/get` and `unifi_insights/topology/subscribe`)
+  exposing a per-site graph of gateways, switches, access points and clients.
+  The graph is derived from data the integration already polls, so it adds no
+  API calls. It is the groundwork for the network topology dashboard card
+  ([#166](https://github.com/ruaan-deysel/ha-unifi-insights/issues/166)).
+  [#165](https://github.com/ruaan-deysel/ha-unifi-insights/issues/165)
+
 ## [2026.9.7] - 2026-09-24
 
 ### Added
