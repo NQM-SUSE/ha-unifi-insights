@@ -1,11 +1,11 @@
 """Tests for the UniFi Insights integration initialization."""
 
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 if TYPE_CHECKING:
@@ -286,14 +286,16 @@ async def test_setup_entry_no_sites_found(
     assert [flow["context"]["source"] for flow in flows] == ["reauth"]
 
 
+@pytest.mark.parametrize("site_manager_outage", [False, True])
 async def test_setup_entry_remote_connection(
     hass: HomeAssistant,
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
     enable_custom_integrations,
+    site_manager_outage: bool,  # noqa: FBT001
 ) -> None:
-    """Test setup with remote connection type includes Protect."""
+    """Site Manager data is optional for a working remote console."""
     # Create remote config entry
     remote_entry = MockConfigEntry(
         domain="unifi_insights",
@@ -305,11 +307,52 @@ async def test_setup_entry_remote_connection(
         entry_id="remote_entry",
     )
 
-    remote_entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(remote_entry.entry_id)
-    await hass.async_block_till_done()
+    with patch(
+        "custom_components.unifi_insights.coordinators.site_manager."
+        "UniFiSiteManagerClient"
+    ) as client_class:
+        client = client_class.return_value
+        for method in (
+            "list_hosts",
+            "list_sites",
+            "list_devices",
+            "get_isp_metrics",
+            "list_sd_wan_configs",
+        ):
+            setattr(
+                client,
+                method,
+                AsyncMock(
+                    side_effect=(
+                        UniFiResponseError("cloud unavailable", status_code=502)
+                        if site_manager_outage
+                        else None
+                    ),
+                    return_value=[],
+                ),
+            )
+        if not site_manager_outage:
+            client.list_hosts.return_value = [{"id": "test_console"}]
+        client.close = AsyncMock()
 
-    assert remote_entry.state == ConfigEntryState.LOADED
+        remote_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(remote_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert remote_entry.state == ConfigEntryState.LOADED
+        assert remote_entry.runtime_data.site_manager_coordinator is not None
+        assert "site_manager" in remote_entry.runtime_data.coordinator.data
+        assert remote_entry.runtime_data.coordinator.data["site_manager"][
+            "selected_host_id"
+        ] == (None if site_manager_outage else "test_console")
+        assert (
+            remote_entry.runtime_data.site_manager_coordinator.data["collections"][
+                "hosts"
+            ]["available"]
+            is not site_manager_outage
+        )
+        assert await hass.config_entries.async_unload(remote_entry.entry_id)
+        client.close.assert_awaited_once()
 
 
 async def test_unload_entry_with_websocket_task(

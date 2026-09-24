@@ -381,17 +381,18 @@ class UniFiNetworkClient(BaseUniFiClient):
         if self._connection_type != ConnectionType.REMOTE:
             raise ValueError("get_hosts is only available for REMOTE connections")
 
-        response = await self._get("/v1/hosts")
-        if response is None:
-            return []
+        # Keep the discovery API for existing callers while Site Manager owns
+        # the account-wide endpoint and its pagination rules.
+        from ..site_manager import UniFiSiteManagerClient
 
-        data = (
-            response.get("data", response) if isinstance(response, dict) else response
+        if not isinstance(self._auth, ApiKeyAuth):
+            raise ValueError("get_hosts requires cloud API key authentication")
+        client = UniFiSiteManagerClient(
+            auth=self._auth,
+            session=await self._ensure_session(),
+            timeout=int(self._timeout.total or DEFAULT_TIMEOUT),
         )
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-
-        return []
+        return await client.list_hosts()
 
     async def get_application_info(self) -> ApplicationInfo:
         """

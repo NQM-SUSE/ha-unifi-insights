@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
@@ -144,20 +144,21 @@ async def test_get_hosts_remote_without_console_id() -> None:
     client = UniFiNetworkClient(
         auth=ApiKeyAuth(api_key="test-key"),
         connection_type=ConnectionType.REMOTE,
+        session=MagicMock(),
     )
-    client._get = AsyncMock(
-        return_value={
-            "data": [
-                {
-                    "id": "console-id",
-                    "type": "console",
-                    "reportedState": {"hostname": "Dream Router 7"},
-                }
-            ]
+    hosts = [
+        {
+            "id": "console-id",
+            "type": "console",
+            "reportedState": {"hostname": "Dream Router 7"},
         }
-    )
-
-    result = await client.get_hosts()
+    ]
+    with patch(
+        "custom_components.unifi_insights.api.site_manager.UniFiSiteManagerClient"
+    ) as site_manager_class:
+        site_manager_class.return_value.list_hosts = AsyncMock(return_value=hosts)
+        result = await client.get_hosts()
+        site_manager_class.return_value.list_hosts.assert_awaited_once()
 
     assert result == [
         {
@@ -166,7 +167,7 @@ async def test_get_hosts_remote_without_console_id() -> None:
             "reportedState": {"hostname": "Dream Router 7"},
         }
     ]
-    client._get.assert_awaited_once_with("/v1/hosts")
+    site_manager_class.assert_called_once()
 
 
 @pytest.mark.parametrize(
