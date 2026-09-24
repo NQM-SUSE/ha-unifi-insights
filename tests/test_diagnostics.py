@@ -495,3 +495,33 @@ async def test_diagnostics_placeholders_topology_uplink_mac(
     assert uplink_mac == devices["uuid-parent"]["macAddress"]
     assert devices["uuid-child"]["topology"]["uplink_remote_port"] == 6
     assert "28:70:4e:00:00:01" not in _strings(diagnostics)
+
+
+async def test_diagnostics_placeholders_client_links(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Client link MACs (keys and values) are placeholdered; VLAN stays."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["client_links"] = {
+        "site-1": {
+            "8c:ed:e1:00:00:01": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 14,
+                "vlan": 3,
+                "network_name": "Cameras",
+            }
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    (link_key,) = diagnostics["data"]["client_links"]["site-1"]
+    link = diagnostics["data"]["client_links"]["site-1"][link_key]
+
+    assert link_key.startswith("**REDACTED-MAC-")
+    assert link["sw_mac"].startswith("**REDACTED-MAC-")
+    assert link["vlan"] == 3
+    assert link["network_name"] == "Cameras"
+    for raw in ("8c:ed:e1:00:00:01", "28:70:4e:00:00:01"):
+        assert raw not in _strings(diagnostics)

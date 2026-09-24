@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   API calls. It is the groundwork for the network topology dashboard card
   ([#166](https://github.com/ruaan-deysel/ha-unifi-insights/issues/166)).
   [#165](https://github.com/ruaan-deysel/ha-unifi-insights/issues/165)
+- Topology client nodes now carry their VLAN and network name, and wired
+  client links their switch port, taken from the `/stat/sta` response the
+  integration already fetches.
+  [#165](https://github.com/ruaan-deysel/ha-unifi-insights/issues/165)
 
 ## [2026.9.7] - 2026-09-24
 

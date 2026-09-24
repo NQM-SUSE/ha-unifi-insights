@@ -153,6 +153,7 @@ class UnifiFacadeCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "vpn_clients": self._config_coordinator.data.get("vpn_clients", {}),
             "site_vpns": self._config_coordinator.data.get("site_vpns", {}),
             "network_info": self._config_coordinator.data.get("network_info", {}),
+            "client_links": self._config_coordinator.data.get("client_links", {}),
             # From device coordinator
             "devices": self._device_coordinator.data.get("devices", {}),
             "clients": self._device_coordinator.data.get("clients", {}),

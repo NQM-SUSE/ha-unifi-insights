@@ -7,7 +7,7 @@ import copy
 import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
@@ -1140,6 +1140,144 @@ class TestUnifiConfigCoordinator:
         assert "wifi1" in result["wifi"].get("default", {})
         # WiFi without ID should not be in the dict
         assert None not in result["wifi"].get("default", {})
+
+    def test_client_links_from_stat_sta(self):
+        """Only link fields survive; MACs normalise; untagged has no vlan."""
+        links = UnifiConfigCoordinator._client_links(
+            [
+                {
+                    "mac": "8C:ED:E1:00:00:01",
+                    "hostname": "cam",
+                    "ip": "10.2.0.77",
+                    "is_wired": True,
+                    "sw_mac": "28:70:4E:00:00:01",
+                    "sw_port": 14,
+                    "vlan": 3,
+                    "network": "Cameras",
+                    "network_id": "legacy-net-1",
+                },
+                {
+                    "mac": "12:00:00:00:00:02",
+                    "is_wired": False,
+                    "ap_mac": "02:00:00:00:00:08",
+                    "network": "Default",
+                },
+                {
+                    "mac": "aa:bb:cc:00:00:03",
+                    "is_wired": True,
+                    "sw_mac": "28:70:4e:00:00:01",
+                    "sw_port": 5,
+                    "vlan": 0,
+                    "network": "Default",
+                },
+                {"mac": "not-a-mac"},
+                "garbage",
+            ]
+        )
+
+        assert links == {
+            "8c:ed:e1:00:00:01": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 14,
+                "vlan": 3,
+                "network_name": "Cameras",
+            },
+            "12:00:00:00:00:02": {
+                "ap_mac": "02:00:00:00:00:08",
+                "network_name": "Default",
+            },
+            "aa:bb:cc:00:00:03": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 5,
+                "network_name": "Default",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_collects_client_links_without_wifi(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """Links are built even when the Wi-Fi section is unavailable."""
+        client = coordinator.network_client
+        client.wifi.get_all = AsyncMock(side_effect=RuntimeError("wifi down"))
+        client.clients.get_active_legacy = AsyncMock(
+            return_value=[
+                {
+                    "mac": "8c:ed:e1:00:00:01",
+                    "sw_mac": "28:70:4e:00:00:01",
+                    "sw_port": 3,
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"]["default"] == {
+            "8c:ed:e1:00:00:01": {"sw_mac": "28:70:4e:00:00:01", "sw_port": 3}
+        }
+        # The fixture polls two sites, so this call also runs for "site2";
+        # count the "default" calls specifically to pin the spec's "one
+        # /stat/sta call per site" invariant without over-specifying the
+        # total call count across sites, which is incidental here.
+        assert (
+            client.clients.get_active_legacy.await_args_list.count(call("default")) == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_keeps_client_links_on_failure(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """A failed /stat/sta keeps the previous links and does not fail."""
+        coordinator.data["client_links"] = {
+            "default": {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+        }
+        coordinator.network_client.clients.get_active_legacy = AsyncMock(
+            side_effect=RuntimeError("sta down")
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"]["default"] == {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_wifi_enrichment_unchanged(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """The single /stat/sta call still feeds per-SSID client counts."""
+        client = coordinator.network_client
+        client.wifi.get_legacy_configs = AsyncMock(
+            return_value=[{"name": "MainWiFi", "security": "wpapsk"}]
+        )
+        client.clients.get_active_legacy = AsyncMock(
+            return_value=[{"essid": "MainWiFi", "mac": "12:00:00:00:00:02"}]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["wifi"]["default"]["wifi1"]["num_connected_clients"] == 1
+        # The fixture polls two sites, so this call also runs for "site2";
+        # count the "default" calls specifically to pin the spec's "one
+        # /stat/sta call per site" invariant without over-specifying the
+        # total call count across sites, which is incidental here.
+        assert (
+            client.clients.get_active_legacy.await_args_list.count(call("default")) == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_clears_client_links_with_no_sites(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """The no-sites early return blanks client_links like its siblings."""
+        coordinator.data["client_links"] = {
+            "default": {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+        }
+        coordinator.network_client.sites.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("Not found", status_code=404)
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"] == {}
 
 
 # ============================================================================

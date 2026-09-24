@@ -16,6 +16,7 @@ from custom_components.unifi_insights.api import (
     UniFiTimeoutError,
 )
 from custom_components.unifi_insights.const import CONF_SITE_IDS, SCAN_INTERVAL_CONFIG
+from custom_components.unifi_insights.topology_contract import normalize_mac
 
 from .base import UnifiBaseCoordinator
 
@@ -70,6 +71,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             "vpn_clients": {},
             "site_vpns": {},
             "network_info": {},
+            "client_links": {},
         }
         # Every site the console reports (id -> display name), before the
         # site filter is applied, so the options flow can offer all of them.
@@ -274,6 +276,43 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 ssid, passphrase, security, hidden=hidden
             )
 
+    @staticmethod
+    def _client_links(active_clients: list[Any]) -> dict[str, dict[str, Any]]:
+        """
+        Extract each active client's switch port, AP, VLAN and network name.
+
+        The v1 clients endpoint leaves swMac/swPort/apMac/vlan/networkId null
+        on current firmware; the classic /stat/sta response (already fetched
+        for per-SSID counts) carries them. Keyed by normalised client MAC so
+        the topology builder can join it to v1 clients.
+        """
+        links: dict[str, dict[str, Any]] = {}
+        for client in active_clients:
+            if not isinstance(client, dict):
+                continue
+            client_mac = normalize_mac(client.get("mac"))
+            if client_mac is None:
+                continue
+            link: dict[str, Any] = {}
+            for key in ("sw_mac", "ap_mac"):
+                mac = normalize_mac(client.get(key))
+                if mac is not None:
+                    link[key] = mac
+            sw_port = client.get("sw_port")
+            if isinstance(sw_port, int) and not isinstance(sw_port, bool):
+                link["sw_port"] = sw_port
+            # VLAN 0 is an 802.1Q priority tag, not a real VLAN; untagged
+            # (the default network) reports no vlan key at all on real
+            # hardware, so only a VLAN id of 1 or higher is kept.
+            vlan = client.get("vlan")
+            if isinstance(vlan, int) and not isinstance(vlan, bool) and vlan >= 1:
+                link["vlan"] = vlan
+            network_name = client.get("network")
+            if isinstance(network_name, str) and network_name:
+                link["network_name"] = network_name
+            links[client_mac] = link
+        return links
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch configuration data from API."""
         try:
@@ -340,6 +379,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                 self.data["vpn_clients"] = {}
                 self.data["site_vpns"] = {}
                 self.data["network_info"] = {}
+                self.data["client_links"] = {}
                 self._available = True
                 self.data["last_update"] = datetime.now(tz=UTC)
                 return self.data
@@ -384,6 +424,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             routes_by_site: dict[str, dict[str, Any]] = {}
             vpn_clients_by_site: dict[str, dict[str, Any]] = {}
             site_vpns_by_site: dict[str, dict[str, Any]] = {}
+            client_links_by_site: dict[str, dict[str, Any]] = {}
 
             for site_id in sites:
                 _LOGGER.debug(
@@ -402,17 +443,40 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
                     wifi_id = wifi.get("id")
                     if wifi_id:
                         wifi_dict[wifi_id] = wifi
-                # Enrich with classic data (secrets, per-SSID counts, QR).
+                # One classic /stat/sta call per site feeds both the topology
+                # client links and the per-SSID Wi-Fi counts. It runs even
+                # when the Wi-Fi section failed, so topology keeps its links.
                 legacy_name = legacy_site_names.get(site_id)
-                if wifi_models is not None and legacy_name:
+                active_clients: list[Any] | None = None
+                if legacy_name:
                     try:
-                        legacy_configs = (
-                            await self.network_client.wifi.get_legacy_configs(
+                        active_clients = (
+                            await self.network_client.clients.get_active_legacy(
                                 legacy_name
                             )
                         )
-                        active_clients = (
-                            await self.network_client.clients.get_active_legacy(
+                    except Exception as err:
+                        _LOGGER.debug(
+                            "Config coordinator: Unable to fetch active clients "
+                            "for site %s: %s",
+                            site_id,
+                            err,
+                        )
+                client_links_by_site[site_id] = (
+                    self._client_links(active_clients)
+                    if active_clients is not None
+                    else self.data["client_links"].get(site_id, {})
+                )
+
+                # Enrich with classic data (secrets, per-SSID counts, QR).
+                if (
+                    wifi_models is not None
+                    and legacy_name
+                    and active_clients is not None
+                ):
+                    try:
+                        legacy_configs = (
+                            await self.network_client.wifi.get_legacy_configs(
                                 legacy_name
                             )
                         )
@@ -580,6 +644,7 @@ class UnifiConfigCoordinator(UnifiBaseCoordinator):
             self.data["policy_based_routes"] = routes_by_site
             self.data["vpn_clients"] = vpn_clients_by_site
             self.data["site_vpns"] = site_vpns_by_site
+            self.data["client_links"] = client_links_by_site
             for section, site_id in self._failed_sections - failed_sections:
                 _LOGGER.info(
                     "Config coordinator: %s fetch for site %s recovered",

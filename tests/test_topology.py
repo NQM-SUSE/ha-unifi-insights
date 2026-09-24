@@ -606,6 +606,8 @@ def test_allowlist_never_emits_sensitive_values() -> None:
         "model",
         "ha_device_id",
         "connection",
+        "vlan_id",
+        "network_name",
     }
     edge_keys = {key for edge in snapshot["edges"] for key in edge}
     assert edge_keys <= {
@@ -742,3 +744,98 @@ def test_build_unavailable_topology() -> None:
     assert snapshot["nodes"] == snapshot["edges"] == snapshot["unresolved"] == []
     assert snapshot["truncation"] is None
     assert len(snapshot["revision"]) == 16
+
+
+def _with_links(data: dict, links: dict) -> dict:
+    data["client_links"] = {SITE: links}
+    return data
+
+
+def test_client_link_enrichment() -> None:
+    """Wired clients get port/VLAN/network; untagged clients get no vlan_id."""
+    data = _with_links(
+        _live_layout(),
+        {
+            "12:00:00:00:00:01": {
+                "sw_mac": "02:00:00:00:00:03",
+                "sw_port": 4,
+                "vlan": 3,
+                "network_name": "Media",
+            },
+            "12:00:00:00:00:02": {
+                "ap_mac": "02:00:00:00:00:08",
+                "network_name": "Default",
+            },
+        },
+    )
+    snapshot = _build(data)
+
+    tv = next(n for n in snapshot["nodes"] if n["id"] == "cli:cli-tv")
+    assert tv["vlan_id"] == 3
+    assert tv["network_name"] == "Media"
+    assert _edge(snapshot, "cli:cli-tv")["parent_port"] == 4
+    phone = next(n for n in snapshot["nodes"] if n["id"] == "cli:cli-phone")
+    assert "vlan_id" not in phone
+    assert phone["network_name"] == "Default"
+    assert "parent_port" not in _edge(snapshot, "cli:cli-phone")
+
+
+def test_stale_link_port_not_attached_to_other_parent() -> None:
+    """A 5-minute-old sw_mac that disagrees with uplinkDeviceId adds no port."""
+    data = _with_links(
+        _live_layout(),
+        {"12:00:00:00:00:01": {"sw_mac": "02:00:00:00:00:05", "sw_port": 4}},
+    )
+    snapshot = _build(data)
+
+    tv_edge = _edge(snapshot, "cli:cli-tv")
+    assert tv_edge["target"] == "dev:uuid-u1"
+    assert "parent_port" not in tv_edge
+
+
+def test_client_parent_falls_back_to_link_macs() -> None:
+    """Without uplinkDeviceId, sw_mac/ap_mac place the client."""
+    data = _live_layout()
+    data["clients"][SITE]["cli-tv"]["uplinkDeviceId"] = None
+    data["clients"][SITE]["cli-phone"]["uplinkDeviceId"] = "uuid-gone"
+    _with_links(
+        data,
+        {
+            "12:00:00:00:00:01": {"sw_mac": "02:00:00:00:00:03", "sw_port": 4},
+            "12:00:00:00:00:02": {"ap_mac": "02:00:00:00:00:08"},
+        },
+    )
+    snapshot = _build(data)
+
+    assert _edge(snapshot, "cli:cli-tv")["target"] == "dev:uuid-u1"
+    assert _edge(snapshot, "cli:cli-tv")["parent_port"] == 4
+    assert _edge(snapshot, "cli:cli-phone")["target"] == "dev:uuid-ap"
+    assert snapshot["unresolved"] == []
+
+
+def test_links_never_leak_macs() -> None:
+    """Link MACs are used for joins only, never emitted."""
+    data = _with_links(
+        _live_layout(),
+        {"12:00:00:00:00:01": {"sw_mac": "02:00:00:00:00:03", "sw_port": 4, "vlan": 3}},
+    )
+    payload = json.dumps(_build(data))
+
+    assert "02:00:00" not in payload
+    assert "12:00:00" not in payload
+
+
+def test_client_link_enrichment_without_known_connection() -> None:
+    """VLAN/network name still land on a node whose connection type is unknown."""
+    data = _live_layout()
+    data["clients"][SITE]["cli-tv"]["type"] = "UNKNOWN"
+    _with_links(
+        data,
+        {"12:00:00:00:00:01": {"vlan": 3, "network_name": "Media"}},
+    )
+    snapshot = _build(data)
+
+    tv = next(n for n in snapshot["nodes"] if n["id"] == "cli:cli-tv")
+    assert "connection" not in tv
+    assert tv["vlan_id"] == 3
+    assert tv["network_name"] == "Media"
