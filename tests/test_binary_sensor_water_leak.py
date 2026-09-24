@@ -51,6 +51,7 @@ class TestWaterLeakHelpers:
         assert _water_leak_channel_count({}) == 0
         assert _water_leak_channel_count({"featureFlags": None}) == 0
         assert _water_leak_channel_count({"featureFlags": {"waterLeak": {}}}) == 0
+        assert _water_leak_channel_count({"featureFlags": {"waterLeak": True}}) == 0
         assert (
             _water_leak_channel_count(
                 {"featureFlags": {"waterLeak": {"channelCount": "bogus"}}}
@@ -95,6 +96,11 @@ class TestWaterLeakHelpers:
             ({"externalLeakDetectedAt": None}, False),
             ({"externalLeakDetectedAt": 1758600000000}, True),
             ({"leakDetectedAt": 1758600000000}, False),
+            ({"isExternalLeakDetected": True}, True),
+            (
+                {"isExternalLeakDetected": False, "externalLeakDetectedAt": 1},
+                False,
+            ),
         ],
     )
     def test_external_state(self, data, expected):
@@ -156,3 +162,31 @@ class TestWaterLeakEntityCreation:
         assert by_key["sensor_leak"].is_on is False
         assert by_key["sensor_leak_external"].is_on is False
         assert "sensor_door" not in by_key
+
+    async def test_leak_attributes_expose_both_channels(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """Leak state attributes report internal and external channel."""
+        sensor = mock_coordinator.data["protect"]["sensors"]["env_sensor"]
+        sensor["externalLeakDetectedAt"] = 1758600000000
+
+        config_entry = MagicMock()
+        config_entry.runtime_data = MagicMock()
+        config_entry.runtime_data.coordinator = mock_coordinator
+
+        added: list = []
+        await async_setup_entry(
+            hass, config_entry, lambda ents, **kw: added.extend(ents)
+        )
+        external = next(
+            e
+            for e in added
+            if isinstance(e, UnifiProtectBinarySensor)
+            and e.entity_description.key == "sensor_leak_external"
+        )
+
+        assert external.is_on is True
+        attrs = external.extra_state_attributes
+        assert attrs["leak_detected"] is False
+        assert attrs["external_leak_detected"] is True
+        assert attrs["external_leak_detected_at"] == 1758600000000
