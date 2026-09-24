@@ -2,10 +2,10 @@
 Per-site network topology graph derived from coordinator data.
 
 This module is pure: it performs no I/O and imports nothing from Home
-Assistant or the rest of the integration, so the graph logic is unit-testable
-in isolation and cheap enough to run on every coordinator update.
-(``coordinators/config.py`` imports ``normalize_mac`` from here, so importing
-``.entity`` or ``.coordinators`` would create an import cycle.)
+Assistant or the rest of the integration beyond ``topology_contract``, so the
+graph logic is unit-testable in isolation and cheap enough to run on every
+coordinator update. The snapshot types and node normalisers live in
+``topology_contract``.
 
 Relationship sources, verified against real hardware:
 
@@ -32,183 +32,40 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
-from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Final
+
+from .topology_contract import (
+    MAX_CLIENTS_PER_SITE,
+    TOPOLOGY_SCHEMA_VERSION,
+    UNKNOWN_CLIENT,
+    UNKNOWN_DEVICE,
+    as_int,
+    client_connection,
+    device_kind,
+    device_state,
+    display_name,
+    first_present,
+    link_medium,
+    normalize_mac,
+    opaque_node_id,
+    port_poe_watts,
+    site_display_name,
+    uplink_port_index,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-TOPOLOGY_SCHEMA_VERSION: Final = 1
-# Hard server-side cap on client nodes per site; requests may ask for fewer.
-MAX_CLIENTS_PER_SITE: Final = 500
-
-NodeKind = Literal["gateway", "switch", "access_point", "client", "other"]
-NodeState = Literal["online", "offline", "unknown"]
-LinkMedium = Literal["wired", "wireless", "unknown"]
-ClientConnection = Literal["wired", "wireless"]
-TopologyStatus = Literal["ok", "partial", "unavailable"]
-IssueSeverity = Literal["info", "warning", "error"]
-UnresolvedReason = Literal["parent_not_found", "no_uplink_data"]
-
-
-class TopologyNode(TypedDict):
-    """A device or client in the graph."""
-
-    id: str
-    kind: NodeKind
-    name: str
-    state: NodeState
-    model: NotRequired[str]
-    ha_device_id: NotRequired[str]
-    connection: NotRequired[ClientConnection]
-
-
-class TopologyEdge(TypedDict):
-    """A child -> parent link."""
-
-    source: str
-    target: str
-    medium: LinkMedium
-    speed_mbps: NotRequired[int]
-    parent_port: NotRequired[int]
-    child_port: NotRequired[int]
-    poe_power_w: NotRequired[float]
-
-
-class TopologyIssue(TypedDict):
-    """A machine-readable problem with the snapshot."""
-
-    code: str
-    severity: IssueSeverity
-
-
-class TopologyUnresolved(TypedDict):
-    """A node whose parent could not be placed in the graph."""
-
-    node_id: str
-    reason: UnresolvedReason
-
-
-class TopologyTruncation(TypedDict):
-    """How many clients were left out by the client cap."""
-
-    clients_total: int
-    clients_included: int
-
-
-class SiteTopology(TypedDict):
-    """
-    One site's topology snapshot (contract version 1).
-
-    ``status: "unavailable"`` comes in two shapes. With the
-    ``devices_unavailable`` issue the nodes and edges are the last-known data
-    (the device coordinator keeps its previous data when a poll fails). With
-    ``entry_unloaded`` or ``site_unavailable`` they are empty.
-    """
-
-    schema_version: int
-    entry_id: str
-    site_id: str
-    site_name: str
-    revision: str
-    status: TopologyStatus
-    issues: list[TopologyIssue]
-    nodes: list[TopologyNode]
-    edges: list[TopologyEdge]
-    unresolved: list[TopologyUnresolved]
-    truncation: TopologyTruncation | None
-
-
-_GATEWAY_LEGACY_TYPES: Final = frozenset({"udm", "uxg", "ugw", "udr", "ucg"})
-_ONLINE_STATES: Final = frozenset({"ONLINE", "CONNECTED", "UP"})
-_OFFLINE_STATES: Final = frozenset({"OFFLINE", "DISCONNECTED", "DOWN"})
-_MAC_RE: Final = re.compile(r"[0-9a-f]{2}(?:[:-]?[0-9a-f]{2}){5}")
-
-
-def _field(data: Mapping[str, Any], *keys: str) -> Any:
-    """Return the first non-None value among ``keys`` (get_field semantics)."""
-    for key in keys:
-        value = data.get(key)
-        if value is not None:
-            return value
-    return None
-
-
-def normalize_mac(value: Any) -> str | None:
-    """Return ``value`` as a lower-case colon MAC, or None if it is not one."""
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip().lower()
-    if not _MAC_RE.fullmatch(candidate):
-        return None
-    digits = candidate.replace(":", "").replace("-", "")
-    return ":".join(digits[index : index + 2] for index in range(0, 12, 2))
-
-
-def opaque_node_id(prefix: str, entry_id: str, raw_id: str) -> str:
-    """Return a node id that never exposes a MAC address."""
-    mac = normalize_mac(raw_id)
-    if mac is None:
-        return f"{prefix}:{raw_id}"
-    digest = hashlib.sha256(f"{entry_id}:{mac}".encode()).hexdigest()[:16]
-    return f"{prefix}:h{digest}"
-
-
-def device_kind(device: Mapping[str, Any]) -> NodeKind:
-    """Classify a device: legacy type, then v1 type, then features."""
-    topology = device.get("topology")
-    legacy_type = topology.get("legacy_type") if isinstance(topology, dict) else None
-    if isinstance(legacy_type, str):
-        lowered = legacy_type.lower()
-        if lowered in _GATEWAY_LEGACY_TYPES:
-            return "gateway"
-        if lowered == "usw":
-            return "switch"
-        if lowered == "uap":
-            return "access_point"
-
-    v1_type = device.get("type")
-    if isinstance(v1_type, str):
-        lowered = v1_type.lower()
-        if "gateway" in lowered:
-            return "gateway"
-        if "switch" in lowered:
-            return "switch"
-        if "access" in lowered or lowered in {"ap", "uap"}:
-            return "access_point"
-
-    features = device.get("features")
-    if isinstance(features, list):
-        if "accessPoint" in features:
-            return "access_point"
-        if "switching" in features:
-            return "switch"
-    return "other"
-
-
-def device_state(device: Mapping[str, Any]) -> NodeState:
-    """Map a device state string onto online/offline/unknown."""
-    raw = _field(device, "state", "status")
-    if isinstance(raw, str):
-        upper = raw.upper()
-        if upper in _ONLINE_STATES:
-            return "online"
-        if upper in _OFFLINE_STATES:
-            return "offline"
-    return "unknown"
-
-
-def site_display_name(data: Mapping[str, Any], site_id: str) -> str:
-    """Return a site's display name, falling back to its id."""
-    sites = data.get("sites")
-    site = sites.get(site_id) if isinstance(sites, dict) else None
-    if isinstance(site, dict):
-        for key in ("name", "desc"):
-            value = site.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return site_id
-
+    from .topology_contract import (
+        SiteTopology,
+        TopologyEdge,
+        TopologyIssue,
+        TopologyNode,
+        TopologyStatus,
+        TopologyTruncation,
+        TopologyUnresolved,
+        UnresolvedReason,
+    )
 
 _KIND_ORDER: Final[dict[str, int]] = {
     "gateway": 0,
@@ -217,15 +74,6 @@ _KIND_ORDER: Final[dict[str, int]] = {
     "other": 3,
     "client": 4,
 }
-_UNKNOWN_CLIENT: Final = "Unknown client"
-_UNKNOWN_DEVICE: Final = "Unknown device"
-
-
-def _as_int(value: Any) -> int | None:
-    """Return value when it is a real int (not a bool), else None."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
 
 
 def _site_map(data: Mapping[str, Any], section: str, site_id: str) -> dict[str, Any]:
@@ -233,81 +81,6 @@ def _site_map(data: Mapping[str, Any], section: str, site_id: str) -> dict[str, 
     by_site = data.get(section)
     site_items = by_site.get(site_id) if isinstance(by_site, dict) else None
     return site_items if isinstance(site_items, dict) else {}
-
-
-def _ports(device: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return a device's port dicts from ``ports`` or ``interfaces.ports``."""
-    ports = device.get("ports")
-    if not isinstance(ports, list):
-        interfaces = device.get("interfaces")
-        ports = interfaces.get("ports") if isinstance(interfaces, dict) else None
-    if not isinstance(ports, list):
-        return []
-    return [port for port in ports if isinstance(port, dict)]
-
-
-def _port_index(port: Mapping[str, Any]) -> int | None:
-    """Return a port's index across the v1, interface and legacy shapes."""
-    return _as_int(_field(port, "idx", "port_idx", "portIdx"))
-
-
-def _uplink_port_index(device: Mapping[str, Any]) -> int | None:
-    """Return the index of the port flagged as the device's uplink."""
-    for port in _ports(device):
-        if _field(port, "is_uplink", "isUplink") is True:
-            return _port_index(port)
-    return None
-
-
-def _port_poe_watts(device: Mapping[str, Any], port_idx: int) -> float | None:
-    """Return the PoE draw on one port, or None when PoE is off or unknown."""
-    for port in _ports(device):
-        if _port_index(port) != port_idx:
-            continue
-        poe = port.get("poe")
-        if isinstance(poe, dict):
-            if poe.get("enabled") is not True:
-                return None
-            power = poe.get("power")
-        else:
-            if _field(port, "poeEnabled", "poe_enabled") is False:
-                return None
-            power = _field(port, "poePower", "poe_power")
-        try:
-            return round(float(power), 1) if power is not None else None
-        except TypeError, ValueError:
-            return None
-    return None
-
-
-def _medium(value: Any) -> LinkMedium:
-    """Map a legacy uplink type onto the contract medium."""
-    if isinstance(value, str):
-        lowered = value.lower()
-        if lowered in {"wire", "wired"}:
-            return "wired"
-        if lowered in {"wireless", "mesh"}:
-            return "wireless"
-    return "unknown"
-
-
-def _connection(client: Mapping[str, Any]) -> ClientConnection | None:
-    """Return a client's wired/wireless connection, if known."""
-    raw = client.get("type")
-    if isinstance(raw, str):
-        upper = raw.upper()
-        if upper == "WIRED":
-            return "wired"
-        if upper == "WIRELESS":
-            return "wireless"
-    return None
-
-
-def _display_name(value: Any, fallback: str) -> str:
-    """Return a usable name; blank or MAC-shaped names use the fallback."""
-    if isinstance(value, str) and value.strip() and normalize_mac(value) is None:
-        return value.strip()
-    return fallback
 
 
 def _device_node(
@@ -322,7 +95,7 @@ def _device_node(
     node: TopologyNode = {
         "id": node_id,
         "kind": device_kind(device),
-        "name": _display_name(device.get("name"), model or _UNKNOWN_DEVICE),
+        "name": display_name(device.get("name"), model or UNKNOWN_DEVICE),
         "state": device_state(device),
     }
     if model is not None:
@@ -338,10 +111,10 @@ def _client_node(client: Mapping[str, Any], node_id: str) -> TopologyNode:
     node: TopologyNode = {
         "id": node_id,
         "kind": "client",
-        "name": _display_name(client.get("name"), _UNKNOWN_CLIENT),
+        "name": display_name(client.get("name"), UNKNOWN_CLIENT),
         "state": "offline" if client.get("connected") is False else "online",
     }
-    connection = _connection(client)
+    connection = client_connection(client)
     if connection is not None:
         node["connection"] = connection
     return node
@@ -376,20 +149,20 @@ def _device_edge(
     edge: TopologyEdge = {
         "source": node_id,
         "target": parent_id,
-        "medium": _medium(block.get("uplink_type")),
+        "medium": link_medium(block.get("uplink_type")),
     }
-    speed = _as_int(block.get("uplink_speed"))
+    speed = as_int(block.get("uplink_speed"))
     if speed is not None:
         edge["speed_mbps"] = speed
-    parent_port = _as_int(block.get("uplink_remote_port"))
+    parent_port = as_int(block.get("uplink_remote_port"))
     if parent_port is not None:
         edge["parent_port"] = parent_port
-        poe_watts = _port_poe_watts(devices_by_node[parent_id], parent_port)
+        poe_watts = port_poe_watts(devices_by_node[parent_id], parent_port)
         if poe_watts is not None:
             edge["poe_power_w"] = poe_watts
-    child_port = _as_int(block.get("uplink_port_idx"))
+    child_port = as_int(block.get("uplink_port_idx"))
     if child_port is None:
-        child_port = _uplink_port_index(device)
+        child_port = uplink_port_index(device)
     if child_port is not None:
         edge["child_port"] = child_port
     return edge
@@ -407,8 +180,8 @@ def _select_clients(
     limit = max(0, min(max_clients, MAX_CLIENTS_PER_SITE))
     valid.sort(
         key=lambda item: (
-            _connection(item[1]) != "wired",
-            _display_name(item[1].get("name"), _UNKNOWN_CLIENT).casefold(),
+            client_connection(item[1]) != "wired",
+            display_name(item[1].get("name"), UNKNOWN_CLIENT).casefold(),
             item[0],
         )
     )
@@ -481,9 +254,9 @@ def build_site_topology(
         device_node_ids[device_id] = node_id
         devices_by_node[node_id] = device
         nodes.append(_device_node(device, device_id, node_id, ha_device_ids))
-        mac = normalize_mac(_field(device, "macAddress", "mac")) or normalize_mac(
-            device_id
-        )
+        mac = normalize_mac(
+            first_present(device, "macAddress", "mac")
+        ) or normalize_mac(device_id)
         if mac is not None:
             mac_index[mac] = node_id
 
@@ -498,7 +271,7 @@ def build_site_topology(
     for client_id, client in included:
         node_id = opaque_node_id("cli", entry_id, client_id)
         nodes.append(_client_node(client, node_id))
-        uplink = _field(client, "uplinkDeviceId", "uplink_device_id")
+        uplink = first_present(client, "uplinkDeviceId", "uplink_device_id")
         if not isinstance(uplink, str):
             unresolved.append({"node_id": node_id, "reason": "no_uplink_data"})
             continue
@@ -510,7 +283,7 @@ def build_site_topology(
             {
                 "source": node_id,
                 "target": target,
-                "medium": _connection(client) or "unknown",
+                "medium": client_connection(client) or "unknown",
             }
         )
 

@@ -21,12 +21,8 @@ from homeassistant.util.hass_dict import HassKey
 
 from .const import DOMAIN
 from .helpers import async_get_device_entry
-from .topology import (
-    MAX_CLIENTS_PER_SITE,
-    build_site_topology,
-    build_unavailable_topology,
-    site_display_name,
-)
+from .topology import build_site_topology, build_unavailable_topology
+from .topology_contract import MAX_CLIENTS_PER_SITE, site_display_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -34,7 +30,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
     from . import UnifiInsightsConfigEntry
-    from .topology import SiteTopology
+    from .topology_contract import SiteTopology
 
 _LOGGER = logging.getLogger(__name__)
 
