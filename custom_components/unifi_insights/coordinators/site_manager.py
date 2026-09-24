@@ -102,9 +102,13 @@ class UnifiInsightsSiteManagerCoordinator(DataUpdateCoordinator[dict[str, Any]])
 
     def __init__(self, hass: HomeAssistant, client: UniFiSiteManagerClient) -> None:
         """Initialize the shared coordinator without binding it to one entry."""
+        # An omitted config_entry falls back to the entry being set up, which
+        # would register this shared poller's shutdown on that one entry's
+        # unload and stop polling for every other entry using the account.
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=None,
             name=f"{DOMAIN}_site_manager",
             update_interval=SCAN_INTERVAL_SITE_MANAGER,
         )
@@ -204,8 +208,8 @@ async def _async_initial_refresh(
     """Load optional cloud data without delaying a working console entry."""
     try:
         await coordinator.async_refresh()
-    except Exception:
-        _LOGGER.exception("Initial Site Manager refresh failed")
+    except Exception as err:
+        _LOGGER.warning("Initial Site Manager refresh failed (%s)", type(err).__name__)
 
 
 async def async_acquire_site_manager(
@@ -226,8 +230,11 @@ async def async_acquire_site_manager(
             coordinator=UnifiInsightsSiteManagerCoordinator(hass, client),
         )
         registry[fingerprint] = account
-        account.initial_refresh = hass.async_create_task(
-            _async_initial_refresh(account.coordinator)
+        # A background task keeps optional cloud requests from holding up
+        # Home Assistant startup.
+        account.initial_refresh = hass.async_create_background_task(
+            _async_initial_refresh(account.coordinator),
+            name=f"{DOMAIN}_site_manager_initial_refresh",
         )
     account.users.add(entry_id)
     return fingerprint, account

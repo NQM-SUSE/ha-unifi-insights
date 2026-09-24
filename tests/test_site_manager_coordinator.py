@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from homeassistant import config_entries
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.unifi_insights.api import (
     UniFiRateLimitError,
@@ -14,13 +19,14 @@ from custom_components.unifi_insights.api import (
 )
 from custom_components.unifi_insights.coordinators.site_manager import (
     UnifiInsightsSiteManagerCoordinator,
+    _async_initial_refresh,
+    _latest_isp_metrics,
     async_acquire_site_manager,
     async_release_site_manager,
 )
 from custom_components.unifi_insights.diagnostics import _site_manager_summary
 
 if TYPE_CHECKING:
-    import pytest
     from homeassistant.core import HomeAssistant
 
 
@@ -59,6 +65,52 @@ def _client() -> MagicMock:
     )
     client.close = AsyncMock()
     return client
+
+
+def test_latest_isp_metrics_ignores_invalid_and_older_periods() -> None:
+    """Only the newest valid, numeric WAN sample is retained for a site."""
+    rows = [
+        {"hostId": None, "siteId": "site"},
+        {"hostId": "host", "siteId": None},
+        {
+            "hostId": "host",
+            "siteId": "site",
+            "periods": [
+                None,
+                {"metricTime": None, "data": {"wan": {}}},
+                {"metricTime": "2026-01-02T03:10:00Z", "data": {"wan": []}},
+                {"metricTime": "invalid", "data": {"wan": {}}},
+                {"metricTime": "2026-01-02T03:10:00", "data": {"wan": {}}},
+                {
+                    "metricTime": "2026-01-02T03:10:00Z",
+                    "data": {
+                        "wan": {
+                            "avgLatency": 2,
+                            "uptime": True,
+                            "ispName": "private ISP",
+                        }
+                    },
+                },
+                {
+                    "metricTime": "2026-01-02T03:05:00Z",
+                    "data": {"wan": {"avgLatency": 9}},
+                },
+                {
+                    "metricTime": "2026-01-02T03:10:00Z",
+                    "data": {"wan": {"avgLatency": 10}},
+                },
+            ],
+        },
+    ]
+
+    assert _latest_isp_metrics(rows) == {
+        "host": {
+            "site": {
+                "metric_time": "2026-01-02T03:10:00+00:00",
+                "wan": {"avgLatency": 2},
+            }
+        }
+    }
 
 
 async def test_partial_failure_keeps_last_good_collection(
@@ -111,6 +163,36 @@ async def test_partial_failure_keeps_last_good_collection(
     assert caplog.messages.count("Site Manager sites available again") == 1
 
 
+async def test_malformed_collection_keeps_last_good_data(hass: HomeAssistant) -> None:
+    """A successful HTTP response with malformed rows does not erase inventory."""
+    client = _client()
+    coordinator = UnifiInsightsSiteManagerCoordinator(hass, client)
+    first = await coordinator._async_update_data()
+    coordinator.data = first
+    client.list_sites.return_value = [None]
+
+    second = await coordinator._async_update_data()
+
+    assert second["sites"] == first["sites"]
+    assert second["collections"]["sites"]["available"] is False
+    assert second["collections"]["sites"]["error"] == "AttributeError"
+
+    coordinator.data = second
+    repeated = await coordinator._async_update_data()
+    assert repeated["sites"] == first["sites"]
+    assert repeated["collections"]["sites"]["error"] == "AttributeError"
+
+
+async def test_cancelled_collection_update_propagates(hass: HomeAssistant) -> None:
+    """Cancellation of a cloud request must stop the coordinator update."""
+    client = _client()
+    client.list_hosts.side_effect = asyncio.CancelledError()
+    coordinator = UnifiInsightsSiteManagerCoordinator(hass, client)
+
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator._async_update_data()
+
+
 async def test_rate_limit_skips_requests_until_retry_after(hass: HomeAssistant) -> None:
     """A cloud 429 applies a shared cooldown to the account."""
     client = _client()
@@ -132,6 +214,43 @@ async def test_rate_limit_skips_requests_until_retry_after(hass: HomeAssistant) 
     resumed = await coordinator._async_update_data()
     assert resumed["cooldown_until"] is None
     assert client.list_sites.await_count == before + 1
+
+
+async def test_longest_rate_limit_deadline_wins(hass: HomeAssistant) -> None:
+    """Concurrent 429 responses share the longest requested cooldown."""
+    client = _client()
+    client.list_hosts.side_effect = UniFiRateLimitError(
+        "limited", status_code=429, retry_after=60
+    )
+    client.list_sites.side_effect = UniFiRateLimitError(
+        "limited", status_code=429, retry_after=120
+    )
+    client.list_devices.side_effect = UniFiRateLimitError(
+        "limited", status_code=429, retry_after=30
+    )
+    coordinator = UnifiInsightsSiteManagerCoordinator(hass, client)
+
+    snapshot = await coordinator._async_update_data()
+
+    deadline = datetime.fromisoformat(snapshot["cooldown_until"])
+    assert deadline - datetime.now(UTC) > timedelta(seconds=110)
+
+
+async def test_initial_refresh_failure_does_not_leak_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An optional background refresh failure only logs its exception type."""
+    coordinator = MagicMock()
+    coordinator.async_refresh = AsyncMock(side_effect=RuntimeError("private body"))
+    caplog.set_level(
+        logging.WARNING,
+        logger="custom_components.unifi_insights.coordinators.site_manager",
+    )
+
+    await _async_initial_refresh(coordinator)
+
+    assert "Initial Site Manager refresh failed (RuntimeError)" in caplog.messages
+    assert "private body" not in caplog.text
 
 
 async def test_same_key_shares_coordinator_until_last_unload(
@@ -172,6 +291,87 @@ async def test_same_key_shares_coordinator_until_last_unload(
         await async_release_site_manager(hass, key2, "entry-2")
         coordinator.async_shutdown.assert_awaited_once()
         client.close.assert_awaited_once()
+        await async_release_site_manager(hass, key2, "entry-2")
+        client.close.assert_awaited_once()
+
+
+async def test_shared_coordinator_is_not_bound_to_the_first_entry(
+    hass: HomeAssistant,
+) -> None:
+    """
+    Unloading the entry that created the poller must not stop it for others.
+
+    Without an explicit config_entry, DataUpdateCoordinator adopts the entry
+    currently being set up and registers its own shutdown on that entry's
+    unload, which would silently stop polling for every other entry sharing
+    the account.
+    """
+    first_entry = MockConfigEntry(domain="unifi_insights", entry_id="entry-1")
+    first_entry.add_to_hass(hass)
+    client = _client()
+    token = config_entries.current_entry.set(first_entry)
+    try:
+        with patch(
+            "custom_components.unifi_insights.coordinators.site_manager."
+            "UniFiSiteManagerClient",
+            return_value=client,
+        ):
+            fingerprint, account = await async_acquire_site_manager(
+                hass, "same-key", "entry-1", MagicMock()
+            )
+            await async_acquire_site_manager(hass, "same-key", "entry-2", MagicMock())
+    finally:
+        config_entries.current_entry.reset(token)
+
+    assert account.coordinator.config_entry is None
+    assert account.initial_refresh is not None
+    await account.initial_refresh
+
+    await async_release_site_manager(hass, fingerprint, "entry-1")
+    await first_entry._async_process_on_unload(hass)
+
+    assert not account.coordinator._shutdown_requested
+    await async_release_site_manager(hass, fingerprint, "entry-2")
+    assert account.coordinator._shutdown_requested
+
+
+async def test_last_unload_cancels_pending_initial_refresh(
+    hass: HomeAssistant,
+) -> None:
+    """Unloading the last entry cancels in-flight optional cloud polling."""
+    started = asyncio.Event()
+
+    async def wait_for_cancellation() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    client = _client()
+    coordinator = MagicMock()
+    coordinator.async_refresh = AsyncMock(side_effect=wait_for_cancellation)
+    coordinator.async_shutdown = AsyncMock()
+    with (
+        patch(
+            "custom_components.unifi_insights.coordinators.site_manager."
+            "UniFiSiteManagerClient",
+            return_value=client,
+        ),
+        patch(
+            "custom_components.unifi_insights.coordinators.site_manager."
+            "UnifiInsightsSiteManagerCoordinator",
+            return_value=coordinator,
+        ),
+    ):
+        fingerprint, account = await async_acquire_site_manager(
+            hass, "key", "entry", MagicMock()
+        )
+        await started.wait()
+
+        await async_release_site_manager(hass, fingerprint, "entry")
+
+    assert account.initial_refresh is not None
+    assert account.initial_refresh.cancelled()
+    coordinator.async_shutdown.assert_awaited_once()
+    client.close.assert_awaited_once()
 
 
 def test_diagnostics_omit_cloud_identity_and_raw_metadata() -> None:
@@ -216,3 +416,34 @@ def test_diagnostics_omit_cloud_identity_and_raw_metadata() -> None:
         "203.0.113.9",
     ):
         assert secret not in rendered
+
+
+def test_diagnostics_skips_malformed_site_and_isp_records() -> None:
+    """Unexpected cloud record shapes cannot leak or break diagnostics."""
+    snapshot = {
+        "hosts": {},
+        "sites": {
+            "not-a-site": None,
+            "missing-host": {"hostId": None},
+        },
+        "devices": {},
+        "isp_metrics": {
+            "host": {
+                "not-a-metric": None,
+                "missing-time": {"metric_time": None, "wan": {}},
+                "missing-wan": {
+                    "metric_time": "2026-01-02T03:10:00Z",
+                    "wan": None,
+                },
+                "bad-time": {"metric_time": "private invalid date", "wan": {}},
+            }
+        },
+        "sd_wan_configs": {},
+        "collections": {},
+    }
+
+    summary = _site_manager_summary(snapshot, "host")
+
+    assert summary["inventory"]["sites"] == 2
+    assert summary["selected_host"]["isp_samples"] == []
+    assert "private invalid date" not in repr(summary)
