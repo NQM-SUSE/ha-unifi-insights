@@ -189,8 +189,15 @@ _TAMPER_TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
 _LEAK_STATE_FIELDS: Final[frozenset[str]] = frozenset(
     {"isLeakDetected", "is_leak_detected"}
 )
+# `externalLeakDetectedAt` is the second (external probe) channel of
+# multi-channel leak sensors such as the USL-Environmental.
 _LEAK_TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
-    {"leakDetectedAt", "leak_detected_at"}
+    {
+        "leakDetectedAt",
+        "leak_detected_at",
+        "externalLeakDetectedAt",
+        "external_leak_detected_at",
+    }
 )
 
 # Group name -> every field spelling (state + timestamp) that identifies a
@@ -213,7 +220,10 @@ _PRESERVED_SENSOR_STATE_GROUP_STATE_FIELDS: Final[dict[str, frozenset[str]]] = {
     "door": _DOOR_STATE_FIELDS,
     "motion": _MOTION_STATE_FIELDS,
     "tamper": _TAMPER_STATE_FIELDS,
-    "leak": _LEAK_STATE_FIELDS,
+    # Sensors like the USL-Environmental report no `isLeakDetected` flag;
+    # their leak state IS the `*LeakDetectedAt` timestamp (null when dry),
+    # so the timestamps must take part in the agreement check.
+    "leak": _LEAK_STATE_FIELDS | _LEAK_TIMESTAMP_FIELDS,
 }
 
 

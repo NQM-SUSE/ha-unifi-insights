@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- USL-Environmental sensors now get their water leak binary sensors. These sensors report `mountType: "none"` and no `isLeakDetected` field, so the leak entity was never created even though the sensor supports leak detection. Leak support is now also detected from `featureFlags.waterLeak`, and the state falls back to the `leakDetectedAt` timestamp (set while wet, cleared when dry) when no explicit flag is present. Sensors with a second leak channel (`featureFlags.waterLeak.channelCount >= 2`) additionally get an "External Leak Detection" binary sensor backed by `externalLeakDetectedAt`, and that field now participates in the WebSocket/REST state preservation for the leak group. Existing leak sensors (`mountType: "leak"` / `isLeakDetected`) keep their entity and unique ID unchanged.
+
 ## [2026.9.7] - 2026-09-24
 
 ### Added

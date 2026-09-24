@@ -21,6 +21,8 @@ from .const import (
     ATTR_CAMERA_ID,
     ATTR_CAMERA_NAME,
     ATTR_LAST_MOTION,
+    ATTR_SENSOR_EXTERNAL_LEAK_DETECTED,
+    ATTR_SENSOR_EXTERNAL_LEAK_DETECTED_AT,
     ATTR_SENSOR_ID,
     ATTR_SENSOR_IS_OPENED,
     ATTR_SENSOR_LEAK_DETECTED,
@@ -147,6 +149,70 @@ def _is_doorbell_camera(camera_data: dict[str, Any]) -> bool:
             doorbell_name in camera_name
             for doorbell_name in ["doorbell", "door bell", "front door", "entrance"]
         )
+    )
+
+
+def _water_leak_channel_count(sensor_data: dict[str, Any]) -> int:
+    """
+    Return the number of water leak channels a Protect sensor reports.
+
+    The public Protect API advertises leak support via
+    ``featureFlags.waterLeak.channelCount`` (e.g. USL-Environmental reports
+    2: the internal contacts plus the external probe). Sensors that do not
+    support leak detection omit the ``waterLeak`` flag entirely.
+    """
+    feature_flags = sensor_data.get("featureFlags")
+    if not isinstance(feature_flags, dict):
+        return 0
+    water_leak = feature_flags.get("waterLeak")
+    if not isinstance(water_leak, dict):
+        return 0
+    try:
+        return int(water_leak.get("channelCount") or 0)
+    except TypeError, ValueError:
+        return 0
+
+
+def _supports_internal_leak(sensor_data: dict[str, Any]) -> bool:
+    """Return True if the sensor supports (internal) leak detection."""
+    return (
+        get_field(sensor_data, "mountType", "mount_type", default="")
+        in ("leak", "water")
+        or get_field(sensor_data, "isLeakDetected", "is_leak_detected") is not None
+        or _water_leak_channel_count(sensor_data) >= 1
+    )
+
+
+def _supports_external_leak(sensor_data: dict[str, Any]) -> bool:
+    """Return True if the sensor has a second (external probe) leak channel."""
+    return _water_leak_channel_count(sensor_data) >= 2  # noqa: PLR2004
+
+
+def _is_internal_leak_detected(sensor_data: dict[str, Any]) -> bool:
+    """
+    Return the internal leak state.
+
+    Prefers an explicit ``isLeakDetected`` flag when the API provides one.
+    Otherwise the state is derived from ``leakDetectedAt``, which the API
+    sets while a leak is active and clears (null) once the sensor is dry.
+    """
+    explicit = get_field(
+        sensor_data, "isLeakDetected", "is_leak_detected", "leak_detected"
+    )
+    if explicit is not None:
+        return bool(explicit)
+    return bool(get_field(sensor_data, "leakDetectedAt", "leak_detected_at"))
+
+
+def _is_external_leak_detected(sensor_data: dict[str, Any]) -> bool:
+    """Return the external probe leak state (derived like the internal one)."""
+    explicit = get_field(
+        sensor_data, "isExternalLeakDetected", "is_external_leak_detected"
+    )
+    if explicit is not None:
+        return bool(explicit)
+    return bool(
+        get_field(sensor_data, "externalLeakDetectedAt", "external_leak_detected_at")
     )
 
 
@@ -291,24 +357,25 @@ BINARY_SENSOR_TYPES: tuple[UnifiInsightsBinarySensorEntityDescription, ...] = (
         device_type=DEVICE_TYPE_SENSOR,
         entity_type="protect",
     ),
-    # Sensor leak detection (for water leak sensors)
+    # Sensor leak detection - internal contacts (USL-Leak, USL-Environmental)
     UnifiInsightsBinarySensorEntityDescription(
         key="sensor_leak",
         translation_key="sensor_leak",
         device_class=BinarySensorDeviceClass.MOISTURE,
-        value_fn=lambda device: get_field(
-            device,
-            "isLeakDetected",
-            "is_leak_detected",
-            "leak_detected",
-            default=False,
-        ),
+        value_fn=_is_internal_leak_detected,
         device_type=DEVICE_TYPE_SENSOR,
         entity_type="protect",
-        capability_fn=lambda data: (
-            get_field(data, "mountType", "mount_type", default="") in ("leak", "water")
-            or get_field(data, "isLeakDetected", "is_leak_detected") is not None
-        ),
+        capability_fn=_supports_internal_leak,
+    ),
+    # Sensor leak detection - external probe (second waterLeak channel)
+    UnifiInsightsBinarySensorEntityDescription(
+        key="sensor_leak_external",
+        translation_key="sensor_leak_external",
+        device_class=BinarySensorDeviceClass.MOISTURE,
+        value_fn=_is_external_leak_detected,
+        device_type=DEVICE_TYPE_SENSOR,
+        entity_type="protect",
+        capability_fn=_supports_external_leak,
     ),
 )
 
@@ -685,8 +752,14 @@ class UnifiProtectBinarySensor(UnifiProtectEntity, BinarySensorEntity):
                 ATTR_SENSOR_TAMPER_DETECTED_AT: device_data.get(
                     "tamperingDetectedAt", 0
                 ),
-                ATTR_SENSOR_LEAK_DETECTED: device_data.get("isLeakDetected", False),
+                ATTR_SENSOR_LEAK_DETECTED: _is_internal_leak_detected(device_data),
                 ATTR_SENSOR_LEAK_DETECTED_AT: device_data.get("leakDetectedAt", 0),
+                ATTR_SENSOR_EXTERNAL_LEAK_DETECTED: _is_external_leak_detected(
+                    device_data
+                ),
+                ATTR_SENSOR_EXTERNAL_LEAK_DETECTED_AT: device_data.get(
+                    "externalLeakDetectedAt", 0
+                ),
             }
 
 

@@ -255,6 +255,8 @@ ATTR_SENSOR_TAMPER_DETECTED_AT: Final = "tamper_detected_at"
 ATTR_SENSOR_ALARM_ENABLED: Final = "alarm_enabled"
 ATTR_SENSOR_LEAK_DETECTED: Final = "leak_detected"
 ATTR_SENSOR_LEAK_DETECTED_AT: Final = "leak_detected_at"
+ATTR_SENSOR_EXTERNAL_LEAK_DETECTED: Final = "external_leak_detected"
+ATTR_SENSOR_EXTERNAL_LEAK_DETECTED_AT: Final = "external_leak_detected_at"
 
 # NVR attributes
 ATTR_NVR_ID: Final = "nvr_id"

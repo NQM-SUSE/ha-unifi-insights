@@ -297,6 +297,9 @@
       "sensor_leak": {
         "name": "Leak Detection"
       },
+      "sensor_leak_external": {
+        "name": "External Leak Detection"
+      },
       "motion": {
         "name": "Motion"
       },

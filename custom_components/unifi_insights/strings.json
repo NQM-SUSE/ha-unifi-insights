@@ -303,6 +303,9 @@
       "sensor_leak": {
         "name": "Leak Detection"
       },
+      "sensor_leak_external": {
+        "name": "External Leak Detection"
+      },
       "port_sfp_present": {
         "name": "SFP Module"
       },
