@@ -17,6 +17,7 @@ from custom_components.unifi_insights.api import (
     UniFiRateLimitError,
     UniFiResponseError,
 )
+from custom_components.unifi_insights.api.const import DEFAULT_RATE_LIMIT_RETRY_AFTER
 from custom_components.unifi_insights.coordinators.site_manager import (
     UnifiInsightsSiteManagerCoordinator,
     _async_initial_refresh,
@@ -234,6 +235,31 @@ async def test_longest_rate_limit_deadline_wins(hass: HomeAssistant) -> None:
 
     deadline = datetime.fromisoformat(snapshot["cooldown_until"])
     assert deadline - datetime.now(UTC) > timedelta(seconds=110)
+
+
+@pytest.mark.parametrize(
+    "retry_after",
+    [10**12, 10**100],
+    ids=["datetime-addition", "timedelta-construction"],
+)
+async def test_unrepresentable_rate_limit_deadline_uses_default(
+    hass: HomeAssistant, retry_after: int
+) -> None:
+    """An unrepresentable Retry-After value does not abort the refresh."""
+    client = _client()
+    client.list_hosts.side_effect = UniFiRateLimitError(
+        "limited", status_code=429, retry_after=retry_after
+    )
+    coordinator = UnifiInsightsSiteManagerCoordinator(hass, client)
+
+    snapshot = await coordinator._async_update_data()
+
+    deadline = datetime.fromisoformat(snapshot["cooldown_until"])
+    remaining = deadline - datetime.now(UTC)
+    assert timedelta(seconds=DEFAULT_RATE_LIMIT_RETRY_AFTER - 1) <= remaining
+    assert remaining <= timedelta(seconds=DEFAULT_RATE_LIMIT_RETRY_AFTER)
+    assert snapshot["collections"]["hosts"]["error"] == "UniFiRateLimitError"
+    assert snapshot["collections"]["sites"]["available"] is True
 
 
 async def test_initial_refresh_failure_does_not_leak_response(

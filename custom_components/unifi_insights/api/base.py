@@ -61,7 +61,7 @@ def _retry_after_seconds(value: str | None) -> int:
     except ValueError:
         try:
             deadline = parsedate_to_datetime(value)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return DEFAULT_RATE_LIMIT_RETRY_AFTER
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=UTC)

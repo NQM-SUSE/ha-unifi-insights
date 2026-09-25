@@ -12,7 +12,7 @@ from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 
 from .api import __version__ as api_version
-from .const import CONF_CONSOLE_ID
+from .const import CONF_CONSOLE_ID, ISP_WAN_NUMBERS, SITE_MANAGER_COLLECTIONS
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -22,23 +22,6 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _MAX_HOST_SITE_COUNTS = 20
 _MAX_ISP_SAMPLES = 8
-_SITE_MANAGER_COLLECTIONS = (
-    "hosts",
-    "sites",
-    "devices",
-    "isp_metrics",
-    "sd_wan_configs",
-)
-_ISP_WAN_NUMBERS = (
-    "avgLatency",
-    "download_kbps",
-    "downtime",
-    "maxLatency",
-    "packetLoss",
-    "upload_kbps",
-    "uptime",
-)
-
 TO_REDACT = {
     # Credentials and secrets
     CONF_API_KEY,
@@ -311,7 +294,7 @@ def _site_manager_summary(
                 "metric_time": safe_time,
                 "wan": {
                     key: value
-                    for key in _ISP_WAN_NUMBERS
+                    for key in ISP_WAN_NUMBERS
                     if isinstance(value := wan.get(key), (int, float))
                     and not isinstance(value, bool)
                 },
@@ -355,7 +338,7 @@ def _site_manager_summary(
                 "updated_at": state.get("updated_at"),
                 "error": state.get("error"),
             }
-            for name in _SITE_MANAGER_COLLECTIONS
+            for name in SITE_MANAGER_COLLECTIONS
             if isinstance(state := collections.get(name), Mapping)
         },
         "last_attempt": snapshot.get("last_attempt"),

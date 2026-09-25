@@ -13,8 +13,14 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from custom_components.unifi_insights.api import ApiKeyAuth, UniFiRateLimitError
+from custom_components.unifi_insights.api.const import DEFAULT_RATE_LIMIT_RETRY_AFTER
 from custom_components.unifi_insights.api.site_manager import UniFiSiteManagerClient
-from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_SITE_MANAGER
+from custom_components.unifi_insights.const import (
+    DOMAIN,
+    ISP_WAN_NUMBERS,
+    SCAN_INTERVAL_SITE_MANAGER,
+    SITE_MANAGER_COLLECTIONS,
+)
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
@@ -22,16 +28,6 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _ACCOUNT_REGISTRY = "site_manager_accounts"
-_COLLECTIONS = ("hosts", "sites", "devices", "isp_metrics", "sd_wan_configs")
-_WAN_NUMBERS = (
-    "avgLatency",
-    "download_kbps",
-    "downtime",
-    "maxLatency",
-    "packetLoss",
-    "upload_kbps",
-    "uptime",
-)
 
 
 def _empty_snapshot() -> dict[str, Any]:
@@ -44,7 +40,7 @@ def _empty_snapshot() -> dict[str, Any]:
         "sd_wan_configs": {},
         "collections": {
             name: {"available": False, "updated_at": None, "error": None}
-            for name in _COLLECTIONS
+            for name in SITE_MANAGER_COLLECTIONS
         },
         "last_attempt": None,
         "cooldown_until": None,
@@ -89,7 +85,7 @@ def _latest_isp_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "metric_time": timestamp.isoformat(),
                 "wan": {
                     key: value
-                    for key in _WAN_NUMBERS
+                    for key in ISP_WAN_NUMBERS
                     if isinstance(value := wan.get(key), (int, float))
                     and not isinstance(value, bool)
                 },
@@ -141,7 +137,7 @@ class UnifiInsightsSiteManagerCoordinator(DataUpdateCoordinator[dict[str, Any]])
             self.client.list_sd_wan_configs(),
         )
         results = await asyncio.gather(*requests, return_exceptions=True)
-        for name, result in zip(_COLLECTIONS, results, strict=True):
+        for name, result in zip(SITE_MANAGER_COLLECTIONS, results, strict=True):
             state = snapshot["collections"][name]
             if isinstance(result, asyncio.CancelledError):
                 raise result
@@ -156,7 +152,12 @@ class UnifiInsightsSiteManagerCoordinator(DataUpdateCoordinator[dict[str, Any]])
                 state["error"] = type(result).__name__
                 if isinstance(result, UniFiRateLimitError):
                     retry_after = max(result.retry_after or 0, 0)
-                    deadline = now + timedelta(seconds=retry_after)
+                    try:
+                        deadline = now + timedelta(seconds=retry_after)
+                    except OverflowError:
+                        deadline = now + timedelta(
+                            seconds=DEFAULT_RATE_LIMIT_RETRY_AFTER
+                        )
                     if self._cooldown_until is None or deadline > self._cooldown_until:
                         self._cooldown_until = deadline
                 continue

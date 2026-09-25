@@ -337,7 +337,7 @@ async def test_setup_entry_remote_connection(
 
         remote_entry.add_to_hass(hass)
         await hass.config_entries.async_setup(remote_entry.entry_id)
-        await hass.async_block_till_done()
+        await hass.async_block_till_done(wait_background_tasks=True)
 
         assert remote_entry.state == ConfigEntryState.LOADED
         assert remote_entry.runtime_data.site_manager_coordinator is not None
