@@ -13,6 +13,7 @@ from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 
 from .api import __version__ as api_version
 from .const import CONF_CONSOLE_ID, ISP_WAN_NUMBERS, SITE_MANAGER_COLLECTIONS
+from .innerspace_transforms import build_innerspace_diagnostics_summary
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -80,6 +81,13 @@ TO_REDACT = {
     "id",
     "deviceId",
     "siteId",
+    "site_id",
+    "floor_plan_id",
+    "floorPlanId",
+    "matched_device_id",
+    "matched_site_id",
+    "image_url",
+    "imageUrl",
     # Location data
     "latitude",
     "longitude",
@@ -364,6 +372,10 @@ async def async_get_config_entry_diagnostics(
         "host": REDACTED,
         "network_client_connected": coordinator.network_client is not None,
         "protect_client_connected": coordinator.protect_client is not None,
+        "innerspace_client_connected": (
+            getattr(coordinator, "innerspace_client", None) is not None
+            or getattr(data, "innerspace_client", None) is not None
+        ),
     }
 
     # WS health signal (task 5): previously no way to tell "connected and
@@ -374,10 +386,14 @@ async def async_get_config_entry_diagnostics(
         protect_coordinator.websocket_health if protect_coordinator else None
     )
 
-    # The Site Manager snapshot contains account-wide identifiers and variable
-    # nested fields. Build its summary separately and exclude the raw section.
+    # The Site Manager and InnerSpace snapshots contain identifiers and variable
+    # nested fields. Build their summaries separately and exclude raw sections.
     facade_data = dict(coordinator.data)
     facade_data.pop("site_manager", None)
+    innerspace_snapshot = facade_data.pop("innerspace", None)
+    innerspace_coord = getattr(data, "innerspace_coordinator", None)
+    if not isinstance(innerspace_snapshot, Mapping) and innerspace_coord is not None:
+        innerspace_snapshot = innerspace_coord.data
     diagnostics_data: dict[str, Any] = {
         "library_version": library_version,
         "connection": connection_info,
@@ -385,6 +401,13 @@ async def async_get_config_entry_diagnostics(
         "entry": async_redact_data(entry.as_dict(), TO_REDACT),
         "data": _redact_coordinator_data(facade_data),
     }
+    if isinstance(innerspace_snapshot, Mapping):
+        diagnostics_data["innerspace"] = build_innerspace_diagnostics_summary(
+            innerspace_snapshot,
+            available=bool(getattr(coordinator, "innerspace_available", True)),
+            redact_fn=async_redact_data,
+            to_redact=TO_REDACT,
+        )
     if data.site_manager_coordinator:
         diagnostics_data["site_manager"] = _site_manager_summary(
             data.site_manager_coordinator.data,

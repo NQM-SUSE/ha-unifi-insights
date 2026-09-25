@@ -60,6 +60,9 @@ from .entity import (
 from .entity import (
     get_client_type as _get_client_type,
 )
+from .innerspace_entity import (
+    _discover_innerspace_sensors,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1457,6 +1460,9 @@ async def async_setup_entry(
 
         # Add UniFi Protect sensors
         _discover_protect_sensors(coordinator, known_sensor_keys, entities)
+
+        # Add UniFi InnerSpace placement sensors
+        _discover_innerspace_sensors(coordinator, known_sensor_keys, entities)
 
         if entities:
             _LOGGER.info("Adding %d UniFi Insights sensors", len(entities))
