@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#165](https://github.com/ruaan-deysel/ha-unifi-insights/issues/165)
 - Remote connections now load account-wide Site Manager host, site, and device inventory, five-minute ISP metrics, and SD-WAN configuration metadata through a shared optional coordinator. Diagnostics include bounded counts, selected-host ISP samples, and collection health without exporting cloud identifiers or raw account data. A Site Manager outage does not prevent the console integration from loading. [#171](https://github.com/ruaan-deysel/ha-unifi-insights/issues/171)
 
+### Fixed
+
+- UniFi Protect requests no longer exceed the console's rate limit. The local Protect Integration API allows 10 requests per second per API key, but each Protect poll fired its seven fetches within about 100 ms while camera snapshots drew from the same allowance, so polls regularly got `429 Too Many Requests`. Since 2026.9.2 these were absorbed without a log line, which hid them: one install measured 120 rate-limited requests in 15 minutes with nothing in the log. On some starts the WebSocket `host_id` lookup was the request rejected, leaving Protect on 30-second polling with no push updates. The Protect API client now spaces its requests to stay under the limit, and a rate-limited request, snapshots included, waits out the console's `Retry-After` (1 second) and is retried once. A request that is rate limited again holds the client's other requests for the same wait instead of letting them run into the limit. The Network client is unchanged, since its API is not rate limited this way.
+
 ## [2026.9.7] - 2026-09-24
 
 ### Added
