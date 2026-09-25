@@ -161,16 +161,20 @@ def _water_leak_channel_count(sensor_data: dict[str, Any]) -> int:
     2: the internal contacts plus the external probe). Sensors that do not
     support leak detection omit the ``waterLeak`` flag entirely.
     """
-    feature_flags = sensor_data.get("featureFlags")
+    feature_flags = get_field(sensor_data, "featureFlags", "feature_flags")
     if not isinstance(feature_flags, dict):
         return 0
-    water_leak = feature_flags.get("waterLeak")
+    water_leak = get_field(feature_flags, "waterLeak", "water_leak")
     if not isinstance(water_leak, dict):
         return 0
-    try:
-        return int(water_leak.get("channelCount") or 0)
-    except TypeError, ValueError:
+    raw_count = get_field(water_leak, "channelCount", "channel_count")
+    if isinstance(raw_count, bool):
         return 0
+    if isinstance(raw_count, int):
+        return raw_count
+    if isinstance(raw_count, str) and raw_count.isdigit():
+        return int(raw_count)
+    return 0
 
 
 def _supports_internal_leak(sensor_data: dict[str, Any]) -> bool:
@@ -185,7 +189,11 @@ def _supports_internal_leak(sensor_data: dict[str, Any]) -> bool:
 
 def _supports_external_leak(sensor_data: dict[str, Any]) -> bool:
     """Return True if the sensor has a second (external probe) leak channel."""
-    return _water_leak_channel_count(sensor_data) >= 2  # noqa: PLR2004
+    return (
+        get_field(sensor_data, "isExternalLeakDetected", "is_external_leak_detected")
+        is not None
+        or _water_leak_channel_count(sensor_data) >= 2  # noqa: PLR2004
+    )
 
 
 def _is_internal_leak_detected(sensor_data: dict[str, Any]) -> bool:

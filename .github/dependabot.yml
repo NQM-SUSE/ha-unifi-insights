@@ -47,3 +47,8 @@ updates:
       python-dependencies:
         patterns:
           - "*"
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly

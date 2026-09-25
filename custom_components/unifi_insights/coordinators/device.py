@@ -330,6 +330,12 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             if ports:
                 mapped["ports"] = ports
 
+        # Same parent-link block the merge path produces, so topology reads
+        # one shape whichever endpoint served the device list.
+        topology = cls._legacy_topology_block(legacy)
+        if topology:
+            mapped["topology"] = topology
+
         return mapped
 
     @staticmethod
@@ -465,6 +471,69 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         if outlet_metrics.ac_power_budget is not None:
             device_dict["outlet_ac_power_budget"] = outlet_metrics.ac_power_budget
             device_dict["ac_power_budget"] = outlet_metrics.ac_power_budget
+
+    @staticmethod
+    def _strict_int(value: Any) -> int | None:
+        """Return value when it is a real int (not a bool), else None."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    @classmethod
+    def _legacy_topology_block(cls, legacy: dict[str, Any]) -> dict[str, Any]:
+        """
+        Extract the parent-link fields topology needs from a legacy device.
+
+        The v1 API leaves ``uplink`` and ``type`` null on current firmware, so
+        the classic ``/stat/device`` record is the only source of which device
+        (and port) this one hangs off. ``last_uplink`` keeps the same keys when
+        the device is offline and ``uplink`` has been emptied.
+        """
+        block: dict[str, Any] = {}
+
+        legacy_type = legacy.get("type")
+        if isinstance(legacy_type, str) and legacy_type:
+            block["legacy_type"] = legacy_type.lower()
+
+        uplink = legacy.get("uplink")
+        link = uplink if isinstance(uplink, dict) else {}
+        if cls._normalize_mac(link.get("uplink_mac")) is None:
+            last_uplink = legacy.get("last_uplink")
+            if isinstance(last_uplink, dict) and cls._normalize_mac(
+                last_uplink.get("uplink_mac")
+            ):
+                link = {**link, **last_uplink}
+
+        uplink_mac = cls._normalize_mac(link.get("uplink_mac"))
+        if uplink_mac is not None:
+            block["uplink_mac"] = uplink_mac
+        for source_key, block_key in (
+            ("uplink_remote_port", "uplink_remote_port"),
+            ("port_idx", "uplink_port_idx"),
+            ("speed", "uplink_speed"),
+        ):
+            value = cls._strict_int(link.get(source_key))
+            if value is not None:
+                block[block_key] = value
+        uplink_type = link.get("type")
+        if isinstance(uplink_type, str) and uplink_type:
+            block["uplink_type"] = uplink_type.lower()
+
+        return block
+
+    @classmethod
+    def _merge_legacy_uplink_data(
+        cls,
+        device_dict: dict[str, Any],
+        legacy_devices_by_mac: dict[str, dict[str, Any]],
+    ) -> None:
+        """Attach the legacy parent link to a v1 device as ``topology``."""
+        legacy_device = cls._legacy_device_for(device_dict, legacy_devices_by_mac)
+        if legacy_device is None:
+            return
+        block = cls._legacy_topology_block(legacy_device)
+        if block:
+            device_dict["topology"] = block
 
     @classmethod
     def _merge_legacy_wan_data(
@@ -899,6 +968,9 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                     self._merge_legacy_temperature_data(device, legacy_devices_by_mac)
                     self._merge_legacy_port_data(device, legacy_devices_by_mac)
                     self._merge_legacy_outlet_data(device, legacy_devices_by_mac)
+                    # When legacy is primary, _legacy_device_to_v1_dict()
+                    # already embeds the topology block directly.
+                    self._merge_legacy_uplink_data(device, legacy_devices_by_mac)
                 # The legacy-to-v1 mapping does not carry WAN links, so they
                 # are merged whichever source is primary.
                 self._merge_legacy_wan_data(device, legacy_devices_by_mac)

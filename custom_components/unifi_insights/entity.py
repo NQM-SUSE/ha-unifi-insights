@@ -25,6 +25,7 @@ from .const import (
     MANUFACTURER,
 )
 from .coordinators import UnifiFacadeCoordinator
+from .innerspace_entity import UnifiInnerSpaceEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -520,3 +521,12 @@ class UnifiProtectEntity(CoordinatorEntity[UnifiFacadeCoordinator]):
             self._device_id
         )
         return data if isinstance(data, dict) else None
+
+
+__all__ = [
+    "UnifiInnerSpaceEntity",
+    "UnifiInsightsEntity",
+    "UnifiProtectEntity",
+    "get_field",
+    "is_device_online",
+]

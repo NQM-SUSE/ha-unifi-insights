@@ -1,0 +1,36 @@
+{
+  "name": "unifi-insights-topology-card",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Network topology Lovelace card for the UniFi Insights integration (built into custom_components/unifi_insights/frontend/).",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "size": "node scripts/check-size.mjs"
+  },
+  "dependencies": {
+    "@mdi/js": "7.4.47",
+    "d3-hierarchy": "3.1.2",
+    "d3-selection": "3.0.0",
+    "d3-transition": "3.0.1",
+    "d3-zoom": "3.0.0",
+    "lit": "3.3.3"
+  },
+  "devDependencies": {
+    "@types/d3-hierarchy": "3.1.7",
+    "@types/d3-selection": "3.0.12",
+    "@types/d3-transition": "3.0.9",
+    "@types/d3-zoom": "3.0.8",
+    "@vitest/coverage-v8": "5.0.1",
+    "axe-core": "4.13.0",
+    "eslint": "10.11.0",
+    "jsdom": "30.1.1",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.70.1",
+    "vite": "8.3.1",
+    "vitest": "5.0.1"
+  }
+}

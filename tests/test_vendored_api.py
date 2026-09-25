@@ -4,14 +4,33 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 
-from custom_components.unifi_insights.api import ApiKeyAuth, ConnectionType
-from custom_components.unifi_insights.api.const import ENDPOINT_TRAFFIC_ROUTES
+from custom_components.unifi_insights.api import (
+    ApiKeyAuth,
+    ConnectionType,
+    LocalAuth,
+    UniFiInnerSpaceClient,
+)
+from custom_components.unifi_insights.api import base as api_base
+from custom_components.unifi_insights.api.base import (
+    RequestRateLimiter,
+    parse_retry_after,
+)
+from custom_components.unifi_insights.api.const import (
+    DEFAULT_RATE_LIMIT_RETRY_AFTER,
+    ENDPOINT_TRAFFIC_ROUTES,
+    PROTECT_RATE_LIMIT_REQUESTS,
+    PROTECT_RATE_LIMIT_WINDOW,
+    RATE_LIMIT_MAX_RETRY_AFTER,
+    RATE_LIMIT_WINDOW_MARGIN,
+)
 from custom_components.unifi_insights.api.exceptions import (
+    UniFiConnectionError,
+    UniFiRateLimitError,
     UniFiResponseError,
     UniFiValidationError,
 )
@@ -144,20 +163,21 @@ async def test_get_hosts_remote_without_console_id() -> None:
     client = UniFiNetworkClient(
         auth=ApiKeyAuth(api_key="test-key"),
         connection_type=ConnectionType.REMOTE,
+        session=MagicMock(),
     )
-    client._get = AsyncMock(
-        return_value={
-            "data": [
-                {
-                    "id": "console-id",
-                    "type": "console",
-                    "reportedState": {"hostname": "Dream Router 7"},
-                }
-            ]
+    hosts = [
+        {
+            "id": "console-id",
+            "type": "console",
+            "reportedState": {"hostname": "Dream Router 7"},
         }
-    )
-
-    result = await client.get_hosts()
+    ]
+    with patch(
+        "custom_components.unifi_insights.api.network.client.UniFiSiteManagerClient"
+    ) as site_manager_class:
+        site_manager_class.return_value.list_hosts = AsyncMock(return_value=hosts)
+        result = await client.get_hosts()
+        site_manager_class.return_value.list_hosts.assert_awaited_once()
 
     assert result == [
         {
@@ -166,7 +186,7 @@ async def test_get_hosts_remote_without_console_id() -> None:
             "reportedState": {"hostname": "Dream Router 7"},
         }
     ]
-    client._get.assert_awaited_once_with("/v1/hosts")
+    site_manager_class.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -2076,3 +2096,444 @@ async def test_cameras_get_all_reports_complete_for_response_with_nothing_to_par
 
     assert await client.cameras.get_all() == []
     assert client.cameras.last_result_complete is True
+
+
+class _FakeClock:
+    """Monotonic clock that only moves when the code under test sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    """Drive the rate limiter from a fake clock instead of real time."""
+    clock = _FakeClock()
+    monkeypatch.setattr(api_base.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(api_base.asyncio, "sleep", clock.sleep)
+    return clock
+
+
+def test_protect_client_is_rate_limited_and_network_client_is_not() -> None:
+    """Only the Protect client paces itself.
+
+    The local Protect Integration API allows 10 requests per 1-second window
+    per API key; the Network Integration API sends no rate-limit headers and
+    does not draw from the Protect allowance.
+    """
+    protect = _protect_client()
+    assert protect._rate_limiter is not None
+    assert protect._rate_limiter._max_requests == PROTECT_RATE_LIMIT_REQUESTS
+    assert protect._rate_limiter._window == pytest.approx(
+        PROTECT_RATE_LIMIT_WINDOW + RATE_LIMIT_WINDOW_MARGIN
+    )
+    assert _network_client()._rate_limiter is None
+
+
+async def test_rate_limiter_admits_a_full_window_then_waits(
+    fake_clock: _FakeClock,
+) -> None:
+    """The limiter lets `max_requests` through at once and holds the next.
+
+    Regression test: the Protect coordinator used to fire its seven fetches
+    within ~100 ms, and together with camera snapshot pulls on the same API
+    key that exceeded the 10-per-second limit and 429'd every poll.
+    """
+    limiter = RequestRateLimiter(max_requests=3, window=1.0)
+
+    for _ in range(3):
+        await limiter.acquire()
+    assert fake_clock.sleeps == []
+
+    await limiter.acquire()
+    assert fake_clock.sleeps == [pytest.approx(1.0)]
+
+
+async def test_rate_limiter_window_rolls(fake_clock: _FakeClock) -> None:
+    """A slot frees up once its request start leaves the rolling window."""
+    limiter = RequestRateLimiter(max_requests=2, window=1.0)
+
+    await limiter.acquire()
+    fake_clock.now += 0.6
+    await limiter.acquire()
+    await limiter.acquire()  # must wait for the first start to expire
+
+    assert fake_clock.sleeps == [pytest.approx(0.4)]
+
+
+async def test_rate_limiter_defer_holds_requests(fake_clock: _FakeClock) -> None:
+    """After a 429 every request waits out the server's Retry-After."""
+    limiter = RequestRateLimiter(max_requests=10, window=1.0)
+
+    limiter.defer(2)
+    await limiter.acquire()
+
+    assert fake_clock.sleeps == [pytest.approx(2.0)]
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({"Retry-After": "1"}, 1),
+        ({}, DEFAULT_RATE_LIMIT_RETRY_AFTER),
+        ({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}, 0),
+        ({"Retry-After": "invalid"}, DEFAULT_RATE_LIMIT_RETRY_AFTER),
+    ],
+)
+def test_parse_retry_after(headers: dict[str, str], expected: int) -> None:
+    """Retry-After parses seconds or HTTP dates; invalid headers fall back to default.
+
+    An HTTP-date Retry-After (allowed by RFC 9110) used to raise ValueError
+    out of the response handler instead of a UniFiRateLimitError.
+    """
+    assert parse_retry_after(headers) == expected
+
+
+def _rate_limit_error(retry_after: int) -> UniFiRateLimitError:
+    return UniFiRateLimitError(
+        "Rate limited by API", status_code=429, retry_after=retry_after
+    )
+
+
+def _response_context(
+    status: int, headers: dict[str, str], body: Any = None
+) -> MagicMock:
+    """An `async with session.request(...)` context yielding one response."""
+    response = MagicMock()
+    response.status = status
+    response.headers = headers
+    response.text = AsyncMock(
+        return_value="Too many requests" if status == 429 else "response body"
+    )
+    response.json = AsyncMock(return_value=body)
+    response.read = AsyncMock(return_value=b"jpeg")
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=None)
+    return context
+
+
+def _recording_session(
+    fake_clock: _FakeClock, contexts: list[MagicMock], method: str
+) -> tuple[MagicMock, list[float]]:
+    """A session whose `method` hands out `contexts` in turn, noting send times."""
+    send_times: list[float] = []
+
+    def send(*args: Any, **kwargs: Any) -> MagicMock:
+        send_times.append(fake_clock.now)
+        return contexts.pop(0)
+
+    session = MagicMock()
+    session.closed = False
+    setattr(session, method, MagicMock(side_effect=send))
+    return session, send_times
+
+
+async def test_request_retries_once_after_short_retry_after(
+    fake_clock: _FakeClock,
+) -> None:
+    """A 429 with a short Retry-After is waited out and retried once.
+
+    Both attempts go through the limiter, so the retry is only sent once the
+    Retry-After has passed.
+    """
+    client = _protect_client()
+    session, send_times = _recording_session(
+        fake_clock,
+        [
+            _response_context(429, {"Retry-After": "1"}),
+            _response_context(200, {}, {"ok": True}),
+        ],
+        "request",
+    )
+    client._session = session
+    start = fake_clock.now
+
+    assert await client._get("/cameras") == {"ok": True}
+    assert session.request.call_count == 2
+    assert send_times == [start, pytest.approx(start + 1)]
+
+
+async def test_request_raises_when_retry_also_rate_limited(
+    fake_clock: _FakeClock,
+) -> None:
+    """Only one retry: a second 429 reaches the caller, and defers the client.
+
+    Without the second defer, other queued requests would start against the
+    allowance the server has just rejected again.
+    """
+    client = _protect_client()
+    session, send_times = _recording_session(
+        fake_clock,
+        [
+            _response_context(429, {"Retry-After": "1"}),
+            _response_context(429, {"Retry-After": "1"}),
+        ],
+        "request",
+    )
+    client._session = session
+    start = fake_clock.now
+
+    with pytest.raises(UniFiRateLimitError):
+        await client._get("/cameras")
+    assert session.request.call_count == 2
+    assert send_times == [start, pytest.approx(start + 1)]
+    assert client._rate_limiter is not None
+    assert client._rate_limiter._blocked_until == pytest.approx(start + 2)
+
+
+async def test_request_does_not_retry_long_retry_after(
+    fake_clock: _FakeClock,
+) -> None:
+    """A long (or defaulted) Retry-After is raised, never slept through."""
+    client = _protect_client()
+    client._request_once = AsyncMock(  # type: ignore[method-assign]
+        side_effect=_rate_limit_error(RATE_LIMIT_MAX_RETRY_AFTER + 1)
+    )
+
+    with pytest.raises(UniFiRateLimitError):
+        await client._get("/cameras")
+    assert client._request_once.await_count == 1
+    assert fake_clock.sleeps == []
+    # The client still backs off, capped so a long wait cannot freeze it.
+    assert client._rate_limiter is not None
+    assert client._rate_limiter._blocked_until == pytest.approx(
+        fake_clock.now + RATE_LIMIT_MAX_RETRY_AFTER
+    )
+
+
+async def test_unlimited_client_does_not_retry_429() -> None:
+    """Clients without a known rate limit keep the old raise-through behavior."""
+    client = _network_client()
+    client._request_once = AsyncMock(  # type: ignore[method-assign]
+        side_effect=_rate_limit_error(1)
+    )
+
+    with pytest.raises(UniFiRateLimitError):
+        await client._get("/sites")
+    assert client._request_once.await_count == 1
+
+
+async def test_request_once_waits_for_rate_limiter(fake_clock: _FakeClock) -> None:
+    """Every HTTP request goes through the limiter before it is sent."""
+    client = _protect_client()
+    session = MagicMock()
+    session.closed = False
+    session.request = MagicMock(side_effect=aiohttp.ClientError("boom"))
+    client._session = session
+    assert client._rate_limiter is not None
+    client._rate_limiter.defer(1)
+
+    with pytest.raises(UniFiConnectionError):
+        await client._request_once("GET", "/cameras")
+
+    assert fake_clock.sleeps == [pytest.approx(1.0)]
+    session.request.assert_called_once()
+
+
+def _binary_session(status: int, headers: dict[str, str]) -> MagicMock:
+    session = MagicMock()
+    session.closed = False
+    session.get = MagicMock(
+        side_effect=lambda *args, **kwargs: _response_context(status, headers)
+    )
+    return session
+
+
+async def test_binary_429_is_retried_once(fake_clock: _FakeClock) -> None:
+    """A rate-limited snapshot waits out a short Retry-After and is retried."""
+    client = _protect_client()
+    session, send_times = _recording_session(
+        fake_clock,
+        [
+            _response_context(429, {"Retry-After": "1"}),
+            _response_context(200, {}),
+        ],
+        "get",
+    )
+    client._session = session
+    start = fake_clock.now
+
+    assert await client._get_binary("/cameras/abc/snapshot") == b"jpeg"
+    assert session.get.call_count == 2
+    assert send_times == [start, pytest.approx(start + 1)]
+
+
+async def test_binary_429_on_retry_defers_whole_client(
+    fake_clock: _FakeClock,
+) -> None:
+    """A snapshot rate limited twice fails, and makes every request back off.
+
+    Snapshots draw from the same per-key allowance as the JSON calls, so the
+    back-off must apply to the whole client, not just the snapshot.
+    """
+    client = _protect_client()
+    client._session = _binary_session(429, {"Retry-After": "1"})
+    start = fake_clock.now
+
+    with pytest.raises(UniFiConnectionError):
+        await client._get_binary("/cameras/abc/snapshot")
+
+    assert client._session.get.call_count == 2
+    assert client._rate_limiter is not None
+    assert client._rate_limiter._blocked_until == pytest.approx(start + 2)
+
+
+async def test_binary_429_without_retry_after_defers_capped(
+    fake_clock: _FakeClock,
+) -> None:
+    """A missing Retry-After is not retried and must not freeze the client.
+
+    It defaults to 60 s, far past the retry cap, so the snapshot fails at
+    once and the client backs off only for the capped wait.
+    """
+    client = _protect_client()
+    client._session = _binary_session(429, {})
+
+    with pytest.raises(UniFiConnectionError):
+        await client._get_binary("/cameras/abc/snapshot")
+
+    assert client._session.get.call_count == 1
+    assert client._rate_limiter is not None
+    assert client._rate_limiter._blocked_until == pytest.approx(
+        fake_clock.now + RATE_LIMIT_MAX_RETRY_AFTER
+    )
+
+
+async def test_binary_request_is_throttled(fake_clock: _FakeClock) -> None:
+    """Snapshot pulls wait for the limiter like every other request."""
+    client = _protect_client()
+    client._session = _binary_session(200, {})
+    assert client._rate_limiter is not None
+    client._rate_limiter.defer(1)
+
+    assert await client._get_binary("/cameras/abc/snapshot") == b"jpeg"
+    assert fake_clock.sleeps == [pytest.approx(1.0)]
+
+
+class TestUniFiInnerSpaceClient:
+    """Tests for UniFiInnerSpaceClient local/remote paths and endpoints."""
+
+    def test_init_validation_and_paths(self) -> None:
+        """Test LOCAL and REMOTE client initialization and path building."""
+        with pytest.raises(ValueError, match="base_url is required"):
+            UniFiInnerSpaceClient(
+                auth=LocalAuth(api_key="k", verify_ssl=False),
+                connection_type=ConnectionType.LOCAL,
+            )
+
+        with pytest.raises(ValueError, match="console_id is required"):
+            UniFiInnerSpaceClient(
+                auth=ApiKeyAuth(api_key="k"),
+                connection_type=ConnectionType.REMOTE,
+            )
+
+        local_client = UniFiInnerSpaceClient(
+            auth=LocalAuth(api_key="k", verify_ssl=False),
+            base_url="https://192.168.1.1",
+            connection_type=ConnectionType.LOCAL,
+        )
+        assert local_client.connection_type == ConnectionType.LOCAL
+        assert local_client.console_id is None
+        assert (
+            local_client._build_api_path("project")
+            == "/proxy/innerspace/integration/v1/project"
+        )
+
+        remote_client = UniFiInnerSpaceClient(
+            auth=ApiKeyAuth(api_key="k"),
+            connection_type=ConnectionType.REMOTE,
+            console_id="console-123",
+        )
+        assert remote_client.connection_type == ConnectionType.REMOTE
+        assert remote_client.console_id == "console-123"
+        expected_remote = (
+            "/v1/connector/consoles/console-123/innerspace/integration/v1/floor_plans"
+        )
+        assert remote_client._build_api_path("/floor_plans") == expected_remote
+
+    @pytest.mark.asyncio
+    async def test_endpoints_and_malformed_handling(self) -> None:
+        """Test all 5 InnerSpace endpoints, validate_connection, and malformed data."""
+        client = UniFiInnerSpaceClient(
+            auth=LocalAuth(api_key="k", verify_ssl=False),
+            base_url="https://192.168.1.1",
+            connection_type=ConnectionType.LOCAL,
+        )
+
+        client._get = AsyncMock(
+            return_value={
+                "data": {
+                    "project": {"id": "proj-1"},
+                    "plans": [{"id": "fp-1", "name": "Floor 1", "siteId": "site-1"}],
+                    "products": [],
+                }
+            }
+        )
+        proj = await client.get_project(mode="2D")
+        assert proj.project is not None
+        assert proj.project.id == "proj-1"
+        assert await client.validate_connection() is True
+
+        # Root-level project fields without 'project' wrapper are also accepted
+        client._get = AsyncMock(
+            return_value={"id": "proj-root", "title": "Root Project"}
+        )
+        proj_root = await client.get_project()
+        assert proj_root.project is not None
+        assert proj_root.project.id == "proj-root"
+
+        client._get = AsyncMock(
+            return_value={"floor_plans": [{"id": "fp-1", "name": "Floor 1"}]}
+        )
+        fps = await client.list_floor_plans(site_id="site-1")
+        assert len(fps) == 1
+        assert fps[0].id == "fp-1"
+
+        client._get = AsyncMock(
+            return_value={
+                "access_points": [
+                    {"id": "ap-1", "name": "AP 1", "floor_plan_id": "fp-1"}
+                ]
+            }
+        )
+        aps = await client.list_access_points()
+        assert len(aps) == 1
+        assert aps[0].id == "ap-1"
+
+        client._get = AsyncMock(
+            return_value={
+                "switches": [{"id": "sw-1", "name": "SW 1", "floor_plan_id": "fp-1"}]
+            }
+        )
+        switches = await client.list_switches()
+        assert len(switches) == 1
+        assert switches[0].id == "sw-1"
+
+        client._get = AsyncMock(
+            return_value={"devices": [{"id": "inv-1", "name": "Unplaced AP"}]}
+        )
+        inventory = await client.list_inventory()
+        assert len(inventory) == 1
+        assert inventory[0].id == "inv-1"
+
+        # Malformed responses raise UniFiResponseError
+        client._get = AsyncMock(return_value="not-a-dict")
+        with pytest.raises(UniFiResponseError):
+            await client.get_project()
+        assert await client.validate_connection() is False
+
+        client._get = AsyncMock(return_value={"unexpected": []})
+        with pytest.raises(UniFiResponseError):
+            await client.get_project()
+        assert await client.validate_connection() is False
+        with pytest.raises(UniFiResponseError):
+            await client.list_floor_plans()

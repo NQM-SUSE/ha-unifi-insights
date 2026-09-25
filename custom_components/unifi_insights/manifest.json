@@ -1,10 +1,11 @@
 {
   "domain": "unifi_insights",
   "name": "UniFi Insights",
+  "after_dependencies": ["http", "frontend", "lovelace"],
   "bluetooth": [],
   "codeowners": ["@ruaan-deysel"],
   "config_flow": true,
-  "dependencies": ["ffmpeg", "stream"],
+  "dependencies": ["ffmpeg", "stream", "websocket_api"],
   "dhcp": [],
   "documentation": "https://github.com/ruaan-deysel/ha-unifi-insights",
   "integration_type": "hub",

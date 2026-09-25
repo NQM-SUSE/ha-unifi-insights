@@ -1,0 +1,158 @@
+{
+  "edges": [
+    {
+      "medium": "wireless",
+      "source": "cli:cli-phone",
+      "target": "dev:uuid-ap"
+    },
+    {
+      "medium": "wired",
+      "parent_port": 4,
+      "source": "cli:cli-tv",
+      "target": "dev:uuid-u1"
+    },
+    {
+      "child_port": 1,
+      "medium": "wired",
+      "parent_port": 20,
+      "poe_power_w": 12.3,
+      "source": "dev:uuid-ap",
+      "speed_mbps": 2500,
+      "target": "dev:uuid-core"
+    },
+    {
+      "child_port": 26,
+      "medium": "wired",
+      "parent_port": 11,
+      "source": "dev:uuid-core",
+      "speed_mbps": 10000,
+      "target": "dev:uuid-gw"
+    },
+    {
+      "child_port": 1,
+      "medium": "wired",
+      "parent_port": 17,
+      "source": "dev:uuid-flex",
+      "speed_mbps": 2500,
+      "target": "dev:uuid-core"
+    },
+    {
+      "child_port": 1,
+      "medium": "wired",
+      "parent_port": 12,
+      "source": "dev:uuid-lite",
+      "speed_mbps": 1000,
+      "target": "dev:uuid-core"
+    },
+    {
+      "child_port": 1,
+      "medium": "wired",
+      "parent_port": 8,
+      "source": "dev:uuid-pdu",
+      "speed_mbps": 100,
+      "target": "dev:uuid-core"
+    },
+    {
+      "child_port": 1,
+      "medium": "wired",
+      "parent_port": 6,
+      "source": "dev:uuid-u1",
+      "speed_mbps": 1000,
+      "target": "dev:uuid-core"
+    },
+    {
+      "child_port": 1,
+      "medium": "wired",
+      "parent_port": 10,
+      "source": "dev:uuid-u2",
+      "speed_mbps": 1000,
+      "target": "dev:uuid-core"
+    }
+  ],
+  "entry_id": "entry-1",
+  "issues": [],
+  "nodes": [
+    {
+      "ha_device_id": "reg-gw",
+      "id": "dev:uuid-gw",
+      "kind": "gateway",
+      "model": "UDM Pro SE",
+      "name": "Gateway",
+      "state": "online"
+    },
+    {
+      "ha_device_id": "reg-core",
+      "id": "dev:uuid-core",
+      "kind": "switch",
+      "model": "USW Pro Max 24",
+      "name": "Core 24",
+      "state": "online"
+    },
+    {
+      "id": "dev:uuid-flex",
+      "kind": "switch",
+      "model": "USW",
+      "name": "Flex",
+      "state": "online"
+    },
+    {
+      "id": "dev:uuid-lite",
+      "kind": "switch",
+      "model": "USW",
+      "name": "Lite 8",
+      "state": "online"
+    },
+    {
+      "id": "dev:uuid-pdu",
+      "kind": "switch",
+      "model": "USW",
+      "name": "PDU",
+      "state": "online"
+    },
+    {
+      "id": "dev:uuid-u1",
+      "kind": "switch",
+      "model": "USW",
+      "name": "Ultra A",
+      "state": "online"
+    },
+    {
+      "id": "dev:uuid-u2",
+      "kind": "switch",
+      "model": "USW",
+      "name": "Ultra B",
+      "state": "online"
+    },
+    {
+      "id": "dev:uuid-ap",
+      "kind": "access_point",
+      "model": "USW",
+      "name": "AP",
+      "state": "online"
+    },
+    {
+      "connection": "wireless",
+      "id": "cli:cli-phone",
+      "kind": "client",
+      "name": "Phone",
+      "network_name": "Default",
+      "state": "online"
+    },
+    {
+      "connection": "wired",
+      "id": "cli:cli-tv",
+      "kind": "client",
+      "name": "TV",
+      "network_name": "Media",
+      "state": "online",
+      "vlan_id": 3
+    }
+  ],
+  "revision": "5d5bb54054874193",
+  "schema_version": 1,
+  "site_id": "site-1",
+  "site_name": "Home",
+  "status": "ok",
+  "truncation": null,
+  "unresolved": []
+}

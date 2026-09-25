@@ -7,7 +7,7 @@ import copy
 import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
@@ -23,6 +23,14 @@ from custom_components.unifi_insights.api import (
     UniFiResponseError,
     UniFiTimeoutError,
 )
+from custom_components.unifi_insights.api.innerspace import (
+    InnerSpaceAccessPoint,
+    InnerSpaceFloorPlan,
+    InnerSpaceInventoryDevice,
+    InnerSpaceProject,
+    InnerSpaceProjectIdentity,
+    InnerSpaceSwitch,
+)
 from custom_components.unifi_insights.api.network.models import (
     LegacyPortMetrics,
     PortBytesMetrics,
@@ -35,6 +43,9 @@ from custom_components.unifi_insights.const import (
     SCAN_INTERVAL_CONFIG,
     SCAN_INTERVAL_DEVICE,
     SCAN_INTERVAL_PROTECT,
+)
+from custom_components.unifi_insights.coordinators import (
+    UnifiInsightsInnerSpaceCoordinator,
 )
 from custom_components.unifi_insights.coordinators.base import UnifiBaseCoordinator
 from custom_components.unifi_insights.coordinators.config import UnifiConfigCoordinator
@@ -1140,6 +1151,144 @@ class TestUnifiConfigCoordinator:
         assert "wifi1" in result["wifi"].get("default", {})
         # WiFi without ID should not be in the dict
         assert None not in result["wifi"].get("default", {})
+
+    def test_client_links_from_stat_sta(self):
+        """Only link fields survive; MACs normalise; untagged has no vlan."""
+        links = UnifiConfigCoordinator._client_links(
+            [
+                {
+                    "mac": "8C:ED:E1:00:00:01",
+                    "hostname": "cam",
+                    "ip": "10.2.0.77",
+                    "is_wired": True,
+                    "sw_mac": "28:70:4E:00:00:01",
+                    "sw_port": 14,
+                    "vlan": 3,
+                    "network": "Cameras",
+                    "network_id": "legacy-net-1",
+                },
+                {
+                    "mac": "12:00:00:00:00:02",
+                    "is_wired": False,
+                    "ap_mac": "02:00:00:00:00:08",
+                    "network": "Default",
+                },
+                {
+                    "mac": "aa:bb:cc:00:00:03",
+                    "is_wired": True,
+                    "sw_mac": "28:70:4e:00:00:01",
+                    "sw_port": 5,
+                    "vlan": 0,
+                    "network": "Default",
+                },
+                {"mac": "not-a-mac"},
+                "garbage",
+            ]
+        )
+
+        assert links == {
+            "8c:ed:e1:00:00:01": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 14,
+                "vlan": 3,
+                "network_name": "Cameras",
+            },
+            "12:00:00:00:00:02": {
+                "ap_mac": "02:00:00:00:00:08",
+                "network_name": "Default",
+            },
+            "aa:bb:cc:00:00:03": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 5,
+                "network_name": "Default",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_collects_client_links_without_wifi(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """Links are built even when the Wi-Fi section is unavailable."""
+        client = coordinator.network_client
+        client.wifi.get_all = AsyncMock(side_effect=RuntimeError("wifi down"))
+        client.clients.get_active_legacy = AsyncMock(
+            return_value=[
+                {
+                    "mac": "8c:ed:e1:00:00:01",
+                    "sw_mac": "28:70:4e:00:00:01",
+                    "sw_port": 3,
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"]["default"] == {
+            "8c:ed:e1:00:00:01": {"sw_mac": "28:70:4e:00:00:01", "sw_port": 3}
+        }
+        # The fixture polls two sites, so this call also runs for "site2";
+        # count the "default" calls specifically to pin the spec's "one
+        # /stat/sta call per site" invariant without over-specifying the
+        # total call count across sites, which is incidental here.
+        assert (
+            client.clients.get_active_legacy.await_args_list.count(call("default")) == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_keeps_client_links_on_failure(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """A failed /stat/sta keeps the previous links and does not fail."""
+        coordinator.data["client_links"] = {
+            "default": {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+        }
+        coordinator.network_client.clients.get_active_legacy = AsyncMock(
+            side_effect=RuntimeError("sta down")
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"]["default"] == {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_wifi_enrichment_unchanged(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """The single /stat/sta call still feeds per-SSID client counts."""
+        client = coordinator.network_client
+        client.wifi.get_legacy_configs = AsyncMock(
+            return_value=[{"name": "MainWiFi", "security": "wpapsk"}]
+        )
+        client.clients.get_active_legacy = AsyncMock(
+            return_value=[{"essid": "MainWiFi", "mac": "12:00:00:00:00:02"}]
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["wifi"]["default"]["wifi1"]["num_connected_clients"] == 1
+        # The fixture polls two sites, so this call also runs for "site2";
+        # count the "default" calls specifically to pin the spec's "one
+        # /stat/sta call per site" invariant without over-specifying the
+        # total call count across sites, which is incidental here.
+        assert (
+            client.clients.get_active_legacy.await_args_list.count(call("default")) == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_clears_client_links_with_no_sites(
+        self, coordinator: UnifiConfigCoordinator
+    ):
+        """The no-sites early return blanks client_links like its siblings."""
+        coordinator.data["client_links"] = {
+            "default": {"aa:aa:aa:aa:aa:aa": {"vlan": 2}}
+        }
+        coordinator.network_client.sites.get_all = AsyncMock(
+            side_effect=UniFiNotFoundError("Not found", status_code=404)
+        )
+
+        result = await coordinator._async_update_data()
+
+        assert result["client_links"] == {}
 
 
 # ============================================================================
@@ -2532,6 +2681,157 @@ class TestUnifiDeviceCoordinator:
         ports = device_dict.get("ports", [])
         assert len(ports) == 1
         assert ports[0]["port_idx"] == 1
+
+    def test_legacy_topology_block_reads_uplink(self):
+        """The parent link and legacy type are copied from /stat/device."""
+        block = UnifiDeviceCoordinator._legacy_topology_block(
+            {
+                "mac": "58:d6:1f:00:00:02",
+                "type": "USW",
+                "uplink": {
+                    "uplink_mac": "28:70:4E:00:00:01",
+                    "uplink_remote_port": 6,
+                    "port_idx": 8,
+                    "type": "wire",
+                    "speed": 1000,
+                    "ip": "10.1.0.105",
+                    "mac": "58:d6:1f:00:00:02",
+                },
+            }
+        )
+
+        assert block == {
+            "legacy_type": "usw",
+            "uplink_mac": "28:70:4e:00:00:01",
+            "uplink_remote_port": 6,
+            "uplink_port_idx": 8,
+            "uplink_type": "wire",
+            "uplink_speed": 1000,
+        }
+
+    def test_legacy_topology_block_falls_back_to_last_uplink(self):
+        """An offline device keeps its parent through last_uplink."""
+        block = UnifiDeviceCoordinator._legacy_topology_block(
+            {
+                "type": "uap",
+                "uplink": {"type": "wire"},
+                "last_uplink": {
+                    "uplink_mac": "28:70:4e:00:00:01",
+                    "uplink_remote_port": 20,
+                    "port_idx": 1,
+                    "type": "wire",
+                },
+            }
+        )
+
+        assert block["uplink_mac"] == "28:70:4e:00:00:01"
+        assert block["uplink_remote_port"] == 20
+        assert block["uplink_port_idx"] == 1
+
+    def test_legacy_topology_block_gateway_and_garbage(self):
+        """A gateway has a type but no parent; malformed values are dropped."""
+        assert UnifiDeviceCoordinator._legacy_topology_block(
+            {"type": "udm", "uplink": {"type": "wire", "speed": 2500}}
+        ) == {"legacy_type": "udm", "uplink_type": "wire", "uplink_speed": 2500}
+        assert (
+            UnifiDeviceCoordinator._legacy_topology_block(
+                {
+                    "type": "",
+                    "uplink": {
+                        "uplink_mac": 5,
+                        "uplink_remote_port": True,
+                        "speed": "fast",
+                    },
+                }
+            )
+            == {}
+        )
+
+    def test_merge_legacy_uplink_data_matches_by_mac(self):
+        """The block lands on the v1 device whose MAC matches, case-insensitively."""
+        device = {"id": "uuid-child", "macAddress": "58:D6:1F:00:00:02", "uplink": None}
+        legacy = {
+            "mac": "58:d6:1f:00:00:02",
+            "type": "usw",
+            "uplink": {"uplink_mac": "28:70:4e:00:00:01", "uplink_remote_port": 6},
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_uplink_data(
+            device, {"58:d6:1f:00:00:02": legacy}
+        )
+
+        assert device["topology"]["uplink_mac"] == "28:70:4e:00:00:01"
+        # The v1 field is left alone.
+        assert device["uplink"] is None
+
+    def test_merge_legacy_uplink_data_without_match_is_noop(self):
+        """No legacy record, or an empty block, adds nothing."""
+        device = {"id": "uuid-x", "macAddress": "aa:bb:cc:dd:ee:ff"}
+        UnifiDeviceCoordinator._merge_legacy_uplink_data(device, {})
+        UnifiDeviceCoordinator._merge_legacy_uplink_data(
+            device, {"aa:bb:cc:dd:ee:ff": {"mac": "aa:bb:cc:dd:ee:ff"}}
+        )
+        assert "topology" not in device
+
+    def test_legacy_device_to_v1_dict_carries_topology(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """The legacy-only fallback produces the same block as the merge path."""
+        mapped = coordinator._legacy_device_to_v1_dict(
+            {
+                "_id": "60a1b2c3d4e5f67890123456",
+                "mac": "58:d6:1f:00:00:02",
+                "type": "usw",
+                "uplink": {"uplink_mac": "28:70:4e:00:00:01", "port_idx": 8},
+            }
+        )
+
+        assert mapped["topology"] == {
+            "legacy_type": "usw",
+            "uplink_mac": "28:70:4e:00:00:01",
+            "uplink_port_idx": 8,
+        }
+
+    @pytest.mark.asyncio
+    async def test_process_site_merges_legacy_uplink(
+        self, coordinator: UnifiDeviceCoordinator
+    ):
+        """The real refresh path attaches the block to v1 devices."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            return_value=[
+                {
+                    "id": "uuid-child",
+                    "name": "Ultra",
+                    "model": "USW Ultra",
+                    "macAddress": "58:d6:1f:00:00:02",
+                    "state": "ONLINE",
+                    "uplink": None,
+                }
+            ]
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "legacy-child",
+                    "mac": "58:d6:1f:00:00:02",
+                    "type": "usw",
+                    "uplink": {
+                        "uplink_mac": "28:70:4e:00:00:01",
+                        "uplink_remote_port": 6,
+                    },
+                }
+            ]
+        )
+
+        devices_dict, _stats, _clients = await coordinator._process_site(
+            "default", legacy_site_name="default"
+        )
+
+        assert devices_dict["uuid-child"]["topology"] == {
+            "legacy_type": "usw",
+            "uplink_mac": "28:70:4e:00:00:01",
+            "uplink_remote_port": 6,
+        }
 
 
 # ============================================================================
@@ -6282,3 +6582,124 @@ class TestProtectCoordinatorEdgeCases:
 
         # Event should be stored but no error
         assert "motion" in coordinator.data["events"]
+
+
+class TestUnifiInsightsInnerSpaceCoordinator:
+    """Tests for UnifiInsightsInnerSpaceCoordinator and facade integration."""
+
+    @pytest.mark.asyncio
+    async def test_update_and_snapshot_preservation_on_failure(
+        self,
+        hass: HomeAssistant,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_innerspace_client: MagicMock,
+        mock_config_entry: MockConfigEntry,
+    ) -> None:
+        """Test InnerSpace refresh normalizes data and preserves snapshot on failure."""
+        mock_innerspace_client.get_project.return_value = InnerSpaceProject(
+            project=InnerSpaceProjectIdentity(id="proj-1"),
+        )
+        mock_innerspace_client.list_floor_plans.return_value = [
+            InnerSpaceFloorPlan(
+                id="fp-1",
+                name="First Floor",
+                floor_number=1,
+                site_id="default",
+                ppm=20.0,
+            )
+        ]
+        mock_innerspace_client.list_access_points.return_value = [
+            InnerSpaceAccessPoint(
+                id="ap-1",
+                name="Office AP",
+                model="U6-Pro",
+                mac="AA:BB:CC:DD:EE:FF",
+                floor_plan_id="fp-1",
+                x=10.0,
+                y=20.0,
+                status="online",
+            )
+        ]
+        mock_innerspace_client.list_switches.return_value = [
+            InnerSpaceSwitch(
+                id="sw-1",
+                name="Office SW",
+                model="USW-24",
+                floor_plan_id="fp-1",
+                x=5.0,
+                y=15.0,
+                status="online",
+            )
+        ]
+        mock_innerspace_client.list_inventory.return_value = [
+            InnerSpaceInventoryDevice(
+                id="inv-1",
+                name="Spare AP",
+                model="U6-LR",
+                mac="AA:BB:CC:99:99:99",
+            )
+        ]
+
+        coord = UnifiInsightsInnerSpaceCoordinator(
+            hass=hass,
+            network_client=mock_network_client,
+            protect_client=mock_protect_client,
+            innerspace_client=mock_innerspace_client,
+            entry=mock_config_entry,
+        )
+
+        data = await coord._async_update_data()
+        assert data["project"]["id"] == "proj-1"
+        assert "fp-1" in data["floor_plans"]
+        assert "ap-1" in data["access_points"]
+        assert "sw-1" in data["switches"]
+        assert "inv-1" in data["inventory"]
+        assert coord.available is True
+
+        # Transient failure raises UpdateFailed while keeping self.data
+        mock_innerspace_client.get_project.side_effect = UniFiConnectionError("Down")
+        with pytest.raises(UpdateFailed):
+            await coord._async_update_data()
+        assert coord.available is False
+        assert "ap-1" in coord.data["access_points"]
+
+        # Auth error raises ConfigEntryAuthFailed
+        mock_innerspace_client.get_project.side_effect = UniFiAuthenticationError(
+            "Expired", status_code=401
+        )
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coord._async_update_data()
+
+        # Timeout, response, and unexpected errors raise UpdateFailed
+        for exc in (
+            UniFiTimeoutError("Timeout"),
+            UniFiResponseError("Bad gateway", status_code=502),
+            RuntimeError("Unexpected"),
+        ):
+            mock_innerspace_client.get_project.side_effect = exc
+            with pytest.raises(UpdateFailed):
+                await coord._async_update_data()
+
+    @pytest.mark.asyncio
+    async def test_config_coordinator_innerspace_only_suppresses_network_404(
+        self,
+        hass: HomeAssistant,
+        mock_network_client: MagicMock,
+        mock_config_entry: MockConfigEntry,
+    ) -> None:
+        """Test UnifiConfigCoordinator suppresses Network 404 when InnerSpace used."""
+        mock_network_client.sites.get_all.side_effect = UniFiNotFoundError(
+            "Not found", status_code=404
+        )
+        config_coord = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=mock_network_client,
+            protect_client=None,
+            entry=mock_config_entry,
+            network_available=True,
+            innerspace_available=True,
+        )
+        data = await config_coord._async_update_data()
+        assert data["sites"] == {}
+        assert config_coord.available is True

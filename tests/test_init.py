@@ -1,11 +1,11 @@
 """Tests for the UniFi Insights integration initialization."""
 
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 if TYPE_CHECKING:
@@ -23,6 +23,12 @@ from custom_components.unifi_insights.api import (
     UniFiNotFoundError,
     UniFiResponseError,
     UniFiTimeoutError,
+)
+from custom_components.unifi_insights.api.innerspace import (
+    InnerSpaceFloorPlan,
+    InnerSpaceInventoryDevice,
+    InnerSpaceProject,
+    InnerSpaceProjectIdentity,
 )
 from custom_components.unifi_insights.const import DOMAIN
 from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
@@ -286,14 +292,16 @@ async def test_setup_entry_no_sites_found(
     assert [flow["context"]["source"] for flow in flows] == ["reauth"]
 
 
+@pytest.mark.parametrize("site_manager_outage", [False, True])
+@pytest.mark.usefixtures("enable_custom_integrations")
 async def test_setup_entry_remote_connection(
     hass: HomeAssistant,
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
-    enable_custom_integrations,
+    site_manager_outage: bool,  # noqa: FBT001
 ) -> None:
-    """Test setup with remote connection type includes Protect."""
+    """Site Manager data is optional for a working remote console."""
     # Create remote config entry
     remote_entry = MockConfigEntry(
         domain="unifi_insights",
@@ -305,11 +313,108 @@ async def test_setup_entry_remote_connection(
         entry_id="remote_entry",
     )
 
-    remote_entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(remote_entry.entry_id)
-    await hass.async_block_till_done()
+    with patch(
+        "custom_components.unifi_insights.coordinators.site_manager."
+        "UniFiSiteManagerClient"
+    ) as client_class:
+        client = client_class.return_value
+        for method in (
+            "list_hosts",
+            "list_sites",
+            "list_devices",
+            "get_isp_metrics",
+            "list_sd_wan_configs",
+        ):
+            setattr(
+                client,
+                method,
+                AsyncMock(
+                    side_effect=(
+                        UniFiResponseError("cloud unavailable", status_code=502)
+                        if site_manager_outage
+                        else None
+                    ),
+                    return_value=[],
+                ),
+            )
+        if not site_manager_outage:
+            client.list_hosts.return_value = [{"id": "test_console"}]
+        client.close = AsyncMock()
 
-    assert remote_entry.state == ConfigEntryState.LOADED
+        remote_entry.add_to_hass(hass)
+        await hass.config_entries.async_setup(remote_entry.entry_id)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert remote_entry.state == ConfigEntryState.LOADED
+        assert remote_entry.runtime_data.site_manager_coordinator is not None
+        assert "site_manager" in remote_entry.runtime_data.coordinator.data
+        assert remote_entry.runtime_data.coordinator.data["site_manager"][
+            "selected_host_id"
+        ] == (None if site_manager_outage else "test_console")
+        assert (
+            remote_entry.runtime_data.site_manager_coordinator.data["collections"][
+                "hosts"
+            ]["available"]
+            is not site_manager_outage
+        )
+        assert await hass.config_entries.async_unload(remote_entry.entry_id)
+        client.close.assert_awaited_once()
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "mock_local_auth",
+    "enable_custom_integrations",
+)
+@pytest.mark.parametrize("connection_type", ["remote", "local"])
+async def test_platform_failure_releases_optional_site_manager(
+    hass: HomeAssistant,
+    connection_type: str,
+) -> None:
+    """Platform setup errors release cloud accounts only when one was acquired."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "connection_type": connection_type,
+            "console_id": "test_console",
+            "api_key": "test_api_key",
+            "host": "https://test.local",
+        },
+        entry_id=f"{connection_type}_platform_error",
+    )
+    entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.unifi_insights.coordinators.site_manager."
+            "UniFiSiteManagerClient"
+        ) as client_class,
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("platform setup failed"),
+        ),
+    ):
+        client = client_class.return_value
+        for method in (
+            "list_hosts",
+            "list_sites",
+            "list_devices",
+            "get_isp_metrics",
+            "list_sd_wan_configs",
+        ):
+            setattr(client, method, AsyncMock(return_value=[]))
+        client.close = AsyncMock()
+
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.state == ConfigEntryState.SETUP_ERROR
+        if connection_type == "remote":
+            client.close.assert_awaited_once()
+        else:
+            client_class.assert_not_called()
 
 
 async def test_unload_entry_with_websocket_task(
@@ -848,3 +953,45 @@ async def test_unload_and_remove_clear_retry_budget(
     attempts[entry_id] = {"partial": 1}
     await hass.config_entries.async_remove(entry_id)
     assert entry_id not in attempts
+
+
+async def test_setup_entry_innerspace_only_console(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_innerspace_client: MagicMock,
+    mock_local_auth: MagicMock,
+    enable_custom_integrations,
+) -> None:
+    """An InnerSpace-only console loads and closes cleanly."""
+    mock_network_client.sites.get_all.return_value = []
+    mock_protect_client.cameras.get_all.return_value = []
+    mock_protect_client.nvr.get.return_value = None
+
+    mock_innerspace_client.get_project.return_value = InnerSpaceProject(
+        project=InnerSpaceProjectIdentity(id="proj-only"),
+    )
+    mock_innerspace_client.list_floor_plans.return_value = [
+        InnerSpaceFloorPlan(id="fp-1", name="Main Floor")
+    ]
+    mock_innerspace_client.list_inventory.return_value = [
+        InnerSpaceInventoryDevice(
+            id="inv-only-1",
+            name="Unplaced AP",
+            model="U6-Pro",
+            mac="AA:BB:CC:00:11:22",
+        )
+    ]
+
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.runtime_data.innerspace_coordinator is not None
+    assert mock_config_entry.runtime_data.innerspace_client is mock_innerspace_client
+    innerspace_data = mock_config_entry.runtime_data.coordinator.data["innerspace"]
+    assert "inv-only-1" in innerspace_data["inventory"]
+
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    mock_innerspace_client.close.assert_awaited()

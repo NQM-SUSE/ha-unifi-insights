@@ -1727,6 +1727,56 @@ class TestGroupStateAgreement:
             is expected
         )
 
+    @pytest.mark.parametrize(
+        ("cached", "rest", "expected"),
+        [
+            pytest.param(
+                {"isLeakDetected": True, "leakDetectedAt": 100},
+                {"isLeakDetected": True, "leakDetectedAt": 200},
+                True,
+                id="explicit-flag-agrees-ignoring-timestamp",
+            ),
+            pytest.param(
+                {"isLeakDetected": True, "leakDetectedAt": 100},
+                {"isLeakDetected": False, "leakDetectedAt": 100},
+                False,
+                id="explicit-flag-disagrees",
+            ),
+            pytest.param(
+                {"isExternalLeakDetected": True, "externalLeakDetectedAt": 100},
+                {"isExternalLeakDetected": True, "externalLeakDetectedAt": 200},
+                True,
+                id="explicit-external-flag-agrees-ignoring-timestamp",
+            ),
+            pytest.param(
+                {"leakDetectedAt": 100, "externalLeakDetectedAt": None},
+                {"leakDetectedAt": 100, "externalLeakDetectedAt": None},
+                True,
+                id="timestamp-only-equal",
+            ),
+            pytest.param(
+                {"leakDetectedAt": 100, "externalLeakDetectedAt": None},
+                {"leakDetectedAt": 200, "externalLeakDetectedAt": None},
+                False,
+                id="timestamp-only-differ",
+            ),
+            pytest.param(
+                {"leakDetectedAt": None, "externalLeakDetectedAt": 100},
+                {"leakDetectedAt": None, "externalLeakDetectedAt": None},
+                False,
+                id="external-timestamp-only-differ",
+            ),
+        ],
+    )
+    def test_leak_agreement(
+        self, cached: dict[str, Any], rest: dict[str, Any], *, expected: bool
+    ) -> None:
+        """Leak group uses explicit flags when available, or timestamps otherwise."""
+        assert (
+            UnifiProtectCoordinator._group_state_agrees(cached, rest, "leak")
+            is expected
+        )
+
 
 class TestNormalizeEpochSeconds:
     """`_normalize_epoch_seconds` edge inputs return comparable or None."""

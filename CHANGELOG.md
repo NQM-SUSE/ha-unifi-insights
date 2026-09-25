@@ -7,9 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Network topology dashboard card, served by the integration and listed in the
+  card picker as **UniFi Insights Topology**. It draws each site's gateway,
+  switches, access points and clients as an interactive graph (pan, zoom,
+  pinch, node details with uplink port, speed and PoE) or an accessible list,
+  with per-card site selection, client grouping, kind filters, and clear
+  loading, partial-data, reconnecting and error states. Configurable entirely
+  from the card editor.
+  [#166](https://github.com/ruaan-deysel/ha-unifi-insights/issues/166)
+- Network topology WebSocket API (`unifi_insights/topology/sources`,
+  `unifi_insights/topology/get` and `unifi_insights/topology/subscribe`)
+  exposing a per-site graph of gateways, switches, access points and clients.
+  The graph is derived from data the integration already polls, so it adds no
+  API calls. It is the groundwork for the network topology dashboard card
+  ([#166](https://github.com/ruaan-deysel/ha-unifi-insights/issues/166)).
+  [#165](https://github.com/ruaan-deysel/ha-unifi-insights/issues/165)
+- Topology client nodes now carry their VLAN and network name, and wired
+  client links their switch port, taken from the `/stat/sta` response the
+  integration already fetches.
+  [#165](https://github.com/ruaan-deysel/ha-unifi-insights/issues/165)
+- Remote connections now load account-wide Site Manager host, site, and device inventory, five-minute ISP metrics, and SD-WAN configuration metadata through a shared optional coordinator. Diagnostics include bounded counts, selected-host ISP samples, and collection health without exporting cloud identifiers or raw account data. A Site Manager outage does not prevent the console integration from loading. [#171](https://github.com/ruaan-deysel/ha-unifi-insights/issues/171)
+- UniFi InnerSpace floor-plan, placed device, and unplaced inventory support across local and remote console connections. A dedicated `UniFiInnerSpaceClient` and `UnifiInsightsInnerSpaceCoordinator` poll `/v1/project`, `/v1/floor_plans`, `/v1/access_points`, `/v1/switches`, and `/v1/inventory` independently of Network and Protect, correlating records by normalized MAC (scoped by floor-plan `siteId` when present) and exposing diagnostic **InnerSpace Placement** enum sensors (`placed`, `unplaced`, `unknown`) without modifying existing Network or Protect entity unique IDs, device identifiers, or Home Assistant area assignments. Consoles where only InnerSpace is reachable can now complete setup, and diagnostics export redacted InnerSpace counts and correlation summaries without floor-plan image URLs or raw geometry shapes. [#170](https://github.com/ruaan-deysel/ha-unifi-insights/issues/170)
+
 ### Fixed
 
-- USL-Environmental sensors now get their water leak binary sensors. These sensors report `mountType: "none"` and no `isLeakDetected` field, so the leak entity was never created even though the sensor supports leak detection. Leak support is now also detected from `featureFlags.waterLeak`, and the state falls back to the `leakDetectedAt` timestamp (set while wet, cleared when dry) when no explicit flag is present. Sensors with a second leak channel (`featureFlags.waterLeak.channelCount >= 2`) additionally get an "External Leak Detection" binary sensor backed by `externalLeakDetectedAt`, and that field now participates in the WebSocket/REST state preservation for the leak group. Existing leak sensors (`mountType: "leak"` / `isLeakDetected`) keep their entity and unique ID unchanged.
+- UniFi Protect requests no longer exceed the console's rate limit. The local Protect Integration API allows 10 requests per second per API key, but each Protect poll fired its seven fetches within about 100 ms while camera snapshots drew from the same allowance, so polls regularly got `429 Too Many Requests`. Since 2026.9.2 these were absorbed without a log line, which hid them: one install measured 120 rate-limited requests in 15 minutes with nothing in the log. On some starts the WebSocket `host_id` lookup was the request rejected, leaving Protect on 30-second polling with no push updates. The Protect API client now spaces its requests to stay under the limit, and a rate-limited request, snapshots included, waits out the console's `Retry-After` (1 second) and is retried once. A request that is rate limited again holds the client's other requests for the same wait instead of letting them run into the limit. The Network client is unchanged, since its API is not rate limited this way.
+- USL-Environmental sensors now get their water leak binary sensors. These sensors report `mountType: "none"` and no `isLeakDetected` field, so the leak entity was never created even though the sensor supports leak detection. Leak support is now also detected from `featureFlags.waterLeak`, and the state falls back to the `leakDetectedAt` timestamp (set while wet, cleared when dry) when no explicit flag is present. Sensors with a second leak channel (`featureFlags.waterLeak.channelCount >= 2`) additionally get an "External Leak Detection" binary sensor backed by `externalLeakDetectedAt`, and that field now participates in the WebSocket/REST state preservation for the leak group. Existing leak sensors (`mountType: "leak"` / `isLeakDetected`) keep their entity and unique ID unchanged. [#178](https://github.com/ruaan-deysel/ha-unifi-insights/issues/178)
 
 ## [2026.9.7] - 2026-09-24
 

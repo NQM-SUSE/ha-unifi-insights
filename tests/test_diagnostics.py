@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 import pytest
 from homeassistant.components.diagnostics.const import REDACTED
@@ -44,6 +46,39 @@ async def test_diagnostics(
     assert "test_api_key" not in str(diagnostics)
     # The key name "api_key" will appear, but the value should be redacted
     assert diagnostics["entry"]["data"]["api_key"] == "**REDACTED**"
+
+
+async def test_site_manager_diagnostics_exclude_raw_cloud_snapshot(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Account-wide Site Manager records never pass through generic redaction."""
+    snapshot = {
+        "hosts": {
+            "secret-host": {
+                "id": "secret-host",
+                "reportedState": {"hostname": "private.example.test"},
+            }
+        },
+        "sites": {},
+        "devices": {},
+        "isp_metrics": {},
+        "sd_wan_configs": {},
+        "collections": {},
+        "last_attempt": None,
+        "cooldown_until": None,
+    }
+    runtime = init_integration.runtime_data
+    runtime.site_manager_coordinator = SimpleNamespace(data=snapshot)
+    runtime.coordinator.data["site_manager"] = snapshot
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    assert diagnostics["site_manager"]["inventory"]["hosts"] == 1
+    assert "site_manager" not in diagnostics["data"]
+    assert "secret-host" not in repr(diagnostics)
+    assert "private.example.test" not in repr(diagnostics)
 
 
 async def test_diagnostics_includes_websocket_health(
@@ -462,3 +497,66 @@ async def test_diagnostics_keeps_malformed_mac_values_distinct(
     for value in (first["macAddress"], first["apMac"]):
         assert value.startswith("**REDACTED-MAC-")
     assert "not-a-mac" not in _strings(diagnostics)
+
+
+async def test_diagnostics_placeholders_topology_uplink_mac(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """The copied legacy parent MAC is placeholdered like every other MAC."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["devices"] = {
+        "site-1": {
+            "uuid-child": {
+                "name": "Ultra",
+                "macAddress": "58:d6:1f:00:00:02",
+                "topology": {
+                    "legacy_type": "usw",
+                    "uplink_mac": "28:70:4e:00:00:01",
+                    "uplink_remote_port": 6,
+                },
+            },
+            "uuid-parent": {"name": "Core", "macAddress": "28:70:4e:00:00:01"},
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    devices = diagnostics["data"]["devices"]["site-1"]
+    uplink_mac = devices["uuid-child"]["topology"]["uplink_mac"]
+
+    assert uplink_mac.startswith("**REDACTED-MAC-")
+    # Same MAC, same placeholder: the parent link stays traceable.
+    assert uplink_mac == devices["uuid-parent"]["macAddress"]
+    assert devices["uuid-child"]["topology"]["uplink_remote_port"] == 6
+    assert "28:70:4e:00:00:01" not in _strings(diagnostics)
+
+
+async def test_diagnostics_placeholders_client_links(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Client link MACs (keys and values) are placeholdered; VLAN stays."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["client_links"] = {
+        "site-1": {
+            "8c:ed:e1:00:00:01": {
+                "sw_mac": "28:70:4e:00:00:01",
+                "sw_port": 14,
+                "vlan": 3,
+                "network_name": "Cameras",
+            }
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    (link_key,) = diagnostics["data"]["client_links"]["site-1"]
+    link = diagnostics["data"]["client_links"]["site-1"][link_key]
+
+    assert link_key.startswith("**REDACTED-MAC-")
+    assert link["sw_mac"].startswith("**REDACTED-MAC-")
+    assert link["vlan"] == 3
+    assert link["network_name"] == "Cameras"
+    for raw in ("8c:ed:e1:00:00:01", "28:70:4e:00:00:01"):
+        assert raw not in _strings(diagnostics)

@@ -48,10 +48,22 @@ class TestWaterLeakHelpers:
     def test_channel_count(self):
         """Channel count is read from featureFlags.waterLeak."""
         assert _water_leak_channel_count(USL_ENVIRONMENTAL) == 2
+        assert (
+            _water_leak_channel_count(
+                {"feature_flags": {"water_leak": {"channel_count": "2"}}}
+            )
+            == 2
+        )
         assert _water_leak_channel_count({}) == 0
         assert _water_leak_channel_count({"featureFlags": None}) == 0
         assert _water_leak_channel_count({"featureFlags": {"waterLeak": {}}}) == 0
         assert _water_leak_channel_count({"featureFlags": {"waterLeak": True}}) == 0
+        assert (
+            _water_leak_channel_count(
+                {"featureFlags": {"waterLeak": {"channelCount": True}}}
+            )
+            == 0
+        )
         assert (
             _water_leak_channel_count(
                 {"featureFlags": {"waterLeak": {"channelCount": "bogus"}}}
@@ -63,6 +75,7 @@ class TestWaterLeakHelpers:
         """USL-Environmental gets internal and external leak capability."""
         assert _supports_internal_leak(USL_ENVIRONMENTAL) is True
         assert _supports_external_leak(USL_ENVIRONMENTAL) is True
+        assert _supports_external_leak({"isExternalLeakDetected": False}) is True
 
     def test_single_channel_has_no_external(self):
         """A single leak channel does not create an external probe entity."""
@@ -142,7 +155,7 @@ class TestWaterLeakEntityCreation:
     async def test_environmental_gets_internal_and_external_leak(
         self, hass: HomeAssistant, mock_coordinator
     ):
-        """Both leak entities are created and report dry (off)."""
+        """Both leak entities are created and report dry/wet independently."""
         config_entry = MagicMock()
         config_entry.runtime_data = MagicMock()
         config_entry.runtime_data.coordinator = mock_coordinator
@@ -162,6 +175,16 @@ class TestWaterLeakEntityCreation:
         assert by_key["sensor_leak"].is_on is False
         assert by_key["sensor_leak_external"].is_on is False
         assert "sensor_door" not in by_key
+
+        sensor_data = mock_coordinator.data["protect"]["sensors"]["env_sensor"]
+        sensor_data["leakDetectedAt"] = 1758600000000
+        assert by_key["sensor_leak"].is_on is True
+        assert by_key["sensor_leak_external"].is_on is False
+
+        sensor_data["leakDetectedAt"] = None
+        sensor_data["externalLeakDetectedAt"] = 1758600000000
+        assert by_key["sensor_leak"].is_on is False
+        assert by_key["sensor_leak_external"].is_on is True
 
     async def test_leak_attributes_expose_both_channels(
         self, hass: HomeAssistant, mock_coordinator
