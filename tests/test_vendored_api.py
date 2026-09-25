@@ -154,7 +154,7 @@ async def test_get_hosts_remote_without_console_id() -> None:
         }
     ]
     with patch(
-        "custom_components.unifi_insights.api.site_manager.UniFiSiteManagerClient"
+        "custom_components.unifi_insights.api.network.client.UniFiSiteManagerClient"
     ) as site_manager_class:
         site_manager_class.return_value.list_hosts = AsyncMock(return_value=hosts)
         result = await client.get_hosts()

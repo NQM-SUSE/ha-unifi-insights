@@ -17,6 +17,7 @@ from ..const import (
     NETWORK_LEGACY_V2_PATH,
     ConnectionType,
 )
+from ..site_manager import UniFiSiteManagerClient
 from .endpoints import (
     ACLEndpoint,
     ClientsEndpoint,
@@ -383,8 +384,6 @@ class UniFiNetworkClient(BaseUniFiClient):
 
         # Keep the discovery API for existing callers while Site Manager owns
         # the account-wide endpoint and its pagination rules.
-        from ..site_manager import UniFiSiteManagerClient
-
         if not isinstance(self._auth, ApiKeyAuth):
             raise ValueError("get_hosts requires cloud API key authentication")
         client = UniFiSiteManagerClient(
