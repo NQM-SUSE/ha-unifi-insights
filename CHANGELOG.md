@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Network topology dashboard card, served by the integration and listed in the
+  card picker as **UniFi Insights Topology**. It draws each site's gateway,
+  switches, access points and clients as an interactive graph (pan, zoom,
+  pinch, node details with uplink port, speed and PoE) or an accessible list,
+  with per-card site selection, client grouping, kind filters, and clear
+  loading, partial-data, reconnecting and error states. Configurable entirely
+  from the card editor.
+  [#166](https://github.com/ruaan-deysel/ha-unifi-insights/issues/166)
 - Network topology WebSocket API (`unifi_insights/topology/sources`,
   `unifi_insights/topology/get` and `unifi_insights/topology/subscribe`)
   exposing a per-site graph of gateways, switches, access points and clients.

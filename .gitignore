@@ -131,4 +131,8 @@ site/
 .claude/settings.json
 uv.lock
 
-
+# ============================================================================
+# Frontend (topology card)
+# ============================================================================
+frontend/node_modules/
+frontend/coverage/

@@ -289,6 +289,49 @@ data:
   duration_minutes: 480
 ```
 
+## Network topology card
+
+The integration ships a Lovelace card that draws each site's network: the
+gateway, switches and access points, and the clients connected to them. It is
+installed with the integration — there is no separate download and no
+dashboard resource to add.
+
+**Add it:** edit a dashboard → _Add card_ → search for **UniFi Insights
+Topology**. With a single UniFi site the card works without any configuration;
+with several, pick the site in the card editor.
+
+**Use it:**
+
+- **Graph** view: drag to pan, pinch or Ctrl + scroll to zoom (plain scroll
+  zooms in panel view), and use the zoom buttons or `+` / `-` / `0` keys.
+  Select a device to see its uplink port, link speed, PoE draw and client
+  counts, with a link to its Home Assistant device page.
+- **List** view: the same network as an indented list with search. It is the
+  recommended view for screen readers.
+- Clients are grouped under their switch or access point ("12 clients");
+  select a group to expand it.
+- The filter buttons hide gateways, switches, access points, clients or other
+  devices; devices under a hidden one stay visible, linked with a dashed line.
+
+**Options** (all optional, all available in the card editor):
+
+| Option                 | Values                                                        | Default                             |
+| ---------------------- | ------------------------------------------------------------- | ----------------------------------- |
+| `entry_id` + `site_id` | the site to show                                              | the only site, if there is one      |
+| `title`                | text                                                          | the site name                       |
+| `view`                 | `graph`, `list`                                               | `graph`                             |
+| `show_site_selector`   | `true`, `false`                                               | `false`                             |
+| `clients`              | `collapsed`, `expanded`, `hidden`                             | `collapsed`                         |
+| `kinds`                | any of `gateway`, `switch`, `access_point`, `client`, `other` | all                                 |
+| `density`              | `comfortable`, `compact`                                      | automatic (compact on narrow cards) |
+| `orientation`          | `vertical`, `horizontal`                                      | `vertical`                          |
+| `show_labels`          | `true`, `false`                                               | `true`                              |
+| `max_clients`          | 1–500                                                         | 500                                 |
+
+The card only receives what the topology API sends — names, models, states,
+ports and VLANs. MAC addresses, IP addresses, hostnames and firmware versions
+are never included.
+
 ## Troubleshooting
 
 ### Enable debug logging

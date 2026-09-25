@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import random
+from pathlib import Path
 
 import pytest
 
@@ -839,3 +841,46 @@ def test_client_link_enrichment_without_known_connection() -> None:
     assert "connection" not in tv
     assert tv["vlan_id"] == 3
     assert tv["network_name"] == "Media"
+
+
+FRONTEND_FIXTURE = (
+    Path(__file__).parent.parent
+    / "frontend"
+    / "test"
+    / "fixtures"
+    / "site-topology.json"
+)
+
+
+def test_frontend_contract_fixture_is_current() -> None:
+    """
+    The card's contract fixture is exactly what the builder emits today.
+
+    frontend/test/fixtures/site-topology.json is validated field by field and
+    rendered by the card's test suite, so a contract change fails here until
+    the fixture is regenerated, and then fails the TypeScript tests until the
+    card is updated. Regenerate with:
+    UPDATE_TOPOLOGY_FIXTURE=1 pytest tests/test_topology.py -k fixture
+    """
+    data = _with_links(
+        _live_layout(),
+        {
+            "12:00:00:00:00:01": {
+                "sw_mac": "02:00:00:00:00:03",
+                "sw_port": 4,
+                "vlan": 3,
+                "network_name": "Media",
+            },
+            "12:00:00:00:00:02": {
+                "ap_mac": "02:00:00:00:00:08",
+                "network_name": "Default",
+            },
+        },
+    )
+    ha_device_ids = {"uuid-gw": "reg-gw", "uuid-core": "reg-core"}
+    snapshot = _build(data, ha_device_ids=ha_device_ids)
+    rendered = json.dumps(snapshot, indent=2, sort_keys=True) + chr(10)
+    if os.environ.get("UPDATE_TOPOLOGY_FIXTURE"):
+        FRONTEND_FIXTURE.parent.mkdir(parents=True, exist_ok=True)
+        FRONTEND_FIXTURE.write_text(rendered, encoding="utf-8")
+    assert FRONTEND_FIXTURE.read_text(encoding="utf-8") == rendered

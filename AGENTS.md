@@ -344,6 +344,9 @@ See `.github/instructions/repairs.instructions.md` for comprehensive patterns.
 pre-commit run --all-files   # Full validation
 script/lint                   # Auto-format and fix linting
 pytest                        # Run unit tests (90% minimum coverage)
+cd frontend && npm ci          # Topology card: install (Node 22)
+npm run lint && npm run typecheck && npm test -- --coverage
+npm run build                  # Rebuild custom_components/unifi_insights/frontend/topology-card.js — commit it
 ```
 
 **Generate code that passes these checks on first run.** As an AI agent, you should produce higher quality code than manual development:

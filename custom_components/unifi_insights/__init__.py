@@ -52,6 +52,7 @@ from .coordinators.site_manager import (
     async_acquire_site_manager,
     async_release_site_manager,
 )
+from .frontend import async_register_frontend
 from .probe import (
     ProbeResult,
     ProbeStatus,
@@ -134,6 +135,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # noqa: ARG00
     # id keys are loaded first so the handlers can read them synchronously.
     await async_load_node_keys(hass)
     async_register_websocket_commands(hass)
+    # The card bundle is served the same way: once per instance.
+    await async_register_frontend(hass)
     return True
 
 
