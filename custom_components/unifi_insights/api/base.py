@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from types import TracebackType
 from typing import Any, Self
@@ -47,6 +50,25 @@ def _redact(text: str) -> str:
         lambda m: m.group(0).rsplit(":", 1)[0] + ': "**REDACTED**"',
         text,
     )
+
+
+def _retry_after_seconds(value: str | None) -> int:
+    """Parse a Retry-After delay or HTTP date, with a safe fallback."""
+    if not value:
+        return DEFAULT_RATE_LIMIT_RETRY_AFTER
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            deadline = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return DEFAULT_RATE_LIMIT_RETRY_AFTER
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        seconds = (deadline - datetime.now(UTC)).total_seconds()
+    if not math.isfinite(seconds):
+        return DEFAULT_RATE_LIMIT_RETRY_AFTER
+    return max(0, math.ceil(seconds))
 
 
 class BaseUniFiClient(ABC):
@@ -220,6 +242,10 @@ class BaseUniFiClient(ABC):
             msg = f"Request to {url} failed: {err}"
             raise UniFiConnectionError(msg) from err
 
+    def _response_log_text(self, response_text: str, *, limit: int) -> str:
+        """Return a bounded, credential-redacted response excerpt for logs."""
+        return _redact(response_text)[:limit] if response_text else "empty"
+
     async def _handle_response(
         self,
         response: aiohttp.ClientResponse,
@@ -244,7 +270,7 @@ class BaseUniFiClient(ABC):
         response_text = await response.text()
 
         if _LOGGER.isEnabledFor(logging.DEBUG):
-            redacted_body = _redact(response_text)[:500] if response_text else "empty"
+            redacted_body = self._response_log_text(response_text, limit=500)
             _LOGGER.debug(
                 "Response status: %s, body: %s",
                 status,
@@ -270,14 +296,11 @@ class BaseUniFiClient(ABC):
             )
 
         if status == HTTPStatus.TOO_MANY_REQUESTS:
-            retry_after = response.headers.get("Retry-After")
             raise UniFiRateLimitError(
                 "Rate limited by API",
                 status_code=status,
                 response_body=response_text,
-                retry_after=int(retry_after)
-                if retry_after
-                else DEFAULT_RATE_LIMIT_RETRY_AFTER,
+                retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
             )
 
         if status >= HTTPStatus.BAD_REQUEST:
@@ -303,9 +326,7 @@ class BaseUniFiClient(ABC):
             # True and entities kept serving stale cached data indefinitely
             # instead of surfacing as unavailable and letting the
             # coordinator's normal retry/backoff take over.
-            redacted_response = (
-                _redact(response_text)[:200] if response_text else "empty"
-            )
+            redacted_response = self._response_log_text(response_text, limit=200)
             # Log the request path: without it this warning names only the
             # body, so a console returning an HTML page on one of several
             # polled endpoints cannot be attributed to the endpoint that
